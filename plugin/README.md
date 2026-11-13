@@ -310,23 +310,29 @@ into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait 
 `$HERMES_HOME/synapse/outbox/` and go with the next successful one. A session marked
 private (`synapse private on <session-id>`, in a terminal; `hermes sessions list` shows
 the id) uploads nothing. Hermes gives a conversation a new session id when it branches
-it, and when a compression starts a new session: the new id is private when a session it
-holds turns of is, and gets the marker and the server row, so what was said off the
-record stays there. Which session that is comes from the ids Hermes names when it moves
-the agent, and from the session's row in Hermes's store, read before the first upload
-under any id. A marker lasts twelve hours and `off` removes it, so when none says, the
-server is asked (`GET /private-sessions/<earlier id>`) before the new session's first
-upload, once per session; until it answers, nothing is uploaded for that session, and
-the turns that finish are kept in memory.
+it, and when a compression starts a new session: the new id is private when Hermes says
+which session it holds turns of and that one is private. It gets the marker and the
+server row, so what was said off the record stays there. Which session that is comes
+from the ids Hermes names when it moves the agent, and from the session's row in
+Hermes's store, read before the first upload under any id. A marker lasts twelve hours
+and `off` removes it, so when none says, the server is asked
+(`GET /private-sessions/<earlier id>`) before the new session's first upload, once per
+session; until it answers, nothing is uploaded for that session, and the turns that
+finish are kept in memory.
 `/new` and `/resume` open another conversation: nothing is carried to it from the one
 you left, and it is on the record unless you mark it or its own row says it continues a
-private session. `synapse private off --forget <id>` puts a session back on the record
-with the turns spoken in it. For a session that was private because of the one it
-continues, the agent running it uploads only the turns you begin from then on, also
-after a compression gives the conversation another id. A reply Hermes began itself (to
-a background-process notice) lands on the turn before it, and is not uploaded when that
-one was spoken off the record. An agent started for the session later looks back ten
-turns, copied ones included.
+private session. An ACP fork names no session it came from: it is on the record, and
+uploads the turns begun in it, not the ones copied into it. A session seeded with
+another's messages names none either, and is taken for a resumed one: up to ten of the
+copied turns are uploaded, whatever the session they came from was.
+`synapse private off --forget <id>` puts a session back on the record with the turns
+spoken in it. For a session that was private because of the one it continues, the agent
+running it keeps those turns out, also after a compression gives the conversation
+another id: it uploads the turns it sees begin on the record from then on. The first of
+them is left out when Hermes added a row of its own to it (a nudge, a reply to a
+background-process notice) or when its message had no text. A message cut short off the
+record that you retry on the record is uploaded. An agent started for the session later
+looks back ten turns, copied ones included.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

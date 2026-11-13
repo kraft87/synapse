@@ -6,16 +6,20 @@ provider was built for or last switched to need not be the agent's: Hermes point
 agent at another session without a call when another holder's compression started one
 (agent/turn_facade_lease.py, agent/session_persistence.py). A flush under the old id
 would upload the new session's turns as the old one's, past the new one's private mode.
-So the provider notes each id a hook names, and a hook without one goes by the last.
+So the provider notes each id a hook names, and a turn start goes by the last. So does
+a flush, when the provider can tell the turns are that session's (provider.py,
+``_upload``).
 
 Two kinds of hook name an id. ``initialize``, ``on_session_switch`` and ``prefetch`` run
 as the agent is in that session (``moved``). ``sync_turn`` runs on Hermes's background
 worker, after its turn, and so possibly after a switch made since (``named``): an id the
-agent was moved away from is not gone back to on its word.
+agent was moved away from is not gone back to on its word: the id ``moved`` found it
+in, and the parent a switch names, which the agent was in though no hook need have
+said so.
 
 Still unseen: a move Hermes did not announce, until a hook names the new id. A flush
 that runs before then (the turn's prompt gave no prefetch, and its ``sync_turn`` is still
-queued) goes under the id from before.
+queued) goes under the id from before, and a turn start is counted there.
 """
 
 from __future__ import annotations
@@ -37,10 +41,14 @@ class Live:
         with self._lock:
             return self._id
 
-    def moved(self, session_id: str) -> None:
-        """The agent is in ``session_id`` now, and no longer in the one before."""
+    def moved(self, session_id: str, left: tuple[str, ...] = ()) -> None:
+        """The agent is in ``session_id`` now, and no longer in the one before, nor in
+        one of ``left`` (the ids a switch says it leaves)."""
         with self._lock:
-            if session_id and session_id != self._id:
+            if not session_id:
+                return
+            self._left.update(one for one in left if one and one != session_id)
+            if session_id != self._id:
                 if self._id:
                     self._left.add(self._id)
                 self._left.discard(session_id)

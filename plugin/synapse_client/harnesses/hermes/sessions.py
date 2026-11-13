@@ -39,7 +39,7 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
   backstop no Hermes path reaches today: ``hermes chat`` and both one-shot paths run
   their turn in the gateway daemon (hermes_cli/cli_agent_setup_mixin.py), whose
   environment has the variable stripped (hermes_cli/gateway_runtime_start.py). There a
-  dispatched run is known only by its turn's author (the provider's ``_foreign``),
+  dispatched run is known only by its turn's author (``foreign``),
   which Hermes reports after it has built the first turn's system prompt. And so is
   any agent the gateway daemon itself builds without a chat: a ``/background`` or
   ``/btw`` side agent
@@ -209,6 +209,20 @@ def owner_subject() -> str | None:
     """The gateway's subject for this machine's owner, ``uid:<n>``; None off POSIX."""
     getuid = getattr(os, "getuid", None)
     return f"uid:{getuid()}" if getuid is not None else None
+
+
+def foreign(owner_id: str | None, author_id: Any, author_name: Any, is_bot: Any) -> bool:
+    """Whether a turn's author is someone other than the owner; ``owner_id`` is the
+    ``user_id`` the gateway bound the session to, None in-process. No author: the owner
+    at the keyboard (in-process). The gateway names one on every turn, the owner's own
+    as ``{"id": <the session's user_id>, "is_bot": False}`` (gateway/run_turn_runner.py,
+    ``ctx.source``, the source of ``user_id`` too); a bot, another id, or any author
+    where no user was bound is someone else."""
+    if is_bot:
+        return True
+    if author_id is None and author_name is None:
+        return False
+    return owner_id is None or author_id != owner_id
 
 
 def bot_chat(title: Any) -> bool:

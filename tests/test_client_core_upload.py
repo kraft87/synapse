@@ -459,13 +459,15 @@ def test_after_a_failed_batch_the_rest_are_queued_without_a_request(tmp_path):
 
 
 def test_the_turn_that_has_just_ended_goes_up_after_time_off_the_record(tmp_path):
-    """``lookback`` 0 leaves out every turn from before. The turn that ends as the
-    session comes back on the record is not one of them, and the turn before it, spoken
-    off the record, does not go along as its context."""
+    """``lookback`` 0 leaves out every turn from before. A turn seen to begin once the
+    session is back on the record (``begin``) is not one of them, and the turn before
+    it, spoken off the record, does not go along as its context."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     assert wire.posts[0]["body"]["records"] == _turn(3)
+    turns.begin("s-1")
     assert turns.upload(said + _turn(4), "s-1", timeout=5, finished=True) is True
     assert wire.posts[1]["body"]["records"] == _turn(3) + _turn(4)  # 3 was sent: context
 
@@ -477,15 +479,16 @@ def test_the_turn_that_has_just_ended_goes_up_after_time_off_the_record(tmp_path
 )
 def test_a_turn_from_before_is_not_taken_for_the_one_that_has_just_ended(tmp_path, last, finished):
     """A flush (the session ends, a compression is due) is not a turn ending, and a
-    last turn cut short is not the one before it."""
+    last turn cut short is not the one before it. Neither had a turn start before it."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + last
     assert turns.upload(said, "s-1", timeout=5, finished=finished) is False and wire.tries == 0
     done = _turn(1) + _turn(2) + _turn(3) + _turn(4) + _turn(5)
     assert turns.upload(done, "s-1", timeout=5, finished=True) is True
     sent = [r["id"] for r in wire.posts[0]["body"]["records"] if r["role"] == "user"]
-    # What the first upload left out stays out, as a turn and as a context.
-    assert sent == ["u4", "u5"]
+    # What the first upload left out stays out, as a turn and as a context: also the
+    # turn cut short, which was not seen to begin on the record.
+    assert sent == (["u5"] if finished else ["u4", "u5"])
 
 
 def test_a_turn_that_has_just_ended_adds_nothing_to_a_look_back(tmp_path):
@@ -829,6 +832,25 @@ def test_every_session_the_server_is_still_to_be_told_about_is_told(tmp_path):
     assert wire.rows == {"s-2", "s-3", "s-4"}
 
 
+def test_telling_the_server_stops_at_the_first_request_that_fails(tmp_path):
+    """Each try holds the caller for its timeout, and the caller is a hook on the
+    harness's worker: with the server gone again, one failed request says enough."""
+    client, wire = _client(tmp_path)
+    warned: list[str] = []
+    up = upload.Uploader(client, warn=warned.append)
+    _mark(tmp_path, "s-1")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-1"], "s-2") is True
+    assert up.carry_private(["s-2"], "s-3") is True
+    assert up.carry_private(["s-3"], "s-4") is True
+    wire.requests.clear()
+    up.settle_owed()
+    assert wire.requests == [_put("s-2")]
+    wire.fail_private = None
+    up.settle_owed()
+    assert wire.requests[1:] == [_put("s-2"), _put("s-3"), _put("s-4")]
+
+
 def test_a_delivered_upload_tells_the_server_what_it_is_still_to_be_told(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
@@ -932,6 +954,7 @@ def test_turns_kept_for_a_session_the_server_then_calls_private_are_dropped(tmp_
     (tmp_path / "private" / "s-new").unlink()  # `private off --forget`
     wire.rows.discard("s-new")
     said = _turn(2) + _turn(3) + _turn(4)
+    turns.begin("s-new")
     assert turns.upload(said, "s-new", timeout=5, finished=True) is True
     assert [post["body"]["records"] for post in wire.posts] == [_turn(4)]
 

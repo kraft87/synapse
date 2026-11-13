@@ -218,13 +218,32 @@ def test_compaction_rows_of_any_role_and_other_roles_are_dropped():
         [
             {"role": "assistant", "content": "[micro compact]", "_compressed_summary": True},
             {"role": "developer", "content": "be brief"},
-            {"role": "user", "content": _MEMORY},  # nothing left once the block is gone
             "not a dict",
             None,
         ]
     )
     assert records == []
     assert hm.to_records(None) == []
+
+
+def test_a_user_row_with_no_text_stays_as_a_row_that_opens_no_turn():
+    """A picture alone, or nothing once the memory block is gone. Left out, the reply
+    to it would read as the reply of a turn before it that got none."""
+    picture = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
+        "message_uid": "p-1",
+        "timestamp": 1_794_000_000.0,
+    }
+    assert hm.to_records([picture, {"role": "user", "content": _MEMORY}]) == [
+        {"role": "user", "content": "", "synthetic": True, "ts": 1_794_000_000.0, "id": "p-1"},
+        {"role": "user", "content": "", "synthetic": True},
+    ]
+    cut_short = {"role": "user", "content": "what is this?", "message_uid": "u-1"}
+    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-1"}
+    (turn,) = cm.turns(hm.to_records([cut_short, picture, reply]))
+    assert [r["id"] for r in turn] == ["u-1", "p-1", "a-1"]
+    assert cm.complete(turn) and cm.joined(turn)
 
 
 def test_tool_arguments_are_capped_and_user_and_assistant_text_are_not():
@@ -311,20 +330,27 @@ def test_a_synthetic_row_after_a_finished_turn_neither_reopens_it_nor_changes_it
     assert not cm.complete([{"role": "user", "content": "q"}, snapshot])
 
 
-def test_stems_are_the_keys_a_turn_had_each_time_it_was_complete_before_it_went_on():
-    """A reply with no real user row before it lands on the finished turn before."""
-    finished = [
-        {"role": "user", "content": "q", "id": "q"},
-        {"role": "assistant", "content": "r", "id": "r"},
-    ]
+def test_joined_says_a_turn_holds_more_than_its_own_exchange():
+    """A reply with no real user row before it lands on the turn before."""
+    asked = {"role": "user", "content": "q", "id": "q"}
+    finished = [asked, {"role": "assistant", "content": "r", "id": "r"}]
     notice = {"role": "user", "content": "[process ended]", "synthetic": True, "id": "n"}
     reply = {"role": "assistant", "content": "noted", "id": "r2"}
-    assert cm.stems(finished) == []
-    assert cm.stems([*finished, notice]) == []  # a synthetic row alone: nothing went on
-    assert cm.stems([*finished, notice, reply]) == ["r"]
-    assert cm.stems([*finished, reply]) == ["r"]  # the row in the user's place left out
-    again = [*finished, notice, reply, {**notice, "id": "n2"}, {**reply, "id": "r3"}]
-    assert cm.stems(again) == ["r", "r2"]
+    assert not cm.joined(finished)
+    # A row after the reply, also a synthetic one with nothing after it: the harness
+    # may have begun a turn with it that left no other row.
+    assert cm.joined([*finished, notice])
+    assert cm.joined([*finished, notice, reply])
+    assert cm.joined([*finished, reply])  # the row in the user's place left out
+    # A turn cut short, then a notice: its reply is not the reply to what was asked.
+    assert not cm.joined([asked])
+    assert cm.joined([asked, notice])
+    assert cm.joined([asked, notice, reply])
+    # A user row with no text opens no turn; what comes after it began later.
+    empty = {"role": "user", "content": "", "id": "e"}
+    assert cm.turns([*finished, empty, reply]) == [[*finished, empty, reply]]
+    assert cm.joined([*finished, empty])
+    assert cm.joined([asked, empty, reply])
     # A tool call and its result are the turn still running, not a turn that went on.
     call = {
         "role": "assistant",
@@ -333,10 +359,29 @@ def test_stems_are_the_keys_a_turn_had_each_time_it_was_complete_before_it_went_
         "id": "c",
     }
     result = {"role": "tool", "content": "ok", "name": "t", "id": "t"}
-    assert cm.stems([finished[0], call, result, finished[1]]) == []
-    assert cm.stems([*finished, call, result, reply]) == ["r"]
+    assert not cm.joined([asked, call, result])
+    assert not cm.joined([asked, call, result, finished[1]])
+    assert cm.joined([*finished, call])
+    assert cm.joined([*finished, call, result, reply])
+
+
+def test_the_opening_key_is_the_same_however_the_turn_goes_on():
+    finished = [
+        {"role": "user", "content": "q", "id": "q"},
+        {"role": "assistant", "content": "r", "id": "r"},
+    ]
+    notice = {"role": "user", "content": "[process ended]", "synthetic": True, "id": "n"}
+    reply = {"role": "assistant", "content": "noted", "id": "r2"}
+    later = [*finished, notice, reply]
+    assert cm.turn_key(later) == "r2" != cm.turn_key(finished)
+    assert cm.opening_key(later) == cm.opening_key(finished) == cm.opening_key(finished[:1]) == "q"
+    # With no id, the opening row is hashed: the same row, the same key.
     bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
-    assert cm.stems([*bare, notice, reply]) == [cm.turn_key(bare)]
+    assert cm.opening_key([*bare, notice, reply]) == cm.opening_key(bare)
+    assert cm.opening_key(bare).startswith("sha256:")
+    assert cm.opening_key(bare) != cm.turn_key(bare)
+    other = [{"role": "user", "content": "another q"}, bare[1]]
+    assert cm.opening_key(other) != cm.opening_key(bare)
 
 
 def _numbered(n: int) -> list[list[dict]]:

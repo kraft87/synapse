@@ -24,6 +24,10 @@ actually sent, with the memory context it injected, our own nudge included), not
   ``agent/context_compressor._SYNTHETIC_USER_ROW_PREFIXES``,
   ``agent/conversation_compression_scaffolding._SYNTHETIC_USER_PREFIXES``). The flags are
   not persisted, so a resumed session's rows are recognised by their text.
+- A user row with no text (a picture alone) is sent as a ``synthetic`` row as well. It
+  opens no turn, so its reply lands on the turn before; the row stays in the records to
+  show that this reply answers something later than that turn (the core's
+  ``messages.joined``). No user row is left out, whatever it holds.
 - An assistant row is a reply only when it shows what the user got. Hermes types the
   two kinds of assistant row that are not (agent/turn_failure_copy.py and its writers):
   ``display_kind`` "failed_turn", the boundary Hermes appends when a turn fails ("This
@@ -167,9 +171,7 @@ def _record(message: Any) -> Record | None:
     text = _text(message.get("content"))
     record: Record = {"role": role, "content": text}
     if role == "user":
-        if not text:
-            return None
-        if _synthetic(message, text):
+        if not text or _synthetic(message, text):
             record["synthetic"] = True
     elif role == "assistant":
         calls = _tool_calls(message.get("tool_calls"))

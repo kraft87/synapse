@@ -24,6 +24,7 @@ import pytest
 
 from tests import test_hermes_gateway_sessions as gs
 from tests import test_hermes_private_lineage as pl
+from tests import test_hermes_provider as base
 from tests.helpers.client_core import use_core
 
 use_core()
@@ -35,6 +36,7 @@ user = gs.user
 plugin = gs.plugin
 server = gs.server
 _conversation = gs._conversation
+_say = gs._say
 _users = gs._users
 _store = gs._store
 _open, _marker, _child, _link = pl._open, pl._marker, pl._child, pl._link
@@ -43,6 +45,7 @@ pytestmark = gs.pytestmark
 
 _GRAND, _PARENT, _CHILD, _OTHER = pl._GRAND, pl._PARENT, pl._CHILD, pl._OTHER
 _THIRD = "20261113_100000_dddddd"
+_NEW = "20261113_110000_eeeeee"
 
 
 def _posted(server: Any) -> list[tuple[str, list[str]]]:
@@ -99,19 +102,19 @@ def test_a_flush_goes_under_the_session_hermes_last_named(plugin, server, tmp_pa
     home = tmp_path / "hermes-a"
     _child(home, None)  # a rotation child: the link alone
     provider = _open(plugin, home, _PARENT, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     getattr(provider, flush)(_conversation(3))  # a turn no sync_turn came for
     assert _posted(server) == [(_CHILD, _questions(1, 2)), (_CHILD, _questions(2, 3))]
     _marker(tmp_path, _CHILD)  # `synapse private on`, for the id Hermes shows
     server.private_rows.add(_CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     getattr(provider, flush)(_conversation(4))
     assert len(server.posts()) == 2
 
 
 def test_the_start_of_a_turn_names_the_session_before_any_upload(plugin, server, tmp_path):
-    """Hermes names the session as each turn starts (``prefetch``, inline), so a flush
-    in that turn goes by it before the turn's own ``sync_turn`` has run. A ``sync_turn``
+    """Hermes names the session as each turn starts (``prefetch``, when it runs
+    one), so a flush in that turn goes by it before the turn's own ``sync_turn`` has run. A ``sync_turn``
     still queued for the session left is for that session, and does not bring the agent
     back to it."""
     home = tmp_path / "hermes-a"
@@ -141,16 +144,60 @@ def test_a_hook_that_may_run_late_does_not_take_the_agent_back_to_a_session_it_l
     live.moved("s-b")  # back, and said so: s-b is not a session left any more
     assert live.named("s-d") == "s-d" and live.named("s-b") == "s-b" and live.id == "s-b"
     assert live.named("s-c") == "s-c" and live.id == "s-b"  # s-c still is
+    # A switch says which ids the agent leaves, also one no hook had named.
+    live.moved("s-e", ("s-b", "s-x", "", "s-e"))
+    assert live.named("s-x") == "s-x" and live.named("s-b") == "s-b" and live.id == "s-e"
+    live.moved("s-e", ("s-y",))  # the id it is in already: what it leaves still counts
+    assert live.named("s-y") == "s-y" and live.id == "s-e"
+    live.moved("", ("s-e",))  # no id to move to: nothing is left
+    assert live.named("s-z") == "s-z" and live.named("s-e") == "s-e" and live.id == "s-e"
+    live.moved("s-e", ("s-e",))  # a compression in place: the id it is in is not left
+    assert live.named("s-f") == "s-f" and live.named("s-e") == "s-e" and live.id == "s-e"
 
 
 def test_a_flush_after_a_switch_goes_under_the_new_id(plugin, server, tmp_path):
     home = tmp_path / "hermes-a"
     _child(home, None)
     provider = _open(plugin, home, _PARENT)
+    provider.on_turn_start(1, "question 1", previous_message="")
     provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
     provider.sync_turn("q", "a", session_id=_PARENT, messages=_conversation(1))  # late
     provider.on_session_end(_conversation(2))
     assert _posted(server) == [(_PARENT, _questions(1, 1)), (_CHILD, _questions(1, 2))]
+
+
+@pytest.mark.parametrize("private", [True, False], ids=["private", "on the record"])
+def test_the_flush_of_the_session_left_at_new_does_not_go_under_the_new_id(
+    plugin, server, tmp_path, private
+):
+    """CLI ``/new``: the agent's id is the new one at once, while the last flush of the
+    session left (``on_session_end``) and the switch wait on Hermes's worker
+    (``commit_session_boundary_async``). A message typed meanwhile starts its turn
+    first and names the new session (``prefetch``). The flush that follows holds the
+    old conversation: as the new session's it would go up under the wrong id, and past
+    the old one's private mode."""
+    home = tmp_path / "hermes-a"
+    for sid in (_PARENT, _NEW):
+        _store(home, sid, source="cli", receipt=False, chat_id="")
+    _link(home, _NEW, _PARENT, {"_reset_from": _PARENT})
+    provider = _open(plugin, home, _PARENT, platform="cli")
+    _say(provider, _conversation(1), _PARENT)
+    if private:
+        _marker(tmp_path, _PARENT)
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
+    # Question 2 has ended, its upload still queued. /new, and the next message at once:
+    provider.on_turn_start(1, "other question 1", previous_message="")
+    provider.prefetch("other question 1", session_id=_NEW)
+    provider.sync_turn("question 2", "a", session_id=_PARENT, messages=_conversation(2))  # late
+    provider.on_session_end(_conversation(2))
+    provider.on_session_switch(_NEW, parent_session_id=_PARENT, reset=True, reason="new_session")
+    provider.sync_turn("other question 1", "a", session_id=_NEW, messages=_other_conversation(1))
+    assert _posted(server) == [
+        (_PARENT, _questions(1, 1)),
+        *([] if private else [(_PARENT, _questions(1, 2))]),
+        (_NEW, ["other question 1"]),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +220,13 @@ def test_a_turn_hermes_begins_after_forget_takes_no_turn_from_before_along(
     said = _conversation(3)  # the parent's turns, copied
     if spoken_private:
         said = _conversation(4)
-        provider.sync_turn("q", "a", session_id=_CHILD, messages=said)
+        _say(provider, said, _CHILD)
     _forget(server, tmp_path, _CHILD)
     said = said + _notice(1)
     provider.sync_turn("n", "noted 1", session_id=_CHILD, messages=said)
     assert server.posts() == []
     said = said + _conversation(5)[-2:]
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=said)
+    _say(provider, said, _CHILD)
     assert _posted(server) == [(_CHILD, ["question 5"])]
 
 
@@ -202,7 +249,7 @@ def test_a_new_session_id_after_forget_is_not_looked_back_at_either(
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home, resumed=True)
     _forget(server, tmp_path, _CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert _posted(server) == [(_CHILD, ["question 4"])]
     _store(home, _THIRD, source="tui", receipt=False, chat_id="")
     if linked:
@@ -210,7 +257,7 @@ def test_a_new_session_id_after_forget_is_not_looked_back_at_either(
     if switch:
         provider.on_session_switch(_THIRD, parent_session_id=_CHILD, reason="compression")
     tail = [_conversation(4)[0], *_conversation(4)[3:], *_conversation(5)[-2:]]  # turns 2 to 5
-    provider.sync_turn("q", "a", session_id=_THIRD, messages=tail)
+    _say(provider, tail, _THIRD)
     assert _posted(server)[1:] == [(_THIRD, ["question 5"])]
     assert not (tmp_path / "private" / _THIRD).exists() and _THIRD not in server.private_rows
 
@@ -230,7 +277,7 @@ def test_forget_after_a_switch_stands_when_the_note_of_the_carry_could_not_be_ke
     provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
     assert server.puts() == [f"/private-sessions/{_CHILD}"]
     _forget(server, tmp_path, _CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert _posted(server) == [(_CHILD, ["question 4"])]
     assert not (tmp_path / "private" / _CHILD).exists() and len(server.puts()) == 1
     assert not carried.settled(home, _CHILD)
@@ -255,9 +302,9 @@ def test_turns_kept_for_a_session_stay_with_it_when_another_is_resumed(plugin, s
     provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))  # late
     assert server.posts() == []
     server.private_status = 200
-    provider.sync_turn("q", "a", session_id=_OTHER, messages=_other_conversation(2))
+    _say(provider, _other_conversation(2), _OTHER)
     assert _posted(server) == [(_OTHER, _questions(1, 2, "other question"))]
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     assert (tmp_path / "private" / _CHILD).is_file() and len(server.posts()) == 1
 
 
@@ -270,7 +317,7 @@ def test_a_late_upload_for_the_session_left_leaves_the_new_one_its_look_back(
     provider = _open(plugin, home, _CHILD, resumed=True)
     provider.on_session_switch(_OTHER, parent_session_id=_CHILD, reason="resume")
     provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))  # late
-    provider.sync_turn("q", "a", session_id=_OTHER, messages=_other_conversation(30))
+    _say(provider, _other_conversation(30), _OTHER)
     assert _posted(server) == [
         (_CHILD, _questions(1, 2)),
         (_OTHER, _questions(20, 30, "other question")),  # ten turns, and the one before
@@ -285,9 +332,65 @@ def test_a_session_first_met_at_an_upload_is_looked_back_at_as_a_resumed_one(
     home = tmp_path / "hermes-a"
     _child(home, None)
     provider = _open(plugin, home, _PARENT)
-    provider.sync_turn("q", "a", session_id=_OTHER, messages=_other_conversation(14))
+    _say(provider, _other_conversation(14), _OTHER)
     sent = [text for _, users in _posted(server) for text in users]
     assert sent == _questions(4, 14, "other question")  # ten turns, and the one before
+
+
+def test_a_late_upload_for_the_parent_a_switch_names_does_not_take_the_agent_back(
+    plugin, server, tmp_path
+):
+    """Hermes pointed the agent at _CHILD without a call, the turn's prompt gave no
+    ``prefetch``, and its ``sync_turn`` waits on the worker: no hook has named _CHILD
+    when the next turn's compression moves the agent on to _THIRD. The switch names
+    _CHILD as the session left. The late upload is _CHILD's, and a flush after it goes
+    by _THIRD: its turns go up under that id, and no more once it is off the record."""
+    home = tmp_path / "hermes-a"
+    _child(home, None)
+    _store(home, _THIRD, source="tui", receipt=False, chat_id="")
+    _link(home, _THIRD, _CHILD, None)
+    provider = _open(plugin, home, _PARENT, resumed=True)
+    provider.on_session_switch(_THIRD, parent_session_id=_CHILD, reason="compression")
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))  # late
+    assert _posted(server) == [(_CHILD, _questions(1, 2))]
+    provider.on_pre_compress(_conversation(3))
+    assert _posted(server)[1:] == [(_THIRD, _questions(1, 3))]
+    _marker(tmp_path, _THIRD)  # `synapse private on`, for the id Hermes shows
+    server.private_rows.add(_THIRD)
+    provider.on_session_end(_conversation(4))
+    assert len(server.posts()) == 2
+
+
+def test_a_switch_back_to_the_bound_id_does_not_send_its_turns_again(plugin, server, tmp_path):
+    """Hermes pointed the agent at _CHILD without a call, and the user resumes _PARENT:
+    the id the provider is still bound to. It is no new id here, so what was sent
+    under it stays sent."""
+    home = tmp_path / "hermes-a"
+    _child(home, None)
+    provider = _open(plugin, home, _PARENT, resumed=True)
+    _say(provider, _conversation(2), _PARENT)
+    provider.prefetch("question 3", session_id=_CHILD)
+    provider.on_session_switch(_PARENT, reason="resume")
+    _say(provider, _conversation(3), _PARENT)
+    assert _posted(server) == [(_PARENT, _questions(1, 2)), (_PARENT, _questions(2, 3))]
+
+
+def test_a_compression_of_the_id_the_agent_is_in_is_one_in_place(plugin, server, tmp_path):
+    """Hermes pointed the agent at _CHILD without a call and then compresses _CHILD in
+    place. The switch names the id the agent is in, not the one the provider is bound
+    to. It is no move: what was sent under _CHILD stays sent, and the cut for recall is
+    taken."""
+    home = tmp_path / "hermes-a"
+    _child(home, None)
+    provider = _open(plugin, home, _PARENT, resumed=True)
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
+    provider.prefetch("question 2", session_id=_CHILD)
+    provider.sync_turn("question 2", "a", session_id=_CHILD, messages=_conversation(2))
+    provider.on_session_switch(_CHILD, parent_session_id=_CHILD, reason="compression")
+    _say(provider, _conversation(3), _CHILD)
+    assert _posted(server) == [(_CHILD, _questions(1, 2)), (_CHILD, _questions(2, 3))]
+    sent = base._sent(provider, server, "recall", {"query": "x"})
+    assert sent["self_session"] == _CHILD and "self_since" in sent
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +417,7 @@ def test_a_switch_goes_by_the_session_hermes_last_named_too(plugin, server, tmp_
     home = tmp_path / "hermes-a"
     _child(home, None)
     provider = _open(plugin, home, _PARENT, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     _marker(tmp_path, _CHILD)
     _store(home, _THIRD, source="tui", receipt=False, chat_id="")
     provider.on_session_switch(_THIRD, reason="compression")
@@ -346,7 +449,7 @@ def test_an_upload_asks_only_as_far_up_as_the_first_settled_session(plugin, serv
     carried.settle(home, _PARENT)
     _marker(tmp_path, _GRAND)
     provider = _open(plugin, home, _OTHER)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     assert _posted(server) == [(_CHILD, _questions(1, 2))]
     assert server.asked() == [_PARENT] and server.puts() == []
 
@@ -357,6 +460,6 @@ def test_a_new_session_that_holds_anothers_turns_is_read_once(plugin, server, tm
     home = tmp_path / "hermes-a"
     _child(home)
     provider = _open(plugin, home)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(12))
+    _say(provider, _conversation(12), _CHILD)
     sent = [text for _, users in _posted(server) for text in users]
     assert sent == _questions(1, 12) and server.asked() == [_PARENT]
