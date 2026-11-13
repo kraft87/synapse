@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import threading
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal, Protocol, cast
 
@@ -54,20 +56,13 @@ class TransientEmbeddingHTTPError(EmbeddingHTTPError):
     then re-raises (reraise=True) so failures are never silently swallowed."""
 
 
-# Voyage's client defaults to max_retries=0, so a transient rate-limit (429) or 5xx
-# RAISES immediately. In recall() that means _rerank_pool silently degrades to RRF
-# order — worse retrieval with no alarm. Retry the transient Voyage errors with
-# exponential backoff + jitter so the API and client negotiate the rate DYNAMICALLY
-# (no hardcoded TPM/worker guesses); permanent errors (auth / invalid-request /
-# malformed) are NOT retried — they fail fast. Matched by class NAME so we don't import
-# voyageai.error at module load (Client is imported lazily in __init__).
-_VOYAGE_RETRYABLE_NAMES = frozenset(
-    {"RateLimitError", "ServiceUnavailableError", "ServerError", "Timeout", "APIConnectionError"}
-)
-
-
+# A transient Voyage failure (429 rate limit, 5xx, timeout, dropped connection) must not
+# raise straight to the caller: in recall() that means _rerank_pool silently degrades to
+# RRF order — worse retrieval with no alarm. Retry them with exponential backoff + jitter
+# so the API and client negotiate the rate DYNAMICALLY (no hardcoded TPM/worker guesses);
+# permanent errors (auth / invalid-request / malformed) are NOT retried — they fail fast.
 def _is_voyage_retryable(exc: BaseException) -> bool:
-    return type(exc).__name__ in _VOYAGE_RETRYABLE_NAMES
+    return isinstance(exc, (httpx.TransportError, TransientEmbeddingHTTPError))
 
 
 # Reranker model. rerank-3-lite is the default after a 3-arm A/B (2026-10-02) against
@@ -95,7 +90,7 @@ _OTHER_STOP = stop_after_attempt(6)
 
 def _is_rate_limit(retry_state: Any) -> bool:
     exc = retry_state.outcome.exception() if retry_state.outcome else None
-    return type(exc).__name__ == "RateLimitError"
+    return isinstance(exc, TransientEmbeddingHTTPError) and exc.status_code == 429
 
 
 def _voyage_wait(retry_state: Any) -> float:
@@ -149,11 +144,92 @@ class EmbeddingModel(Protocol):
     ) -> list[list[float]]: ...
 
 
+# ---------------------------------------------------------------------------
+# Voyage backend — the REST API over one kept-open HTTP client per process
+# ---------------------------------------------------------------------------
+
+_VOYAGE_BASE_URL = "https://api.voyageai.com/v1"
+# Keys issued through MongoDB Atlas ("al-...") are served from Atlas instead.
+_VOYAGE_ATLAS_BASE_URL = "https://ai.mongodb.com/v1"
+
+# Voyage's edge closes a connection that has sat idle for about 10 minutes (one idle
+# 590s was still reused, one idle 630s was not; measured 2026-11-13). Ours expire
+# just before that, so a request is never sent down a connection the server is closing.
+_VOYAGE_KEEPALIVE_S = 570.0
+
+_VOYAGE_CLIENTS: dict[str, httpx.Client] = {}
+_VOYAGE_CLIENTS_LOCK = threading.Lock()
+
+
+def _new_voyage_client(api_key: str, transport: httpx.BaseTransport | None = None) -> httpx.Client:
+    return httpx.Client(
+        base_url=_VOYAGE_ATLAS_BASE_URL if api_key.startswith("al-") else _VOYAGE_BASE_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=_EMBED_HTTP_TIMEOUT,
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=_VOYAGE_KEEPALIVE_S,
+        ),
+        transport=transport,
+    )
+
+
+def _voyage_client(api_key: str) -> httpx.Client:
+    """The process-wide Voyage HTTP client for ``api_key``, built on first use.
+
+    Every VoyageEmbeddingModel in the process shares it, so a call reuses a connection
+    an earlier call opened, whichever instance or thread made that call. A new
+    connection costs about 100ms (TCP, TLS, loading the CA bundle), and one recall makes
+    several Voyage calls: the query embedding, then the episode and passage reranks,
+    with the web, notes and fact reranks alongside.
+    """
+    with _VOYAGE_CLIENTS_LOCK:
+        client = _VOYAGE_CLIENTS.get(api_key)
+        if client is None:
+            client = _VOYAGE_CLIENTS[api_key] = _new_voyage_client(api_key)
+        return client
+
+
+def _voyage_api_key(api_key: str) -> str:
+    """The key to call Voyage with: the one given, else the file VOYAGE_API_KEY_PATH
+    names, else VOYAGE_API_KEY. Having none is a configuration error, raised here
+    rather than as a 401 on every call."""
+    if api_key:
+        return api_key
+    path = os.environ.get("VOYAGE_API_KEY_PATH", "").strip()
+    if path:
+        with open(path) as f:
+            return f.read().strip()
+    key = os.environ.get("VOYAGE_API_KEY", "").strip()
+    if not key:
+        raise EmbeddingConfigError(
+            "No Voyage API key: set VOYAGE_API_KEY (or VOYAGE_API_KEY_PATH), or choose "
+            "another backend with SYNAPSE_EMBED_PROVIDER / SYNAPSE_RERANK_PROVIDER."
+        )
+    return key
+
+
+@functools.cache
+def _voyage_tokenizer(model: str) -> Any:
+    """``model``'s own tokenizer, loaded once per process: it sizes embed batches
+    against Voyage's per-request token cap. It comes from the Hugging Face cache,
+    which the image pre-fetches for the default model (see Dockerfile)."""
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_pretrained(f"voyageai/{model}")
+    tokenizer.no_truncation()
+    return tokenizer
+
+
 class VoyageEmbeddingModel:
     """Voyage AI embeddings + rerank (the default backend): voyage-4-large at
-    2048 dims unless overridden via ``create_embedder()``."""
+    2048 dims unless overridden via ``create_embedder()``.
 
-    _client: Any
+    Calls Voyage's REST API through the process-wide client (``_voyage_client``);
+    ``transport`` gives the instance a private client instead, for tests.
+    """
+
     model_name: str
 
     def __init__(
@@ -161,10 +237,12 @@ class VoyageEmbeddingModel:
         api_key: str,
         model: str = DEFAULT_VOYAGE_EMBED_MODEL,
         dims: int = DEFAULT_EMBED_DIMS,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
-        from voyageai import Client  # type: ignore[attr-defined]
-
-        self._client = Client(api_key=api_key)
+        key = _voyage_api_key(api_key)
+        self._http = (
+            _voyage_client(key) if transport is None else _new_voyage_client(key, transport)
+        )
         self.model_name = model
         self._dims = dims
 
@@ -189,11 +267,14 @@ class VoyageEmbeddingModel:
         ]
         if not capped:
             return []
-        item_tokens = [self._client.count_tokens([t], model=self.model_name) for t in capped]
+        if len(capped) == 1:
+            # One item is one batch whatever its size, so a query never waits on the tokenizer.
+            return self._embed_batch(capped, input_type)
+        tokenizer = _voyage_tokenizer(self.model_name)
+        item_tokens = [len(tokenizer.encode(t)) for t in capped]
         out: list[list[float]] = []
         for batch in _pack_batches(capped, item_tokens, self._MAX_BATCH, self._TARGET_BATCH_TOKENS):
-            result = self._embed_batch(batch, input_type)
-            out.extend(result.embeddings)
+            out.extend(self._embed_batch(batch, input_type))
         return out
 
     def rerank(self, query: str, documents: list[str], top_k: int | None = None) -> list[int]:
@@ -202,10 +283,7 @@ class VoyageEmbeddingModel:
         summary/chunk candidates to surface. Transient failures are retried with
         backoff (_voyage_retry); a permanent failure still raises so the caller
         decides the fallback."""
-        if not documents:
-            return []
-        res = self._rerank_call(query, documents, top_k or len(documents))
-        return [r.index for r in res.results]
+        return [i for i, _ in self.rerank_scored(query, documents, top_k)]
 
     def rerank_scored(
         self, query: str, documents: list[str], top_k: int | None = None
@@ -220,20 +298,46 @@ class VoyageEmbeddingModel:
         RRF order)."""
         if not documents:
             return []
-        res = self._rerank_call(query, documents, top_k or len(documents))
-        return [(r.index, float(r.relevance_score)) for r in res.results]
+        return self._rerank_call(query, documents, top_k or len(documents))
 
     # Raw Voyage API calls, wrapped in tenacity backoff so transient 429/5xx/timeout
     # are retried (dynamic rate negotiation) instead of bubbling up as a hard failure.
     @_voyage_retry
-    def _embed_batch(self, batch: list[str], input_type: str) -> Any:
-        return self._client.embed(
-            batch, model=self.model_name, input_type=input_type, output_dimension=self._dims
+    def _embed_batch(self, batch: list[str], input_type: str) -> list[list[float]]:
+        response = self._http.post(
+            "/embeddings",
+            json={
+                "input": batch,
+                "model": self.model_name,
+                "input_type": input_type,
+                "truncation": True,
+                "output_dimension": self._dims,
+            },
         )
+        _raise_for_http_status(response, "voyage embeddings")
+        return _embedding_vectors(response, "voyage embeddings", len(batch))
 
     @_voyage_retry
-    def _rerank_call(self, query: str, documents: list[str], top_k: int) -> Any:
-        return self._client.rerank(query, documents, model=_RERANK_MODEL, top_k=top_k)
+    def _rerank_call(self, query: str, documents: list[str], top_k: int) -> list[tuple[int, float]]:
+        response = self._http.post(
+            "/rerank",
+            json={
+                "query": query,
+                "documents": documents,
+                "model": _RERANK_MODEL,
+                "top_k": top_k,
+                "truncation": True,
+            },
+        )
+        _raise_for_http_status(response, "voyage rerank")
+        data = _json_body(response, "voyage rerank")
+        try:
+            return [(int(r["index"]), float(r["relevance_score"])) for r in data["data"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EmbeddingHTTPError(
+                f"voyage rerank: malformed response shape: {_body_snippet(response)}",
+                status_code=response.status_code,
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +429,26 @@ def _json_body(response: httpx.Response, what: str) -> Any:
         ) from exc
 
 
+def _embedding_vectors(response: httpx.Response, what: str, sent: int) -> list[list[float]]:
+    """The vectors of an OpenAI-shaped embeddings response (Voyage's has the same
+    shape), in input order. Anything but one vector per input sent is an error."""
+    data = _json_body(response, what)
+    try:
+        items = sorted(data["data"], key=lambda d: int(d["index"]))
+        vectors = [[float(x) for x in d["embedding"]] for d in items]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise EmbeddingHTTPError(
+            f"{what}: malformed response shape: {_body_snippet(response)}",
+            status_code=response.status_code,
+        ) from exc
+    if len(vectors) != sent:
+        raise EmbeddingHTTPError(
+            f"{what}: sent {sent} inputs, got {len(vectors)} vectors back",
+            status_code=response.status_code,
+        )
+    return vectors
+
+
 class OpenAIEmbeddingModel:
     """Any OpenAI-compatible embeddings server: POST ``{base_url}/embeddings``.
 
@@ -407,20 +531,7 @@ class OpenAIEmbeddingModel:
             payload["dimensions"] = self._dims
         response = self._http.post("/embeddings", json=payload)
         _raise_for_http_status(response, "embeddings")
-        data = _json_body(response, "embeddings")
-        try:
-            items = sorted(data["data"], key=lambda d: int(d["index"]))
-            vectors = [[float(x) for x in d["embedding"]] for d in items]
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise EmbeddingHTTPError(
-                f"embeddings: malformed response shape: {_body_snippet(response)}",
-                status_code=response.status_code,
-            ) from exc
-        if len(vectors) != len(batch):
-            raise EmbeddingHTTPError(
-                f"embeddings: sent {len(batch)} inputs, got {len(vectors)} vectors back",
-                status_code=response.status_code,
-            )
+        vectors = _embedding_vectors(response, "embeddings", len(batch))
         for v in vectors:
             if len(v) != self._dims:
                 raise EmbeddingConfigError(

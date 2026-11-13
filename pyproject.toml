@@ -15,7 +15,6 @@ dependencies = [
     "anthropic>=0.40",
     "orjson>=3.10",
     "tokenizers>=0.21",
-    "voyageai>=0.3",
     "claude-agent-sdk>=0.1.72",
     "tenacity>=8.0",
     "numpy>=1.26",
