@@ -13,15 +13,18 @@ session that inherits it, since Hermes forgets the parent when its row is delete
 Marks are only added. A session comes back on only when every file that names it, its
 chat and the sessions it descends from is deleted, and the rows no longer say what was
 marked. A chat that lost its title before this provider ever judged it has no mark. A
-mark that cannot be written is logged and lost; marks that cannot be read stop the
-provider (``marked`` raises).
+mark that cannot be written is logged, each time, and lost; marks that cannot be read
+stop the provider (``marked`` raises): a folder that cannot be searched, a file where it
+goes, or a link that leads nowhere, since the marks may be where it led.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
+import stat
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -61,17 +64,36 @@ def mark(home: Any, keys: Iterable[Any], reason: str) -> None:
         )
 
 
+def _folder(home: Any) -> Path | None:
+    """The marks folder, or None when there is none yet. RAISES OSError when something
+    stands where it or its parent goes that is not a folder to look in: a file, a link
+    that leads nowhere, a folder that cannot be searched."""
+    folder = Path(str(home))
+    for part in _MARK_DIR:
+        folder = folder / part
+        try:
+            mode = os.stat(folder).st_mode
+        except FileNotFoundError:
+            try:
+                os.lstat(folder)
+            except FileNotFoundError:
+                return None  # nothing there: no mark was ever kept
+            raise  # a link whose target is gone
+        if not stat.S_ISDIR(mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(folder))
+    return folder
+
+
 def marked(home: Any, keys: Iterable[Any]) -> bool:
     """Whether any session or chat of ``keys`` carries a mark under ``home``. RAISES
-    OSError when a mark cannot be looked up for any reason but its file not being
-    there: the caller must not take that for "not marked"."""
-    if not home:
+    OSError when the marks cannot be looked up for any reason but not being there: the
+    caller must not take that for "not marked"."""
+    wanted = [str(key) for key in keys if key]
+    if not home or not wanted or _folder(home) is None:
         return False
-    for key in keys:
-        if not key:
-            continue
+    for key in wanted:
         try:
-            os.stat(_mark_file(home, str(key)))
+            os.lstat(_mark_file(home, key))
         except FileNotFoundError:
             continue
         return True

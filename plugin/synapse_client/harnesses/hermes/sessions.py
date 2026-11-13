@@ -383,25 +383,31 @@ def _chat_hits(conn: sqlite3.Connection, chats: list[str]) -> dict[str, Verdict]
 def _parents_verdict(
     conn: sqlite3.Connection, parents: list[Parent], hits: Mapping[str, Verdict]
 ) -> tuple[Verdict, list[str]] | None:
-    """What the sessions a session descends from rule out, with the parent or chat that
-    says so: a parent row, any row of a parent's chat (``hits``), or a parent chat's
-    receipt that names a chat others write into. A parent's receipt is read for that
-    alone; the session's own says who created it."""
-    for parent in parents:
+    """What the sessions a session descends from rule out: a parent row, any row of a
+    parent's chat (``hits``), or a parent chat's receipt that names a chat others write
+    into. With it come the chat that says so and the parents down to it. A parent's
+    receipt is read for that alone; the session's own says who created it."""
+    for index, parent in enumerate(parents):
         found = _row_verdict(parent.title, parent.model_config)
         if found is not None:
-            return found, [parent.id, parent.chat]
-    chats = list(dict.fromkeys(parent.chat for parent in parents if parent.chat))
-    for chat in chats:
+            return found, [*_ids(parents, index), parent.chat]
+    last = {parent.chat: index for index, parent in enumerate(parents) if parent.chat}
+    for chat, index in last.items():
         if chat in hits:
-            return hits[chat], [chat]
-    for chat in chats:
+            return hits[chat], [*_ids(parents, index), chat]
+    for chat, index in last.items():
         receipt = _meta(conn, _POLICY_KEY + chat)
         if isinstance(receipt, dict):
             found = _receipt_verdict(receipt, chat, None)
             if found.foreign:
-                return found, [chat]
+                return found, [*_ids(parents, index), chat]
     return None
+
+
+def _ids(parents: list[Parent], index: int) -> list[str]:
+    """The parents from the nearest to ``parents[index]``: each holds or continues the
+    next one's turns, so what marks that one marks them all."""
+    return [parent.id for parent in parents[: index + 1]]
 
 
 def _judge(
@@ -459,10 +465,11 @@ def _verdict(
     home: Any = None,
 ) -> Verdict:
     """The store's verdict for a session; INERT without its row when ``need_row``. A
-    session found to be one others write into is marked under ``home`` with the chat or
-    parent that says so. A mark on the session, its chats or any session it descends
-    from makes it INERT, and a parent's mark is copied down to it. RAISES sqlite3.Error
-    or ValueError, and OSError when the marks cannot be read."""
+    session found to be one others write into is marked under ``home`` with the chat
+    that says so and the parents down to it. A mark on the session, its chats or any
+    session it descends from makes it INERT, and a parent's mark is copied down to it
+    and the parents between. RAISES sqlite3.Error or ValueError, and OSError when the
+    marks cannot be read."""
     row = conn.execute(
         "SELECT title, source, chat_id, model_config, parent_session_id FROM sessions WHERE id=?",
         (session_id,),
@@ -478,10 +485,12 @@ def _verdict(
     if found.foreign:
         mark(home, [session_id, *keys], found.reason)
     elif found.mode == ACTIVE:
-        inherited = marked(home, [key for parent in parents for key in (parent.id, parent.chat)])
-        if inherited:  # copied down: Hermes forgets the parent when its row is deleted
-            mark(home, [session_id, row_chat], _MARKED)
-        if inherited or marked(home, [session_id, *chats]):
+        for index, parent in enumerate(parents):
+            if marked(home, [parent.id, parent.chat]):
+                # Copied down: Hermes forgets a parent when its row is deleted.
+                mark(home, [session_id, row_chat, *_ids(parents, index)], _MARKED)
+                return Verdict(INERT, _MARKED, foreign=True)
+        if marked(home, [session_id, *chats]):
             return Verdict(INERT, _MARKED, foreign=True)
     return found
 

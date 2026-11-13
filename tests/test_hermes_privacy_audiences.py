@@ -718,23 +718,26 @@ def test_marking_never_raises_and_says_when_it_could_not(tmp_path, caplog):
         hs.marked(tmp_path, [_LOCAL])
 
 
-def _broken_marks(home: Path) -> None:
-    """A marks folder no lookup gets through: a link to itself."""
+def _broken_marks(home: Path, target: str = "inert") -> None:
+    """A marks folder no lookup gets through: a link to itself, or (``target`` "gone")
+    to a folder that is not there, as when the volume it lives on is not mounted."""
     (home / "synapse").mkdir(parents=True, exist_ok=True)
-    (home / "synapse" / "inert").symlink_to("inert")
+    (home / "synapse" / "inert").symlink_to(target)
 
 
-def test_marks_that_cannot_be_read_turn_the_session_off(tmp_path):
-    """ "Could not look" is not "not marked": the chat may be one the marks kept off."""
+@pytest.mark.parametrize("target", ["inert", "gone"])
+def test_marks_that_cannot_be_read_turn_the_session_off(tmp_path, target):
+    """Not being able to look is not "not marked": the marks may have kept this chat
+    off."""
     _store(tmp_path)
     assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
-    _broken_marks(tmp_path)
+    _broken_marks(tmp_path, target)
     verdict = hs.check_session(tmp_path, _LOCAL, _gateway())
     assert verdict.mode == hs.INERT and "the marks could not be read" in verdict.reason
     with pytest.raises(hs.StoreError):
         hs.recheck(tmp_path, _LOCAL, gateway=True)
     bare = tmp_path / "bare"  # an in-process session, no state.db
-    _broken_marks(bare)
+    _broken_marks(bare, target)
     verdict = hs.check_session(bare, _RESET_CHILD, _in_process())
     assert verdict.mode == hs.INERT and "the marks could not be read" in verdict.reason
     with pytest.raises(hs.StoreError):
@@ -748,6 +751,8 @@ def test_a_call_is_skipped_while_the_marks_cannot_be_read(plugin, server, tmp_pa
     assert "BOARD-TEXT" in provider.system_prompt_block()
     _broken_marks(home)
     assert provider.system_prompt_block() == "" and provider.prefetch("x") == ""
+    (home / "synapse" / "inert").unlink()  # skipped, not turned off: it comes back
+    assert "BOARD-TEXT" in provider.system_prompt_block()
 
 
 def test_an_agent_rebuilt_after_a_foreign_turn_stays_off(plugin, server, tmp_path):
@@ -871,10 +876,11 @@ def test_a_branch_never_opened_is_known_by_the_origin_hermes_keeps(tmp_path):
 
 @pytest.mark.parametrize("key", ["_reset_from", "_compressed_from"])
 def test_a_continuation_is_known_by_its_origin_too(tmp_path, key):
-    """An in-process session marked for a foreign turn has no chat to mark. A session
-    that continues it names it in its ``model_config`` (hermes_state_mutation_reset.py,
-    hermes_state_mutation_compress.py), with or without the parent link, and the mark
-    is copied down to it."""
+    """``origin`` reads the other two keys as it reads ``_branched_from``: a row with
+    no parent link that names a marked session is its continuation, and the mark is
+    copied down to it. Hermes writes these keys for gateway chats
+    (hermes_state_mutation_reset.py, hermes_state_mutation_compress.py); the row here is
+    the barest one that carries one."""
     hs.mark(tmp_path, [_RESET_CHILD], "a turn another agent or person wrote")
     later = "20261112_181500_0a1b2c"
     _row(tmp_path, later, "", model_config={key: _RESET_CHILD}, source="cli")
@@ -902,3 +908,70 @@ def test_a_session_run_on_a_marked_chats_route_is_not_marked_itself(tmp_path):
     _store(tmp_path, _BRANCH, source="gui")
     assert "marked" in hs.check_session(tmp_path, _BRANCH, _gateway()).reason
     assert hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).mode == hs.ACTIVE
+
+
+def _marks(home: Path) -> set[str]:
+    """The ids the marks of ``home`` name: the first line of each file."""
+    folder = home / "synapse" / "inert"
+    if not folder.is_dir():
+        return set()
+    return {path.read_text().split("\n", 1)[0] for path in folder.iterdir()}
+
+
+#: A chat and two sessions whose ids are not their chat's, so a session's mark and a
+#: chat's can be told apart (``_store`` gives a first session its chat's id, as Hermes).
+_COPY_CHAT = "local-" + "9c" * 32
+_COPY = "20261112_190000_c0ffee"
+_SEGMENT = "20261112_183000_5e6f70"
+
+
+def _copy_of(home: Path, parent: str) -> None:
+    """A session of its own chat that names ``parent`` as where it was branched from."""
+    _store(home, _COPY_CHAT, source="gui")
+    _row(home, _COPY, _COPY_CHAT, model_config={"_branched_from": parent})
+
+
+def test_a_parents_title_marks_the_copy_its_chat_the_parent_and_the_parents_chat(tmp_path):
+    _store(tmp_path, source="gui")
+    _row(tmp_path, _SEGMENT, _LOCAL, title="Bot Chat")
+    _copy_of(tmp_path, _SEGMENT)
+    assert "Bot Chat" in hs.check_session(tmp_path, _COPY, _gateway(_COPY_CHAT)).reason
+    assert _marks(tmp_path) == {_COPY, _COPY_CHAT, _SEGMENT, _LOCAL}
+
+
+@pytest.mark.parametrize("evidence", ["a row of the parent's chat", "the parent chat's receipt"])
+def test_evidence_in_a_parents_chat_marks_that_chat_and_the_parents_down_to_it(tmp_path, evidence):
+    if evidence == "the parent chat's receipt":
+        _store(tmp_path, request_id="bot-chat:/home/kyle/.hermes")
+    else:
+        _old_bot_chat(tmp_path)
+    _row(tmp_path, _SEGMENT, _LOCAL)  # an untitled later segment; it names no origin
+    _copy_of(tmp_path, _SEGMENT)
+    assert "Bot Chat" in hs.check_session(tmp_path, _COPY, _gateway(_COPY_CHAT)).reason
+    assert _marks(tmp_path) == {_COPY, _COPY_CHAT, _SEGMENT, _LOCAL}
+
+
+def test_an_inherited_mark_is_copied_to_the_session_its_chat_and_the_parents_between(tmp_path):
+    """A never-opened sibling of the copy, cut from the same segment, is then found by
+    that segment's own mark once the whole chat is deleted."""
+    _store(tmp_path, source="gui")
+    _row(tmp_path, _SEGMENT, _LOCAL, model_config={"_reset_from": _LOCAL})
+    hs.mark(tmp_path, [_LOCAL], "a turn another agent or person wrote")
+    _copy_of(tmp_path, _SEGMENT)
+    assert "marked" in hs.check_session(tmp_path, _COPY, _gateway(_COPY_CHAT)).reason
+    assert _marks(tmp_path) == {_LOCAL, _COPY, _COPY_CHAT, _SEGMENT}
+    _branch(tmp_path, parent=_SEGMENT)  # the sibling
+    _delete(tmp_path, _SEGMENT)
+    _delete(tmp_path, _LOCAL)
+    assert "marked" in hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).reason
+
+
+def test_a_mark_on_a_parents_id_alone_leaves_the_parents_chat_unmarked(tmp_path):
+    """The parent was marked for what it was handed; its chat's other sessions were not."""
+    _store(tmp_path, source="gui")
+    _row(tmp_path, _SEGMENT, _LOCAL)
+    hs.mark(tmp_path, [_SEGMENT], "a turn another agent or person wrote")
+    _copy_of(tmp_path, _SEGMENT)
+    assert "marked" in hs.check_session(tmp_path, _COPY, _gateway(_COPY_CHAT)).reason
+    assert _marks(tmp_path) == {_SEGMENT, _COPY, _COPY_CHAT}
+    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE

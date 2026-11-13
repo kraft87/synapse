@@ -147,5 +147,7 @@ def test_this_hermes_store_has_the_columns_the_rule_reads(names: dict[str, Any])
 
 def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[str, Any]) -> None:
     """Hermes clears ``parent_session_id`` when a parent is deleted; these keys are what
-    still says a session is a copy or continuation of it."""
+    still says a session is a copy or continuation of it. A tripwire for a rename in the
+    three gateway writers, by their source text: it does not run a delete, and it does
+    not cover the in-process writers."""
     assert names["origins"] == list(hl._ORIGINS)

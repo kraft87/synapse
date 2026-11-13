@@ -3,13 +3,15 @@
 A branch is a new chat holding a copy of its parent's turns
 (hermes_state_mutation_branch.py ``branch_in_transaction``); a reset or compressed
 continuation is a new row of the same chat (hermes_state_mutation_reset.py,
-hermes_state_mutation_compress.py). Each names the session it came from twice: in
-``parent_session_id``, which Hermes clears when that session is deleted or pruned
-(hermes_state_sessions.py, hermes_state_mutation_retirement.py,
+hermes_state_mutation_compress.py). The gateway's writers name the session a row came
+from twice: in ``parent_session_id``, which Hermes clears when that session is deleted
+or pruned (hermes_state_sessions.py, hermes_state_mutation_retirement.py,
 hermes_state_maintenance.py), and in its ``model_config`` (``_branched_from``,
-``_reset_from``, ``_compressed_from``), which stays. Both are read, so a copy is still
-known as one after its parent's row is gone: the id it names is kept as a last parent,
-with nothing but its mark (marks.py) to go by.
+``_reset_from``, ``_compressed_from``), which stays. Both are read, so such a row is
+still known as a copy after its parent's row is gone: the id it names is kept as a last
+parent, with nothing but its mark (marks.py) to go by. An in-process compression
+(agent/conversation_compression.py) writes the link alone, so its child is known only
+while the parent's row is there, or by the mark sessions.py copied down to it.
 """
 
 from __future__ import annotations

@@ -51,7 +51,8 @@ changed, what to do on each machine, what was proven, and what is still open.
   it is branched.**
   - The first time a session is judged a Bot Chat, a Group Chat member or a chat that
     follows its profile, or is handed a turn someone else wrote, it is marked, together
-    with the chat or parent session that said so: one owner-only file each under
+    with the chat that said so and the parent sessions down to it: one owner-only file
+    each under
     `<hermes_home>/synapse/inert/`, named by the SHA-256 of the id and holding the id
     and the reason (`harnesses/hermes/marks.py`).
   - A mark makes that session and every session of that chat inert. Before, "for good"
@@ -62,8 +63,9 @@ changed, what to do on each machine, what was proven, and what is still open.
     a parent row, any row of a parent's chat, a parent chat's receipt that says Bot
     Chat, Group Chat member or `follow_profile_config`, or a parent's mark. A branch of
     a Bot Chat under a title of its own used to pass.
-  - A parent's mark is copied down to the session that inherits it, the first time that
-    session is judged. Hermes clears a child's `parent_session_id` when the parent is
+  - A parent's mark is copied down to the session that inherits it, its chat and the
+    parents between, the first time that session is judged. Hermes clears a child's
+    `parent_session_id` when the parent is
     deleted or pruned, so the copy is what keeps a branch off after that. A branch not
     judged before then is still found by the `_branched_from` (or `_reset_from`,
     `_compressed_from`) its `model_config` keeps, when the session it names was marked.
@@ -71,9 +73,10 @@ changed, what to do on each machine, what was proven, and what is still open.
     comes back on only when every file that names it, its chat and the sessions it
     descends from is deleted (each file holds the id it is for), and the rows no longer
     say what was marked.
-  - Marks that cannot be read, for any reason but "no such file", make the session
-    inert at `initialize` and skip the call afterwards. A mark that cannot be written is
-    logged; the session is still off for that agent.
+  - Marks that cannot be read make the session inert at `initialize` and skip the call
+    afterwards: a folder that cannot be searched, a file in its place, or a link that
+    leads nowhere (an unmounted volume). Only "nothing there" reads as not marked. A
+    mark that cannot be written is logged; the session is still off for that agent.
 - **A process whose environment carries `HERMES_TURN_AUTHOR` is inert from
   `initialize`.** A backstop only: no Hermes path builds an agent in such a process
   today (see Open).
@@ -114,7 +117,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 **Proven**
 
 - New tests in seven new files: `test_hermes_gateway_sessions.py` (the rule, over a
-  `state.db` built like Hermes's), `test_hermes_privacy_audiences.py` (67: each
+  `state.db` built like Hermes's), `test_hermes_privacy_audiences.py` (73: each
   audience above, its shape built from what Hermes writes and cited),
   `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` (a child process
   killed mid-request, sessions sharing an outbox), `test_client_core_outbox_writeahead.py`,
@@ -198,8 +201,11 @@ changed, what to do on each machine, what was proven, and what is still open.
   make one. A copy of a Bot Chat made that way uploads up to ten copied turns when
   resumed.
 - A branch never judged before its parent was deleted is found only when the session it
-  was branched from carries a mark itself. One cut from a segment of a marked chat that
-  was never judged on its own reads as the owner's chat.
+  was branched from carries a mark itself: it was judged, or it lies between a judged
+  session and what marked it. One cut from a segment of a marked chat that no judged
+  session descends from reads as the owner's chat. So does the child of an in-process
+  compression whose parent row alone is deleted: it names its parent by the link only
+  (`agent/conversation_compression.py`).
 - In the stdio TUI or Desktop backend a model switch on a draft builds the prompt
   before the session has a row, so a draft that becomes a Bot Chat or Group Chat member
   can keep the board in its first prompt.
@@ -216,6 +222,8 @@ changed, what to do on each machine, what was proven, and what is still open.
     so is each branch of it judged from then on;
   - every later segment (`/new`) of a chat branched from a marked one: the branch's
     chat is marked with it;
+  - a branch cut from a session before that session was handed a turn someone else
+    wrote: it holds none of it, and is marked with its chat once judged;
   - every session of a home whose marks folder cannot be read.
 
 ## 2026-11-12 — install: `synapse` is linked into `~/.local/bin` when that is on PATH

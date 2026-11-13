@@ -343,7 +343,9 @@ class SynapseMemoryProvider(MemoryProvider):
                 self._home, sid, gateway=self._gateway, chat_id=self._chat_id, route=self._route
             )
         except Exception:
-            self._say_once("synapse: the session store could not be read; skipped this call")
+            self._say_once(
+                "synapse: the session store or its marks could not be read; skipped this call"
+            )
             return False
         if verdict.mode == ACTIVE:
             return True

@@ -157,20 +157,23 @@ owner's id means only that nobody stamped the turn. A gateway session's project 
 from the `cwd` its client sent, never the daemon's.
 
 **Marks.** A session judged a Bot Chat, a Group Chat member or a chat that follows its
-profile, or handed a turn someone else wrote, is marked together with the chat or parent
-session that said so: one owner-only file each under `<hermes_home>/synapse/inert/`,
-named by the SHA-256 of the id and holding the id and the reason. A marked session and
+profile, or handed a turn someone else wrote, is marked together with the chat that said
+so and the parent sessions down to it: one owner-only file each under
+`<hermes_home>/synapse/inert/`, named by the SHA-256 of the id and holding the id and
+the reason. A marked session and
 every session of a marked chat stay inert after the title is removed (archive, rename)
 and after Hermes builds a new agent for the session. So does a session branched or
-continued from a marked one. Its parent's mark is copied down to it the first time it is
-judged, because Hermes clears a child's `parent_session_id` when the parent is deleted
-or pruned; before that first judgment, the `_branched_from`, `_reset_from` or
-`_compressed_from` its `model_config` keeps still names the parent. Marks are only
+continued from a marked one. Its parent's mark is copied down to it, its chat and the
+parents between the first time it is judged, because Hermes clears a child's
+`parent_session_id` when the parent is deleted or pruned; before that first judgment,
+the `_branched_from`, `_reset_from` or `_compressed_from` the gateway wrote into its
+`model_config` still names the parent. Marks are only
 added, and a mark on a branch never marks its parent. A session comes back on only when
 every file that names it, its chat and the sessions it descends from is deleted (each
 file holds the id it is for), and the rows no longer say what was marked. Marks that
-cannot be read, for any reason but "no such file", turn the session inert at
-`initialize` and skip the call afterwards; a mark that cannot be written is logged.
+cannot be read (a folder that cannot be searched, a file in its place, a link that leads
+nowhere) turn the session inert at `initialize` and skip the call afterwards; only
+"nothing there" reads as not marked. A mark that cannot be written is logged.
 
 What this does not cover:
 
@@ -198,7 +201,8 @@ What this does not cover:
   (`tui_gateway/methods_session.py`) copy a session's turns into a new row with no
   `parent_session_id` and no `_branched_from`. Only the owner's own client can make one.
   Nor is a branch found that was never judged before its parent was deleted, unless the
-  session it was branched from carries a mark itself.
+  session it was branched from carries a mark itself; nor the child of an in-process
+  compression whose parent row alone is deleted, which names its parent by the link only.
 - A side agent built in the stdio TUI or Desktop backend's own process (not the daemon)
   carries no parent and no row, so it is active even when the session that started it
   is not (a Bot Chat open there, say). In that same process a model switch on a draft
@@ -210,8 +214,9 @@ What this does not cover:
   Windows, and an agent built while `state.db` could not be read. For good: a chat the
   owner titled exactly "Bot Chat", "Bot Chat #N", "Bot Chat (...)" or "Group: ...", even
   briefly, once it is judged under that title, with every branch of it and every later
-  segment (`/new`) of such a branch. And every session of a home whose marks folder
-  cannot be read.
+  segment (`/new`) of such a branch; and a branch cut before its parent was handed a
+  turn someone else wrote. And every session of a home whose marks folder cannot be
+  read.
 - An automation turn inside an owner's chat (a cron delivery or notice, which Hermes
   marks with a `display_kind`) is skipped as synthetic, so the assistant's reply to it
   is uploaded with the previous real turn.
