@@ -150,6 +150,13 @@ def test_fetch_session_schema_stays_short():
     assert words <= 120, words
 
 
+def test_self_since_is_on_the_two_recall_tools_only():
+    """The compaction cut narrows self-exclusion, which only the two searches run;
+    fetch_session, recall_feedback and remember reject an unknown argument."""
+    have = {t.name for t in _listed() if "self_since" in t.parameters["properties"]}
+    assert have == {"recall", "recall_full_turns"}
+
+
 def test_issue_machine_token_hidden_from_list_but_callable():
     """Integration-style, against the real app: tools/list omits the hidden tool,
     tools/call still executes it (the `synapse login` compatibility contract)."""
@@ -321,6 +328,7 @@ def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
                 "limit": 5,
                 "source": "mcp-tool",
                 "self_session": None,
+                "self_since": None,
                 "session_id": None,
                 # The server resolves the caller ONCE and hands the engine a verdict,
                 # never a self-reported id. No credential in this test => UNKNOWN,
@@ -346,3 +354,19 @@ def test_recall_routes_to_overview(monkeypatch):
     monkeypatch.setattr(server, "_recall_engine", stub)
     server.recall("state of X")
     assert [name for name, _ in stub.calls] == ["recall"]
+
+
+def test_the_recall_tools_forward_the_cut(monkeypatch):
+    """self_since reaches the engine untouched; the engine parses it (and ignores it
+    under a session-scoped drill-down)."""
+    stub = _StubEngine()
+    monkeypatch.setattr(server, "_recall_engine", stub)
+    at = "2026-11-12T14:00:00Z"
+    server.recall("q", self_session="s-1", self_since=at)
+    server.recall_full_turns("q", self_session="s-1", self_since=at)
+    server.recall("q")
+    assert [(name, kw["self_session"], kw["self_since"]) for name, kw in stub.calls] == [
+        ("recall", "s-1", at),
+        ("episodes", "s-1", at),
+        ("recall", None, None),
+    ]

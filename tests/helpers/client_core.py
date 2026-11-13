@@ -126,3 +126,35 @@ def load_script(name: str) -> ModuleType:
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+#: The head uuid a built Claude Code transcript's boundary preserves.
+HEAD_UUID = "0b7c2a4e-1111-4c22-9d33-000000000002"
+
+
+def transcript(folder: Path, *, codex: bool, at: str | None) -> Path:
+    """A transcript as each PreToolUse hook is handed one: a Codex rollout file whose
+    last ``compacted`` line is stamped ``at``, or a Claude Code transcript whose last
+    boundary preserves a head stamped ``at``. ``at=None``: a session that never
+    compacted."""
+    if codex:
+        rows: list[dict[str, object]] = [
+            {"timestamp": "2026-11-12T13:00:00Z", "type": "session_meta", "payload": {}},
+            {"timestamp": "2026-11-12T13:05:00Z", "type": "response_item", "payload": {}},
+        ]
+        if at is not None:
+            rows.append({"timestamp": at, "type": "compacted", "payload": {"message": "x"}})
+    else:
+        rows = [{"type": "user", "uuid": HEAD_UUID, "timestamp": at or "2026-11-12T13:05:00Z"}]
+        if at is not None:
+            rows.append(
+                {
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "timestamp": "2026-11-12T14:30:00Z",
+                    "compactMetadata": {"preservedSegment": {"headUuid": HEAD_UUID}},
+                }
+            )
+    path = folder / ("rollout.jsonl" if codex else "transcript.jsonl")
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return path

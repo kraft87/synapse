@@ -103,9 +103,11 @@ irm http://localhost:8765/install | python -
 ```
 
 That unpacks the client into `~/.synapse/lib/<version>/`, puts a `synapse` command in
-`~/.synapse/bin` (it prints the line to add to your shell profile if that isn't on `PATH`;
-on Windows it adds it to your user `PATH`), and records the server URL. Python 3.11+ is
-the only requirement. Then:
+`~/.synapse/bin`, and records the server URL. To make the command run from any shell it
+then does the least it can: where `~/.local/bin` is already on `PATH` it links `synapse`
+into it (never over a file of that name that is not its own link); otherwise it prints the
+line to add to your shell profile; on Windows it adds `~/.synapse/bin` to your user `PATH`.
+Python 3.11+ is the only requirement. Then:
 
 ```bash
 synapse login --token     # server without sign-in: paste the step 3 token when asked
@@ -357,9 +359,11 @@ env var says so in its HANDOFF.md entry.
   plugin's static token. The helper's failures (wrong server, no token) are logged to
   `~/.synapse/logs/mcp_headers.log`. `synapse install` puts the harnesses' own copy of the
   URL back in step with `config.json`.
-- **`synapse` not found.** Install the client (step 4) and add `~/.synapse/bin` to `PATH` as
-  the installer printed. Inside Claude Code sessions the plugin's own `bin/` provides
-  `synapse` and `synapse-login` too.
+- **`synapse` not found.** Install the client (step 4). On Linux and macOS the installer
+  links the command into `~/.local/bin` when that directory is on `PATH`; when it is not,
+  or a different `synapse` already sits there, it prints the line that adds `~/.synapse/bin`
+  to `PATH` instead: add that line and open a new shell. Inside Claude Code sessions the
+  plugin's own `bin/` provides `synapse` and `synapse-login` too.
 - **Codex hooks don't run.** Codex skips hooks nobody trusted: run `/hooks` in `codex` and
   trust the Synapse ones. `synapse update` never changes their commands, so trust survives
   updates.

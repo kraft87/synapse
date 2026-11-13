@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
@@ -64,6 +65,19 @@ def _pool(n: int = 4) -> list[dict]:
         }
         for i in range(n)
     ]
+
+
+_CUT = datetime(2026, 11, 12, 14, 0, tzinfo=UTC)
+
+
+def _own_pool() -> list[dict]:
+    """e:0 is the caller's turn from before its last compaction (``_CUT``), e:1 one from
+    after it; e:2 and e:3 belong to other sessions."""
+    p = _pool()
+    p[0].update(session_id="MY-SESSION", created_at=_CUT - timedelta(hours=1))
+    p[1].update(session_id="MY-SESSION", created_at=_CUT + timedelta(hours=1))
+    p[2]["session_id"], p[3]["session_id"] = "other-2", "other-3"
+    return p
 
 
 def _wired(db_url: str, scores: list[float]) -> Recall:
@@ -157,9 +171,13 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     assert "n_bm25_lifted" not in served  # BM25 fusion deleted 2026-10-09
 
 
-def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, full_surface):
+@pytest.mark.parametrize("self_since", [None, "", "not a time"])
+def test_recall_kind_self_excludes_calling_session(
+    conn, db_url, monkeypatch, full_surface, self_since
+):
     """No flag: a hook-injected self_session always drops the caller's own episodes from
-    the overview, and the envelope records how many were dropped."""
+    the overview, and the envelope records how many were dropped. With no usable cut the
+    whole session stays hidden and the cut's keys are absent."""
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry self exclusion recall {uuid.uuid4().hex[:8]}"
     p = _pool()
@@ -170,7 +188,13 @@ def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, fu
         dict(e) for e in p
     ]
     mark = _watermark(conn)
-    out = engine.recall(q, source="mcp-tool", surface=full_surface, self_session="MY-SESSION")
+    out = engine.recall(
+        q,
+        source="mcp-tool",
+        surface=full_surface,
+        self_session="MY-SESSION",
+        self_since=self_since,
+    )
     assert [it["id"] for it in out["episodes"]] == ["e:2", "e:3"]
 
     row = _newest(conn, engine, "recall", "served_ids", mark)
@@ -179,6 +203,49 @@ def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, fu
     assert served["self_session"] == "MY-SESSION"
     assert served["n_self_excluded"] == 2
     assert served["n_self_facts_excluded"] == 0
+    assert "self_since" not in served and "n_self_served" not in served
+
+
+def test_recall_kind_with_a_cut_serves_the_callers_turns_from_before_it(
+    conn, db_url, monkeypatch, full_surface
+):
+    """self_since narrows self-exclusion to the caller's turns at or after its last
+    compaction, in all three places it runs (episodes, facts, the overlay), and the
+    envelope records the cut as applied plus how many of the caller's turns served."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    q = f"telemetry self cut recall {uuid.uuid4().hex[:8]}"
+    p = _own_pool()
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine._search_bm25_episodes = lambda q_, proj, limit, sid=None, allowed=None, own=None: [
+        dict(e) for e in p
+    ]
+    engine._search_kg = lambda *a, **k: ([{"fact": "f", "_uuid": "f-1", "_date": None}], [])
+    cuts: list[tuple[str, object]] = []
+
+    def _own(uuids, session, since=None):
+        cuts.append(("facts", since))
+        return set()
+
+    engine._self_session_facts = _own
+    engine._episode_supersessions = lambda ids, **k: cuts.append(("overlay", k["since"])) or {}
+    mark = _watermark(conn)
+    out = engine.recall(
+        q,
+        source="mcp-tool",
+        surface=full_surface,
+        self_session="MY-SESSION",
+        self_since="2026-11-12T09:00:00-05:00",
+    )
+    assert sorted(it["id"] for it in out["episodes"]) == ["e:0", "e:2", "e:3"]
+    # The overlay asks for the other turns, then for the caller's own (a lookup of its own).
+    assert cuts == [("facts", _CUT), ("overlay", _CUT), ("overlay", _CUT)]
+
+    row = _newest(conn, engine, "recall", "served_ids", mark)
+    assert row is not None
+    (served,) = row
+    assert served["self_since"] == "2026-11-12T14:00:00+00:00"
+    assert served["n_self_served"] == 1
+    assert served["n_self_excluded"] == 1
 
 
 def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypatch, full_surface):
@@ -195,7 +262,7 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
     ]
     asked: list[tuple[list[str], str]] = []
 
-    def _own(uuids, session):
+    def _own(uuids, session, since=None):
         asked.append((list(uuids), session))
         return {u for u in uuids if u.startswith("own-")}
 
@@ -270,10 +337,11 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     assert served["floor"] == pytest.approx(0.58)
 
 
-def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
+@pytest.mark.parametrize("self_since", [None, "", "not a time"])
+def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch, self_since):
     """With a hook-injected self_session, the envelope gains self_session +
     n_self_excluded and the caller's own turns never serve; hookless calls
-    (the test above) keep the lean key set."""
+    (the test above) keep the lean key set. No usable cut: no cut keys."""
     q = f"telemetry self exclusion {uuid.uuid4().hex[:8]}"
     p = _pool()
     for i, ep in enumerate(p):
@@ -286,7 +354,7 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     )
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
-    out = server.recall_full_turns(q, self_session="MY-SESSION")
+    out = server.recall_full_turns(q, self_session="MY-SESSION", self_since=self_since)
     assert [it["id"] for it in out["episodes"]] == ["e:2", "e:3"]
 
     row = _newest(conn, engine, "episodes", "served_ids", mark)
@@ -295,6 +363,33 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     assert served["self_session"] == "MY-SESSION"
     assert served["n_self_excluded"] == 2
     assert served["limit"] == 5
+    assert "self_since" not in served and "n_self_served" not in served
+
+
+def test_episodes_kind_with_a_cut_serves_the_callers_turns_from_before_it(
+    conn, db_url, monkeypatch
+):
+    """recall_full_turns forwards self_since: the caller's turn from before its last
+    compaction serves again and the envelope records the cut and the count."""
+    q = f"telemetry self cut episodes {uuid.uuid4().hex[:8]}"
+    p = _own_pool()
+    engine = _wired(db_url, [0.9, 0.8, 0.7])  # scores for the 3 survivors
+    engine._episode_pool = (
+        lambda q_, emb, proj, session_id=None, allowed_projects=None, own_surface=None: [
+            dict(e) for e in p
+        ]
+    )
+    monkeypatch.setattr(server, "_recall_engine", engine)
+    mark = _watermark(conn)
+    out = server.recall_full_turns(q, self_session="MY-SESSION", self_since="2026-11-12T14:00:00Z")
+    assert sorted(it["id"] for it in out["episodes"]) == ["e:0", "e:2", "e:3"]
+
+    row = _newest(conn, engine, "episodes", "served_ids", mark)
+    assert row is not None
+    (served,) = row
+    assert served["self_since"] == "2026-11-12T14:00:00+00:00"
+    assert served["n_self_served"] == 1
+    assert served["n_self_excluded"] == 1
 
 
 # ---------------------------------------------------------------------------

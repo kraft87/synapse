@@ -19,6 +19,7 @@ import time
 import types
 import uuid
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -661,6 +662,123 @@ def test_a_failed_tool_call_is_a_json_error(plugin, server, tmp_path, user):
     assert out == {"error": "bad", "tool": "recall", "code": -32602}
     out = json.loads(provider.handle_tool_call("recall", "not an object"))  # type: ignore[arg-type]
     assert out["error"] == "the arguments must be a JSON object"
+
+
+# ---------------------------------------------------------------------------
+# The compression cut
+# ---------------------------------------------------------------------------
+
+_CUT = "2026-11-12T15:00:00.250000+00:00"
+_OTHER = "20261112_120000_ffffff"
+
+
+def _module(plugin: types.ModuleType) -> types.ModuleType:
+    return sys.modules[plugin.__name__ + ".synapse_client.harnesses.hermes.provider"]
+
+
+def _compress(provider: Any) -> None:
+    """An in-place compression as Hermes runs it: the upload, the commit, the switch."""
+    provider.on_pre_compress(_conversation(2))
+    provider.on_session_end(_conversation(2))
+    provider.on_session_switch(_SID, parent_session_id=_SID, reset=False, reason="compression")
+
+
+def _sent(provider: Any, server: _Server, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """The arguments ``tool`` reached the server with."""
+    provider.handle_tool_call(tool, args)
+    return server.posts("/mcp")[-1]["params"]["arguments"]
+
+
+def test_no_cut_before_a_compression(plugin, server, tmp_path):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    assert _sent(provider, server, "recall", {"query": "x"}) == {"query": "x", "self_session": _SID}
+    provider.on_session_switch(_SID, rewound=True)
+    provider.on_session_switch(_SID, parent_session_id=_SID, reason="resume")
+    assert "self_since" not in _sent(provider, server, "recall_full_turns", {"query": "x"})
+
+
+def test_an_in_place_compression_sets_the_cut_on_the_two_recall_tools(
+    plugin, server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(_module(plugin), "_clock", lambda: _CUT)
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _compress(provider)
+    own = {"self_session": _SID, "self_since": _CUT}
+    assert _sent(provider, server, "recall", {"query": "x"}) == {"query": "x", **own}
+    assert _sent(provider, server, "recall_full_turns", {"query": "x"}) == {"query": "x", **own}
+    assert _sent(provider, server, "fetch_session", {"session_id": "self"}) == {
+        "session_id": "self",
+        "self_session": _SID,
+    }
+    assert _sent(provider, server, "recall_feedback", {"query": "x"}) == {
+        "query": "x",
+        "session_id": _SID,
+    }
+    assert _sent(provider, server, "remember", {"content": "x"}) == {
+        "content": "x",
+        "session_id": _SID,
+    }
+    assert _sent(provider, server, "fetch", {"ids": ["e:1"]}) == {"ids": ["e:1"]}
+    # Never over a value the call carries, never with someone else's session.
+    given = {"query": "x", "self_since": "2026-11-01T00:00:00Z"}
+    assert _sent(provider, server, "recall", given)["self_since"] == "2026-11-01T00:00:00Z"
+    assert "self_since" not in _sent(
+        provider, server, "recall", {"query": "x", "self_session": "s"}
+    )
+    provider.on_session_switch(_SID, rewound=True)  # an undo keeps the id, and the cut
+    assert _sent(provider, server, "recall", {"query": "x"})["self_since"] == _CUT
+
+
+def test_the_cut_is_the_client_clock_at_the_commit(plugin, server, tmp_path):
+    """Hermes stamps each message with time.time(), and the server stores the turn under
+    that stamp: the cut is the same clock, read when the compression commits."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    before = time.time()
+    _compress(provider)
+    after = time.time()
+    cut = datetime.fromisoformat(_sent(provider, server, "recall", {"query": "x"})["self_since"])
+    assert cut.utcoffset() == timedelta(0)
+    assert before - 1e-6 <= cut.timestamp() <= after + 1e-6
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        {"new_session_id": _OTHER, "parent_session_id": _SID, "reason": "compression"},
+        {"new_session_id": _OTHER, "parent_session_id": _SID, "reason": "branch"},
+        {"new_session_id": _SID, "reset": True, "reason": "new_session"},
+    ],
+    ids=["compressed-into-a-new-id", "new-id", "reset"],
+)
+def test_a_new_id_or_a_reset_drops_the_cut(plugin, server, tmp_path, monkeypatch, switch):
+    monkeypatch.setattr(_module(plugin), "_clock", lambda: _CUT)
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _compress(provider)
+    provider.on_session_switch(**switch)
+    assert _sent(provider, server, "recall", {"query": "x"}) == {
+        "query": "x",
+        "self_session": switch["new_session_id"],
+    }
+
+
+def test_a_restart_forgets_the_cut(plugin, server, tmp_path, monkeypatch):
+    monkeypatch.setattr(_module(plugin), "_clock", lambda: _CUT)
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _compress(provider)
+    _start(provider, tmp_path / "hermes-a", resumed=True)
+    assert "self_since" not in _sent(provider, server, "recall", {"query": "x"})
+    fresh = _start(_new(plugin), tmp_path / "hermes-a", resumed=True)
+    assert "self_since" not in _sent(fresh, server, "recall", {"query": "x"})
+
+
+def test_a_cut_that_cannot_be_taken_never_raises(plugin, server, tmp_path, monkeypatch):
+    def broken() -> str:
+        raise OSError("no clock")
+
+    monkeypatch.setattr(_module(plugin), "_clock", broken)
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _compress(provider)
+    assert _sent(provider, server, "recall", {"query": "x"}) == {"query": "x", "self_session": _SID}
 
 
 # ---------------------------------------------------------------------------

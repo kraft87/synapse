@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -34,17 +35,20 @@ _KG_SCOPE_PROBE_SQL = (
 )
 
 
-def _self_only_sql(alias: str) -> str:
+def _self_only_sql(alias: str, cut: bool = False) -> str:
     """SQL predicate: every source episode of fact ``alias`` belongs to the session bound at %s.
 
     False for a fact with no recorded source (web artifacts, a malformed ``episodes`` value),
-    so self-exclusion never drops what it cannot attribute."""
+    so self-exclusion never drops what it cannot attribute. With ``cut``, a source counts as
+    the session's only from the time bound at the next %s (its last compaction): a fact with
+    any source before that is gone from the caller's context, so it serves."""
+    since = " AND e.created_at >= %s" if cut else ""
     return (
         f"(jsonb_typeof({alias}.episodes) = 'array' AND jsonb_array_length({alias}.episodes) > 0 "
         f"AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text({alias}.episodes) AS src(eid) "
         "WHERE NOT EXISTS (SELECT 1 FROM episodes e "
         "WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END "
-        "AND e.session_id = %s)))"
+        f"AND e.session_id = %s{since})))"
     )
 
 
@@ -248,7 +252,9 @@ class RecallSourcesMixin:
             _warn(f"KG facts leg failed ({_err_brief(e)}): no facts served.")
             return [], []
 
-    def _self_session_facts(self, uuids: list[str], self_session: str) -> set[str]:
+    def _self_session_facts(
+        self, uuids: list[str], self_session: str, since: datetime | None = None
+    ) -> set[str]:
         """The facts among ``uuids`` whose every source episode belongs to ``self_session``.
 
         The KG half of ``_exclude_self``: the drain extracts facts while a session is
@@ -256,7 +262,8 @@ class RecallSourcesMixin:
         served facts, in 10% of hook-injected recalls, over the 14 days to 2026-10-09).
         A fact the session only reinforced keeps an older source and still serves, and
         a fact with no recorded source (web artifacts, a malformed ``episodes`` value)
-        is never excluded. Fails open: a lookup error serves the facts as before.
+        is never excluded. ``since`` (the caller's last compaction) narrows "own" to the
+        sources at or after it. Fails open: a lookup error serves the facts as before.
         """
         if not uuids:
             return set()
@@ -264,8 +271,8 @@ class RecallSourcesMixin:
             with self._pg() as conn:
                 rows = conn.execute(
                     "SELECT r.uuid FROM kg_relationships r "
-                    f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
-                    (uuids, self_session),
+                    f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r', since is not None)}",
+                    (uuids, self_session) if since is None else (uuids, self_session, since),
                 ).fetchall()
         except Exception as e:
             logger.warning("self-session fact lookup failed: %s", e)
@@ -370,6 +377,7 @@ class RecallSourcesMixin:
         allowed_projects: list[str] | None = None,
         self_session: str | None = None,
         served_text: dict[int, str] | None = None,
+        since: datetime | None = None,
     ) -> dict[int, list[str]]:
         """Map served episode ids -> the CURRENT facts that superseded a claim each made.
 
@@ -383,7 +391,8 @@ class RecallSourcesMixin:
         served, and P is what ties it to the episode.
 
         ``self_session`` drops a successor N sourced only from the calling session, the
-        overlay half of self-exclusion (see ``_self_session_facts``).
+        overlay half of self-exclusion (see ``_self_session_facts``); ``since`` narrows
+        that to the sources at or after the caller's last compaction, as there.
 
         ``served_text`` (episode id -> the text actually served for it) keeps a successor
         only where that text states P's claim (``OVERLAY_MIN_SUPPORT``).
@@ -400,8 +409,10 @@ class RecallSourcesMixin:
             scope_args = [allowed_projects, allowed_projects]
         self_sql = ""
         if self_session:
-            self_sql = f"AND NOT {_self_only_sql('n')} "
+            self_sql = f"AND NOT {_self_only_sql('n', since is not None)} "
             scope_args.append(self_session)
+            if since is not None:
+                scope_args.append(since)
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
         params: list[Any] = [
             *(json.dumps([i]) for i in episode_ids),

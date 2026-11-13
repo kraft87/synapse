@@ -8,6 +8,12 @@ to the tool input as `self_session` via the PreToolUse `updatedInput` mechanism;
 the exclusion is keyed to exactly that id, so two concurrent sessions never
 suppress each other's genuinely relevant content.
 
+recall / recall_full_turns also get `self_since`, the time of this session's last
+compaction, read from the payload's `transcript_path` (synapse_client.compaction): the
+turns before it have left the context, so serving hides only the ones since. Only when
+`self_session` is this session's id, and never on the other three tools, whose schemas
+reject an unknown argument.
+
 recall_feedback / remember: the same id lands in each tool's existing
 `session_id` param — feedback reports group by session (same-session noise
 analysis needs it) and remembered episodes attach to the writing session.
@@ -22,10 +28,12 @@ one release, from root-token callers only, purely so a 0.16.x plugin keeps worki
 during the migration.
 
 Fail-open by design: on any error, exit 0 with no output — the tool call
-proceeds unmodified and the server simply skips self-exclusion / grouping.
+proceeds unmodified and the server simply skips self-exclusion / grouping. A failure
+to read the cut only loses the cut.
 """
 
 import json
+import os
 import re
 import sys
 
@@ -36,6 +44,19 @@ import sys
 _SYNAPSE_TOOL = re.compile(
     r"^mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$"
 )
+_SINCE_TOOLS = ("recall", "recall_full_turns")
+
+
+def _cut(transcript_path):
+    """The session's last compaction time, or None. The client core is imported the way
+    synapse_project.py does, here so that a core that cannot load costs only the cut."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from synapse_client.compaction import claude_code_cut
+
+        return claude_code_cut(transcript_path)
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -59,6 +80,17 @@ def main() -> None:
             if not tool_input.get(field):  # already set (retry/nested call) — don't overwrite
                 tool_input[field] = session_id
                 changed = True
+            transcript = payload.get("transcript_path")
+            if (
+                base in _SINCE_TOOLS
+                and transcript
+                and tool_input.get("self_session") == session_id
+                and not tool_input.get("self_since")
+            ):
+                cut = _cut(transcript)
+                if cut:
+                    tool_input["self_since"] = cut
+                    changed = True
 
         if not changed:
             return

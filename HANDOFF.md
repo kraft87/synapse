@@ -68,6 +68,115 @@ changed, what to do on each machine, what was proven, and what is still open.
 **Still open**: `recall_metrics.group_id` (history) and the `group_id` argument that
 `recall` still accepts and ignores.
 
+## 2026-11-12 — install: `synapse` is linked into `~/.local/bin` when that is on PATH
+
+**What changed**
+
+- **The command works without a profile edit where the usual user bin directory exists.**
+  The installer keeps the client in `~/.synapse` and its shim in `~/.synapse/bin`, as
+  before. On Linux and macOS, when `~/.synapse/bin` is not on `PATH` but `~/.local/bin` is
+  an existing directory on `PATH`, it now also creates `~/.local/bin/synapse` as a
+  symlink to the shim, and says so. Before, it only printed the line to add to a shell
+  profile, so on a machine where nobody added it the command was not found outside a
+  Claude Code session.
+- **It takes the name only when the name is free.** A file, or a link to anything else,
+  named `synapse` in `~/.local/bin` is left as it is; the installer says so and prints the
+  profile line as before. It never creates `~/.local/bin` and never edits a profile.
+- **Only the default home is linked.** An install under a `SYNAPSE_HOME` other than
+  `~/.synapse` is a side install and gets the printed line, never the link.
+- **Windows is unchanged** (the installer already adds `~/.synapse/bin` to the user
+  `PATH` there).
+
+**On each machine**
+
+1. Nothing until the server runs this image. Then `synapse update` (or
+   `~/.synapse/bin/synapse update` where the command is not found yet): the update runs the
+   installer again, which creates the link. No plugin version change; the installer is
+   served by the server.
+2. A line that adds `~/.synapse/bin` to `PATH` in a shell profile can stay or go; with it
+   the installer finds the directory on `PATH` and creates no link.
+3. To remove the client by hand, remove `~/.local/bin/synapse` along with `~/.synapse`.
+
+**Proven**
+
+- `tests/test_install_route.py` runs the rendered installer in a subprocess with a scratch
+  `HOME`: the default home with `~/.local/bin` on `PATH` gets the link, `synapse` resolves
+  through it and runs the installed client, no profile line is printed, and a second run
+  finds the link and says nothing; with `~/.local/bin` missing or off `PATH` there is no
+  link, the directory is not created and the line is printed; a regular file, a link
+  elsewhere and a dangling link of that name are each left untouched; a `SYNAPSE_HOME`
+  elsewhere is never linked.
+- Each rule was broken once (side home linked, off-`PATH` directory linked, foreign file
+  replaced, own link not recognized, link never made) and a test failed each time.
+
+**Still open**
+
+- No uninstall command exists; removal is by hand (step 3).
+
+## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.6)
+
+**What changed**
+
+- **Self-exclusion stops at the last compaction.** `recall` and `recall_full_turns` leave
+  out the calling session's own turns because the model still holds them. That stops being
+  true when the harness compacts the conversation: the turns before that point are gone
+  from the context and were still hidden, so a long session could not look up its own
+  earlier work. Both tools now take `self_since`, the time of the session's last
+  compaction. With it the server hides only the session's turns from that time on, and a
+  fact counts as the session's own only when every source is one of those turns. Without
+  it nothing changes.
+- **Earlier own turns are added, never swapped in.** With the cut, the other sessions'
+  turns served are exactly those served without it. At most two of the session's earlier
+  turns are then added (`SYNAPSE_RECALL_SELF_PRIOR_LIMIT`, `0` = none), each only when it
+  scores at least as well as the weakest other turn served, so a list can be two longer.
+- **The client reads the compaction time from the transcript.** The Claude Code and Codex
+  PreToolUse hooks add `self_since` next to `self_session`
+  (`plugin/synapse_client/compaction.py`: the last `compact_boundary` line of a Claude Code
+  transcript, at the first message the harness kept verbatim when the line names one; the
+  last `compacted` line of a Codex rollout). The Hermes provider takes the time when Hermes
+  commits an in-place compression. A transcript that cannot be read, or one with no
+  compaction, sends nothing, and the whole session stays hidden as before.
+- **Telemetry.** A call that carried a cut records `self_since` and `n_self_served` (how
+  many of the served episodes are the caller's own) in `recall_metrics.served_ids`.
+
+**On each machine**
+
+1. Nothing to migrate and no setting to change. The server part takes effect with the image.
+2. `synapse update` for plugin 0.24.6; until then a client sends no `self_since` and
+   behaves as before. A server older than this release rejects the argument, so the client
+   must not get ahead of its server; `synapse update` cannot, because the installer serves
+   the client that matches the server it runs on.
+
+**Proven**
+
+- With no cut the SQL and its parameters are what they were. On the standard recall bench
+  (491 questions, no cut sent) the result is identical to main's in 475, where main run
+  twice twenty minutes apart agrees with itself in 465, and every gold answer one finds
+  the other finds.
+- Replayed on 48 real recalls made after a compaction: the old path served none of the
+  session's own turns; with the cut, 20 calls served one or two, and 21 gained facts from
+  earlier in the session. A pairwise judge preferred the new results in 20 of the 30 calls
+  whose results changed and the old in 3, with 7 ties. (Before the earlier turns had a lane
+  of their own, when they competed for the same places, it was 17 and 12.)
+- In 45 of those 48 calls the other sessions' turns were identical with and without the
+  cut. The 3 that differed are the reranker's own variation, which repeats of the old path
+  alone show too: a score moves by about 0.001 between two identical calls, and two
+  passages with the same text come back in either order.
+- With the cut, both tools serve the same other-session turns, in the same order and with
+  the same scores, as without it: with the reranker on, degraded, and on the score-cutoff
+  path, including a pool where more own turns than the passage window holds rank first.
+- Each rule has a test that fails when the rule is broken: the comparison at the cut; an
+  own turn with no usable time stays hidden; the session-scoped drill-down ignores the cut;
+  the hooks add it only to the two tools, only for their own session, and never overwrite
+  one; a marker that appears inside tool output is skipped.
+
+**Still open**
+
+- Hermes keeps a verbatim tail across an in-place compression. Those few turns are stamped
+  before the cut, so they can be served while still in the context.
+- Subagent calls are unchanged: they carry the parent's session id, and now its cut.
+- Not run on Windows: the scan maps the transcript read-only while the harness appends to it.
+
 ## 2026-11-12 — plugin: the Claude Code hooks run on the client core (plugin 0.24.5)
 
 **What changed**
@@ -289,6 +398,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   `systemMessage` warning, the 20 s kill, the skills sync's time on a large folder, and
   payloads Codex might send that the tests do not.
 - Claude Code's hooks are next onto the core.
+
 
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 

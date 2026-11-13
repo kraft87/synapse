@@ -46,6 +46,7 @@ def register(
         project: str | None = None,
         session_focus: list[str] | None = None,
         self_session: str | None = None,
+        self_since: str | None = None,
         surface: str | None = None,
     ) -> dict:
         """Search the user's long-term memory: tens of thousands of reranked
@@ -93,6 +94,8 @@ def register(
             self_session: NEVER set this yourself. The client's PreToolUse hook injects
                 the calling session's id so serving can suppress self-session domination;
                 calls without it simply skip that suppression.
+            self_since: NEVER set this yourself; the client hook injects the time of this
+                session's last compaction, so only your turns since then are left out.
             surface: DEPRECATED and ignored — the server identifies the calling
                 device from its own credential. Never set it.
         """
@@ -105,6 +108,7 @@ def register(
                 session_focus=session_focus or [],
                 source="mcp-tool",
                 self_session=self_session,
+                self_since=self_since,
                 trust=trust,
             )
             return _served(out, trust)
@@ -115,6 +119,7 @@ def register(
         project: str | None = None,
         limit: int = 5,
         self_session: str | None = None,
+        self_since: str | None = None,
         session_id: str | None = None,
         surface: str | None = None,
     ) -> dict:
@@ -155,6 +160,8 @@ def register(
             self_session: NEVER set this yourself. The client's PreToolUse hook
                 injects the calling session's id so your own session's turns are
                 excluded; calls without it simply skip that exclusion.
+            self_since: NEVER set this yourself; the client hook injects the time of this
+                session's last compaction, so only your turns since then are left out.
             session_id: Scope to ONE conversation — the `session` field from a
                 recall/fetch result, or "self" for the current session.
             surface: DEPRECATED and ignored — the server identifies the calling
@@ -178,6 +185,7 @@ def register(
                 limit=max(1, min(int(limit), 10)),
                 source="mcp-tool",
                 self_session=self_session,
+                self_since=self_since,
                 session_id=session_id,
                 trust=trust,
             )

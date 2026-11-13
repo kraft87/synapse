@@ -10,6 +10,12 @@ Codex's ``updatedInput``. recall_feedback and remember get it as
 would fail their pydantic validation) so reports group by session and
 remembered episodes attach to the writing session.
 
+recall / recall_full_turns also get ``self_since``, the time of this session's last
+compaction, read from the rollout file Codex passes as ``transcript_path``
+(synapse_client.compaction, in the Claude plugin beside this one): the turns before it
+have left the context, so serving hides only the ones since. Only when ``self_session``
+is this session's id, and never on the other three tools.
+
 The ``surface`` injection is GONE (schema 054): trust is bound to the per-device token
 the client authenticates with, so a host name asserted by the client identifies nothing
 and there is no param left to inject.
@@ -19,12 +25,14 @@ That auto-approves the call — acceptable here because the matched tools are
 memory lookups plus remember() (a write the user asked for either way), and the
 config matcher plus the in-script guard below both scope this to synapse tools.
 
-Fail-open: on any error, no output — the call proceeds unmodified.
+Fail-open: on any error, no output — the call proceeds unmodified. A failure to read
+the cut only loses the cut.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 
@@ -33,6 +41,21 @@ import sys
 _SYNAPSE_TOOL = re.compile(
     r"^mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$"
 )
+_SINCE_TOOLS = ("recall", "recall_full_turns")
+
+
+def _cut(rollout_path):
+    """The session's last compaction time, or None. The client core lives in the Claude
+    plugin beside this one; ``plugin/`` goes first on sys.path, as synapse_project.py
+    puts it, and the import is here so that a core that cannot load costs only the cut."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(here, "..", "..", "plugin"))
+        from synapse_client.compaction import codex_cut
+
+        return codex_cut(rollout_path)
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -55,6 +78,17 @@ def main() -> None:
             if not tool_input.get(field):  # already set (retry or nested call)
                 tool_input[field] = session_id
                 changed = True
+            transcript = payload.get("transcript_path")
+            if (
+                base in _SINCE_TOOLS
+                and transcript
+                and tool_input.get("self_session") == session_id
+                and not tool_input.get("self_since")
+            ):
+                cut = _cut(transcript)
+                if cut:
+                    tool_input["self_since"] = cut
+                    changed = True
 
         if not changed:
             return

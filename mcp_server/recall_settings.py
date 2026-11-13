@@ -38,6 +38,8 @@ class RecallSettings:
     _FACT_LIMIT: int
     _RECALL_EPISODE_LIMIT: int
     _RECALL_PASSAGE_SRC_K: int
+    _RECALL_SELF_PRIOR_LIMIT: int
+    _RECALL_SELF_PRIOR_CANDIDATES: int
     _RECALL_FLOOR: float
     _KG_OWNER: str
     _RERANK_DOC_CAP: int
