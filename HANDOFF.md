@@ -3,6 +3,89 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — plugin: the Claude Code hooks run on the client core (plugin 0.24.5)
+
+**What changed**
+
+- **`plugin/scripts/config.py` resolves and sends through the core.**
+  - URL, ingest URL, MCP URL, flags and token come from `Settings.load`, fed the plugin's
+    own sources in the old order: the `CLAUDE_PLUGIN_OPTION_*` environment, the
+    `settings.json` plugin options, and the pre-0.20 `credentials.json` and `device.json`.
+    Every name another script, test or doc uses is kept.
+  - `get_json`, `post_json` and `request_json` send through `Transport`. The bearer goes
+    only to the origins of the server, ingest and MCP URLs; before, the helpers sent it to
+    any absolute URL they were given. No shipped script asks for one.
+  - Requests carry `User-Agent: synapse-client/<version> claude-code` (was
+    `synapse-plugin/0.9`).
+- **Session start prints the core's blocks.** `board_block.py` prints the token notice and
+  `context.board_part`, with Claude Code's enrollment explainers passed in;
+  `preferences_block.py` prints `context.preferences_part`. Still two hooks with their
+  own kill switches (`SYNAPSE_BOARD`, `SYNAPSE_PREFS_BLOCK`).
+- **The prompt hook prints `context.prompt_nudge`**, naming `synapse:recall` and
+  `synapse:remember`.
+- **The Stop hook uploads through `Transport`** to the ingest URL exactly as configured
+  (trailing slash and query kept), and asks `private.is_private` about private mode. The
+  marker TTL is still read from the environment only. The shipper is unchanged: byte
+  cursor, chunking, the detached `--ship`, retry bookkeeping, `--catchup`.
+- **`enroll.py`'s explainers are the core's**, with Claude Code's sign-in hints. The core
+  gains `restricted_block(paste_aside=)` for the "/plugin" aside.
+- Core additions, each tested: `Settings.with_sources`, the `notice_part` and
+  `override_notice` source wording, `board_part(not_enrolled=, restricted=)`,
+  `restricted_block(paste_aside=)` and `Transport.open`.
+
+**On each machine**
+
+1. `synapse update` once the server serves 0.24.5. `hooks.json` is byte for byte the
+   same (pinned), so no hook changes.
+2. What a Claude Code user sees: no change in any hook's output for any reply the server
+   sends. The server's logs show the new User-Agent.
+3. Changes only a broken setup or a malformed reply can reach:
+   - `SYNAPSE_URL` of only slashes, an ingest URL from another source, and an enrolled
+     machine: the device-token decision now looks at the ingest URL alone, since the
+     empty base URL is never requested. The notice and token differ in 3 of 4200
+     generated homes.
+   - A board reply whose `text` is not a string now prints, with the notice; before, the
+     hook printed nothing at all. A preferences reply with a non-dict item prints the
+     valid ones; before, nothing.
+   - A clock the platform cannot format: the prompt hook prints nothing and exits 0;
+     before, a traceback and exit 1.
+
+**Proven**
+
+- Full non-db suite: 3866 passed, 34 skipped, 2 xfailed (3781 before). Ruff check and
+  format are clean.
+- New `tests/test_claude_on_core.py` (73 tests), against local fake servers:
+  - the resolution ranking and the token rules, notices byte for byte;
+  - the bearer kept off another origin, for `config.py` and for the Stop hook's upload,
+    redirects included;
+  - each session-start hook's bytes for a normal reply, a 401 enrolled or not, a
+    restricted caller with and without a device token, a 500, the server down and its
+    kill switch;
+  - the prompt hook for each kill switch and source;
+  - the Stop hook's POST (URL, User-Agent, bearer, body), its 401 and 500 log lines and
+    recorded reasons, and the private skip, stale marker and path-like record id;
+  - `hooks.json` unchanged.
+- Old vs new, one fresh process per case, temp homes, made-up tokens:
+  - `config.py` and `mcp_headers.py`, 4200 generated homes: before vs before 0; before
+    vs after 3, the slashes-only URL case above. `mcp_headers.py` identical in all.
+  - The hooks against a fake server, 1112 cases (normal, 401, restricted, 500, hung,
+    not ok, kill switches, malformed replies): only the User-Agent and the two
+    malformed-reply cases above.
+  - `ingest_hook.py --ship`, 318 cases (URL forms, token sources, replies, private
+    markers, TTL values): identical apart from the User-Agent.
+- `recall_nudge.py` takes 26 ms more (median of 30). All of it is `config.py` now
+  importing the core (`typing`, and `dataclasses` pulling in `inspect`), which
+  `recall_feedback_nudge.py` already paid.
+- Read-only smoke on this machine, against the real server: `board_block.py`,
+  `preferences_block.py`, `recall_nudge.py` (timestamp masked) and `mcp_headers.py`
+  print the same bytes from the installed 0.24.1, from 0.24.4 and from this change
+  (compared by length and hash).
+
+**Open**
+
+- Not run on Windows. The hook paths use no POSIX-only calls, and `~` expands as before.
+- The two harnesses' wiring moving into `harnesses/` beside Hermes's.
+
 ## 2026-11-12 — ingest: the transcript line rules live in one module
 
 **What changed**
@@ -63,6 +146,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 - Left as it is: Cursor renders tool results as `[tool:name]` lines, never `[result]`.
 - codex's "a group with only `[context]` is kept" cannot happen: every group after the
   first opens with a user message, which always renders a `[user]` line.
+
 ## 2026-11-12 — plugin-codex: the Codex hooks run on the client core (plugin 0.24.4)
 
 **What changed**

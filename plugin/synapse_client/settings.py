@@ -19,7 +19,7 @@ import os
 import re
 import types
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -70,8 +70,8 @@ def has(data: Mapping[str, Any], name: str) -> bool:
 
 def base_url(url: str) -> str:
     """``url`` without a trailing slash or a pasted endpoint suffix (``/ingest``,
-    ``/recall``, ``/mcp``, ``/skills``); "" stays "". Lenient, as config.py's
-    ``_base_url`` is: an unusual URL is kept, not rejected."""
+    ``/recall``, ``/mcp``, ``/skills``); "" stays "". Lenient, as the hooks have always
+    been: an unusual URL is kept, not rejected."""
     out = (url or "").rstrip("/")
     for suffix in _ENDPOINTS:
         # a path segment only: a host that happens to be named "mcp" stays
@@ -114,6 +114,21 @@ def _read_config(path: Path) -> dict[str, Any]:
 
 def _frozen(data: Mapping[str, Any]) -> Mapping[str, Any]:
     return types.MappingProxyType(dict(data))
+
+
+def _snapshot(environ: Mapping[str, str]) -> dict[str, str]:
+    """The ``SYNAPSE_*`` variables of ``environ``: all the settings read from it."""
+    return {k: v for k, v in environ.items() if k.startswith("SYNAPSE_")}
+
+
+def _extras(
+    extra_candidates: Iterable[tuple[str, Mapping[str, Any]]],
+) -> tuple[tuple[str, dict[str, str]], ...]:
+    """Each extra source's values as the env strings they stand for; empty ones dropped."""
+    return tuple(
+        (str(source), {str(k): str(v) for k, v in values.items() if v not in (None, "")})
+        for source, values in extra_candidates
+    )
 
 
 def _lookup(
@@ -174,6 +189,32 @@ class Settings:
         Only ``SYNAPSE_*`` names are kept from the environment."""
         return _lookup(self.environ, self.config, self.extras, name, default)
 
+    def with_sources(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+        config: Mapping[str, Any] | None = None,
+        extra_candidates: Iterable[tuple[str, Mapping[str, Any]]] | None = None,
+    ) -> Settings:
+        """This value with the sources ``flag`` reads replaced, each taken as ``load``
+        takes it; the URL, the token and the enrollment stay as resolved. Reads nothing.
+
+        For an adapter whose sources change after it loaded: a hook's kill switches
+        follow the live environment, and a CLI that writes config.json reads its own
+        write back from the copy it holds."""
+        return replace(
+            self,
+            environ=self.environ if environ is None else _frozen(_snapshot(environ)),
+            config=self.config if config is None else _frozen(config),
+            extras=(
+                self.extras
+                if extra_candidates is None
+                else tuple(
+                    (source, _frozen(values)) for source, values in _extras(extra_candidates)
+                )
+            ),
+        )
+
     @classmethod
     def load(
         cls,
@@ -200,17 +241,14 @@ class Settings:
         Never raises over a missing or malformed config.json: that reads as nothing
         configured, as it does for the hooks."""
         environ = os.environ if env is None else env
-        snapshot = {k: v for k, v in environ.items() if k.startswith("SYNAPSE_")}
+        snapshot = _snapshot(environ)
         home_path = (
             Path(home)
             if home is not None
             else _expand(snapshot.get("SYNAPSE_HOME") or "~/.synapse", environ)
         )
         config = _read_config(home_path / "config.json")
-        extras = tuple(
-            (str(source), {str(k): str(v) for k, v in values.items() if v not in (None, "")})
-            for source, values in extra_candidates
-        )
+        extras = _extras(extra_candidates)
         url = base_url(
             _lookup(snapshot, config, extras, "SYNAPSE_URL")
             or _lookup(snapshot, config, extras, "SYNAPSE_INGEST_URL")

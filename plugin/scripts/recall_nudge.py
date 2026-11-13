@@ -21,6 +21,10 @@ host-local time): remember() and timeline references need the current moment,
 and the model otherwise only knows the session-start date. The weekday is spelled
 out because deriving it from a bare date is exactly the arithmetic models get wrong.
 
+The two lines are the client core's (synapse_client.context.prompt_nudge), with the
+tools named as Claude Code shows them to the model; this hook prints them in the
+UserPromptSubmit envelope.
+
 Kill switches: SYNAPSE_RECALL_NUDGE=0, SYNAPSE_PROMPT_TIMESTAMP=0
 (env or plugin install options).
 """
@@ -30,31 +34,26 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import _cfg
+import config
+
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client import context
 
 
 def main() -> None:
-    lines = []
-    if _cfg("SYNAPSE_PROMPT_TIMESTAMP", "1") != "0":
-        lines.append(time.strftime("[%a %Y-%m-%d %H:%M:%S %Z]"))
-    if _cfg("SYNAPSE_RECALL_NUDGE", "1") != "0":
-        lines.append(
-            "[Synapse] IMPORTANT: the user's cross-session history is searchable — assume "
-            "it has context on any past work, project, device, or person they name. BEFORE "
-            "answering anything that references the past: synapse:recall (skip only if the "
-            "answer is already in this conversation). About to say 'noted' or 'I'll "
-            "remember'? Call synapse:remember FIRST, then reply."
-        )
-    if lines:
+    text = context.prompt_nudge(
+        config.live_settings(), recall="synapse:recall", remember="synapse:remember"
+    )
+    if text:
         print(
             json.dumps(
                 {
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
-                        "additionalContext": "\n".join(lines),
+                        "additionalContext": text,
                     }
                 }
             )

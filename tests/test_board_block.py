@@ -14,8 +14,10 @@ It no longer sends a ``surface`` param: the bearer identifies the caller now, an
 host name the client asserts is evidence of nothing. Enrollment itself is interactive
 (it prints a sign-in code and waits for a human), so the hook never runs it.
 
-Stdlib-only script loaded by path (it lives outside the package). No live server:
-config.get_json is monkeypatched on the loaded module.
+Stdlib-only script loaded by path (it lives outside the package). No live server: the
+client core's ``urlopen``, which every request the hook makes goes through, is replaced
+(tests.helpers.client_core.fake_urlopen). Whether the machine is enrolled is a device
+record in a scratch ~/.synapse/config.json, as the hook reads it.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from tests.helpers.client_core import fake_urlopen, requested
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "plugin" / "scripts" / "board_block.py"
@@ -58,12 +62,23 @@ _BOARD_TEXT = (
 _SURFACE = "test-board-block-host"
 
 
-def _isolated_env(monkeypatch, tmp_path) -> None:
+def _isolated_env(monkeypatch, tmp_path, *, enrolled: bool = True) -> None:
     """Point the plugin config layer at a scratch config dir: no real env vars,
-    no settings.json options, no credentials file, no project .claude."""
+    no settings.json options, no credentials file, no project .claude, and a scratch
+    ~/.synapse whose config.json holds a device record when ``enrolled``. Enrollment is a
+    separate concern with its own tests; the default pins it "already enrolled" so the
+    assertions stay about the board fetch."""
     cfg_dir = tmp_path / "claude"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    synapse_home = tmp_path / "synapse-home"
+    synapse_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SYNAPSE_HOME", str(synapse_home))
+    if enrolled:
+        record = {"device": {"surface_id": "dev-board-block-test"}}
+        (synapse_home / "config.json").write_text(json.dumps(record), encoding="utf-8")
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
     # Pin the display label so nothing depends on the hostname of whatever machine
     # runs the suite. It is a label now, not an identity.
@@ -92,23 +107,13 @@ def _load_hook() -> ModuleType:
 
 
 def _run(monkeypatch, mod: ModuleType, stdin: str, reply) -> list[tuple[str, dict]]:
-    """Run main() with the hook payload on stdin and get_json mocked; return the
-    (path, params) calls made. `reply` is a payload dict or an exception to raise."""
-    calls: list[tuple[str, dict]] = []
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        calls.append((path, dict(params or {})))
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    # Enrollment is a separate concern with its own tests; pin it "already enrolled" so
-    # these assertions stay about the board fetch.
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: True)
+    """Run main() with the hook payload on stdin and the network faked; return the
+    (path, params) of each request made. `reply` is a payload dict or an exception to
+    raise."""
+    seen = fake_urlopen(monkeypatch, reply)
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     mod.main()
-    return calls
+    return [requested(req) for req in seen]
 
 
 def _context(capsys) -> str:
@@ -221,16 +226,10 @@ def test_a_401_on_an_unenrolled_machine_explains_itself(monkeypatch, tmp_path, c
     """The one error worth a block: this machine holds no credential of its own, so it
     will go on being served nothing until someone signs in. Silence would read as
     "memory is empty"."""
-    _isolated_env(monkeypatch, tmp_path)
+    _isolated_env(monkeypatch, tmp_path, enrolled=False)
     mod = _load_hook()
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        raise urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    mod.main()
+    unauthorized = urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
+    _run(monkeypatch, mod, "{}", unauthorized)
     out = _context(capsys)
     assert "not enrolled" in out and "synapse-login" in out
 
@@ -239,16 +238,10 @@ def test_a_401_on_an_enrolled_machine_stays_silent(monkeypatch, tmp_path, capsys
     """A revoked or briefly-broken credential on a machine that DID enroll is not the
     user's cue to re-run login — it is an operator problem, and a session start is the
     wrong place to guess at it."""
-    _isolated_env(monkeypatch, tmp_path)
+    _isolated_env(monkeypatch, tmp_path, enrolled=True)
     mod = _load_hook()
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: True)
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        raise urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    mod.main()
+    unauthorized = urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
+    _run(monkeypatch, mod, "{}", unauthorized)
     assert _context(capsys) == ""
 
 
@@ -260,16 +253,9 @@ def test_a_restricted_unenrolled_caller_explains_itself(monkeypatch, tmp_path, c
     the shared root token, is served a perfectly successful empty board — same outcome
     as the 401 above, none of the signal. Both remedies must appear, because which one
     applies depends on whether the server has a sign-in at all."""
-    _isolated_env(monkeypatch, tmp_path)
+    _isolated_env(monkeypatch, tmp_path, enrolled=False)
     mod = _load_hook()
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        return {"status": "ok", "text": "", "trust": "restricted", "n_notes": 0}
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    mod.main()
+    _run(monkeypatch, mod, "{}", {"status": "ok", "text": "", "trust": "restricted", "n_notes": 0})
     out = _context(capsys)
     assert "served nothing" in out
     assert "synapse-login" in out  # remedy 1: server with an IdP
@@ -294,14 +280,7 @@ def test_restricted_but_enrolled_stays_silent(monkeypatch, tmp_path, capsys):
 
 
 def test_full_trust_prints_no_explainer(monkeypatch, tmp_path, capsys):
-    _isolated_env(monkeypatch, tmp_path)
+    _isolated_env(monkeypatch, tmp_path, enrolled=False)
     mod = _load_hook()
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        return {"status": "ok", "text": _BOARD_TEXT, "trust": "full"}
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    mod.main()
+    _run(monkeypatch, mod, "{}", {"status": "ok", "text": _BOARD_TEXT, "trust": "full"})
     assert _context(capsys) == _BOARD_TEXT

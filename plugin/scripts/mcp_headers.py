@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             "the harnesses at the saved one"
         )
     # Whether the device token may go to this server is config's decision, the same one
-    # the hooks make: only to the server that minted it (config._device_origins).
+    # the hooks make: only to the server that minted it (synapse_client.credentials).
     override = getattr(config, "TOKEN_OVERRIDE", None) or {}
     if override.get("withheld"):
         return _fail(config.withheld_notice(override["withheld"], override.get("server") or ""))

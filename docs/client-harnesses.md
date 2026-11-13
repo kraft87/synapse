@@ -229,10 +229,18 @@ with `Settings.load` and sends through `Transport`, and session start, the promp
 the recall-feedback nudge and the Stop hook's private check come from the core. Codex
 keeps its own Stop-hook shipper (rollout cursors, catch-up sweep and retry), the
 session-id injection hook (`pre_tool_use.py`), the private-mode toggle
-(`scripts/private_mode.py`) and the skills-sync glue. Claude Code's hooks
-(`plugin/scripts/`) still carry their own configuration and HTTP code (`config.py`);
-moving them onto the core is the next change, and the two harnesses' wiring then moves
-into `harnesses/` beside Hermes's.
+(`scripts/private_mode.py`) and the skills-sync glue.
+
+Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `config.py`
+resolves with `Settings.load` and sends through `Transport`; the board, preferences and
+prompt-nudge hooks print what `context` builds, with Claude Code's enrollment wording
+(`enroll.py`) passed in; the Stop hook uploads through `Transport` and its private check
+is `private.is_private`. Claude Code keeps its own Stop-hook shipper (byte cursor,
+chunking, the detached `--ship`, retry bookkeeping, the catch-up sweep), the session-id
+injection hook (`self_session_inject.py`), the private-mode toggle
+(`scripts/private_mode.py`), the remember spool, the git feeder and the skills and config
+sync, which send through `config.py`'s helpers. The two harnesses' wiring moving into
+`harnesses/` beside Hermes's is the next change.
 
 A module moves like this: the code goes into `synapse_client/`, the old path keeps a
 few-line stub that imports it (hook commands and Codex's trusted command text never name
@@ -251,18 +259,20 @@ The core ports the hooks' behaviour and wording, with these differences:
   goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
   read as JSON or as server-sent events, up to the answer to this call.
 - **The bearer stays on its origin.** `http.Transport` sends it only to the configured
-  server (and the ingest URL's origin), and Codex's hooks send through it; Claude Code's
-  hook helpers send it to any absolute URL they are given. A redirect carries it only
+  server (and the ingest URL's origin; for Claude Code's `config.py`, the MCP URL's too),
+  and both Codex's and Claude Code's hooks send through it. A redirect carries it only
   within its origin, or from http to https on the same host and the default ports (80 to
-  443, the rule the `requests` library uses). Claude Code's hooks open their requests
-  through the same handler (`http.urlopen`, reached through `config._urlopen`): urllib's
-  stock one forwards the header to wherever a redirect points.
+  443, the rule the `requests` library uses). The sign-in calls that build their own
+  request (`synapse_login.py`) open it through the same handler (`http.urlopen`, reached
+  through `config._urlopen`): urllib's stock one forwards the header to wherever a
+  redirect points.
 - **Legacy credentials are passed in, not read.** `Settings.load` takes the old
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
 - **Session-start order** is notice, upload warning, board, preferences in every harness.
-- **Enrollment notices** take the login hint as an argument; the restricted-device
-  notice has no Claude-only "paste it into /plugin" aside.
+- **Enrollment notices** take the login hint as an argument, and the restricted-device
+  notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
+  one, the other harnesses none.
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
   processes can drain one directory. Up to 2000 wait; past that the oldest are dropped. A
   payload the server refuses with 400, 413 or 422 is dropped; any other failure, 404

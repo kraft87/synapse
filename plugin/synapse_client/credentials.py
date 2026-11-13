@@ -15,9 +15,8 @@ know are ``env`` (SYNAPSE_INGEST_TOKEN), ``config_file`` (~/.synapse/config.json
 Claude plugin's legacy ``plugin_option`` (CLAUDE_PLUGIN_OPTION_*) and ``plugin_config``
 (settings.json). Only source names ever leave this module; values stay in the bearer.
 
-A port of plugin/scripts/config.py (``_resolve_ingest_token`` and its helpers); the
-equivalence test in tests/test_client_core_credentials.py keeps the two in step until
-the hooks move onto this module.
+Every harness resolves its token here: the Claude plugin's config.py (which once kept
+its own copy, ``_resolve_ingest_token``), Codex's common.py and the Hermes provider.
 """
 
 from __future__ import annotations
@@ -192,23 +191,31 @@ def override_notice(
     env_location: str = "your shell profile",
     config_path: str = "~/.synapse/config.json",
     hint: str = "",
+    source_lines: Mapping[str, str] | None = None,
 ) -> str:
     """One line per token source the note says was overridden, or the withheld line, or
     "" when the note is empty. Names the source and the enrolled surface, never a token
     value or any part of one.
 
     The harness supplies what only it knows: ``env_location``, where an environment
-    token most likely lives for it (Hermes: its .env file); ``hint``, appended to the
-    line about a source the harness itself loaded (Claude Code: reload the plugins).
+    token most likely lives for it (Hermes: its .env file); ``config_path``, how it
+    shows config.json's path; ``hint``, appended to the line about a source the harness
+    itself loaded (Claude Code: reload the plugins). ``source_lines`` words a source of
+    its own whole: source name -> the line, with ``{surface}`` for the surface; an empty
+    line says nothing about that source.
     """
     if not note:
         return ""
     if note.get("withheld"):
         return withheld_notice(str(note["withheld"]), str(note.get("server") or ""))
     surface = note.get("surface_id")
+    own = source_lines or {}
     lines = []
     for source in note.get("sources") or ():
-        if source == "env":
+        if source in own:
+            if own[source]:
+                lines.append(own[source].format(surface=surface))
+        elif source == "env":
             lines.append(
                 f"[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this "
                 f"machine is enrolled as {surface}. Remove it from {env_location}."

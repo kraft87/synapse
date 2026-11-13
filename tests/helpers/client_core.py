@@ -11,10 +11,15 @@ real configuration or credential is ever read.
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -52,6 +57,28 @@ def core_http() -> ModuleType:
     from synapse_client import http
 
     return http
+
+
+def fake_urlopen(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[urllib.request.Request]:
+    """Replace the core's ``urlopen`` (``core_http``) for one test: each request a hook
+    opens is recorded in the returned list and answered with ``answer`` as a JSON body,
+    or raised, when ``answer`` is an exception."""
+    seen: list[urllib.request.Request] = []
+
+    def fake(req: urllib.request.Request, timeout: float | None = None) -> io.BytesIO:
+        seen.append(req)
+        if isinstance(answer, BaseException):
+            raise answer
+        return io.BytesIO(json.dumps(answer).encode())
+
+    monkeypatch.setattr(core_http(), "urlopen", fake)
+    return seen
+
+
+def requested(req: urllib.request.Request) -> tuple[str, dict[str, str]]:
+    """``(path, query parameters)`` of a request ``fake_urlopen`` recorded."""
+    parts = urllib.parse.urlsplit(req.full_url)
+    return parts.path, dict(urllib.parse.parse_qsl(parts.query))
 
 
 def scratch_user(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:

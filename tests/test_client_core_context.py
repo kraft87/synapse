@@ -22,7 +22,14 @@ from typing import Any
 
 import pytest
 
-from tests.helpers.client_core import drop_scripts, load_script, scratch_user, use_core
+from tests.helpers.client_core import (
+    drop_scripts,
+    fake_urlopen,
+    load_script,
+    requested,
+    scratch_user,
+    use_core,
+)
 
 use_core()
 from synapse_client import context  # noqa: E402
@@ -108,12 +115,15 @@ def test_prompt_nudge_is_byte_identical_to_the_hook(scratch, monkeypatch, capsys
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     hook = load_script("recall_nudge")
-    fixed = time.localtime(_NOW)
+    # The hook asks the core for the current time; this test's clock is _NOW.
     monkeypatch.setattr(
-        hook, "time", SimpleNamespace(strftime=lambda fmt: time.strftime(fmt, fixed))
+        context,
+        "time",
+        SimpleNamespace(strftime=time.strftime, localtime=lambda now=None: time.localtime(_NOW)),
     )
     hook.main()
-    assert context.prompt_nudge(Settings.load(), now=_NOW) == _hook_context(capsys)
+    expected = context.prompt_nudge(Settings.load(), now=_NOW)
+    assert expected == _hook_context(capsys)
 
 
 def test_prompt_nudge_names_the_tools_as_the_harness_does(tmp_path):
@@ -165,9 +175,10 @@ _PREF_CASES = {
 def test_preferences_block_is_byte_identical_to_the_hook(scratch, monkeypatch, capsys, case):
     items = _PREF_CASES[case]
     hook = load_script("preferences_block")
-    monkeypatch.setattr(hook, "get_json", lambda path, params, timeout: {"items": items})
+    seen = fake_urlopen(monkeypatch, {"items": items})
     hook.main()
     assert context.preferences_block(items) == _hook_context(capsys)
+    assert [requested(req) for req in seen] == [("/preferences/top", {"limit": "8"})]
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +193,20 @@ def test_the_explainers_match_enroll_with_the_claude_hints(scratch):
     assert context.restricted_block(_CLAUDE_RESTRICTED_HINT) == enroll.restricted_block().replace(
         _PASTE_HINT, ""
     )
+    assert (
+        context.restricted_block(_CLAUDE_RESTRICTED_HINT, paste_aside=_PASTE_HINT)
+        == enroll.restricted_block()
+    )
     assert context.BOOTSTRAP_CMD == enroll.BOOTSTRAP_CMD
     assert context.PASTE_CMD == enroll.PASTE_CMD
+
+
+def test_the_paste_aside_closes_the_restricted_explainer():
+    plain = context.restricted_block()
+    assert plain.endswith(f"    on the server, then run `{context.PASTE_CMD}` here.")
+    assert context.restricted_block(paste_aside="") == plain
+    aside = context.restricted_block(paste_aside=" (or in the token slot)")
+    assert aside == plain[:-1] + " (or in the token slot)."
 
 
 def test_the_default_hint_is_harness_neutral():
@@ -198,7 +221,7 @@ def test_the_default_hint_is_harness_neutral():
 
 
 # ---------------------------------------------------------------------------
-# board_parts == board_block._board_parts
+# board_parts == what board_block.py prints
 # ---------------------------------------------------------------------------
 
 _BOARD_CASES = {
@@ -215,21 +238,21 @@ _BOARD_CASES = {
 
 
 @pytest.mark.parametrize("case", sorted(_BOARD_CASES))
-def test_board_parts_match_the_hook(scratch, monkeypatch, tmp_path, case):
+def test_board_parts_match_the_hook(scratch, monkeypatch, capsys, tmp_path, case):
     reply, enrolled = _BOARD_CASES[case]
     answer = _http_error(reply) if isinstance(reply, int) else reply
-
-    def get_json(path, params, timeout):
-        assert (path, params) == ("/context", {"project": "proj"})
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
+    if enrolled:  # the hook reads enrollment from the device record, as it does at start
+        (scratch / ".synapse").mkdir(parents=True, exist_ok=True)
+        record = {"device": {"surface_id": "dev-1"}}
+        (scratch / ".synapse" / "config.json").write_text(json.dumps(record))
 
     hook = load_script("board_block")
-    monkeypatch.setattr(hook, "get_json", get_json)
+    seen = fake_urlopen(monkeypatch, answer)
     monkeypatch.setattr(hook, "_project_label", lambda: "proj")
-    monkeypatch.setattr(hook.enroll, "is_enrolled", lambda: enrolled)
-    expected = [p.replace(_PASTE_HINT, "") for p in hook._board_parts()]
+    hook.main()
+    assert [requested(req) for req in seen] == [("/context", {"project": "proj"})]
+    # The hook prints the parts joined by blank lines (no credential notice applies here).
+    expected = _hook_context(capsys).replace(_PASTE_HINT, "")
 
     client = _FakeClient(board=answer)
     settings = _settings(tmp_path, enrolled=enrolled)
@@ -239,7 +262,7 @@ def test_board_parts_match_the_hook(scratch, monkeypatch, tmp_path, case):
         p.replace(f"configured: {_CLAUDE_HINT}.", f"configured: {_CLAUDE_RESTRICTED_HINT}.")
         for p in got
     ]
-    assert got == expected
+    assert "\n\n".join(got) == expected
     assert client.calls == [("context", "proj")]
 
 
@@ -297,6 +320,14 @@ def test_the_pieces_compose_into_the_block(tmp_path):
     assert context.assemble(pieces) == context.session_block(client, "p", s, upload_warning="W")
 
 
+def test_notice_part_passes_the_harness_wording_through(tmp_path):
+    s = _noted_settings(tmp_path)
+    own = {"env": "[Synapse] env token ignored for {surface}."}
+    assert context.notice_part(s, source_lines=own) == "[Synapse] env token ignored for dev-9."
+    assert context.notice_part(s, source_lines={"env": ""}) == ""
+    assert context.notice_part(s, env_location="~/a b/.env").endswith("Remove it from ~/a b/.env.")
+
+
 @pytest.mark.parametrize(
     ("flags", "expected"),
     [
@@ -338,6 +369,29 @@ def test_an_unenrolled_401_explains_itself_with_the_harness_hint(tmp_path):
     client = _FakeClient(board=_http_error(401), prefs=_http_error(401))
     block = context.session_block(client, None, _settings(tmp_path), login_hint="run `hermes x`")
     assert block == context.not_enrolled_block("run `hermes x`")
+
+
+@pytest.mark.parametrize(
+    ("reply", "enrolled", "expected"),
+    [
+        (401, False, "NOT ENROLLED"),
+        ({"status": "ok", "text": "B", "trust": "restricted"}, False, "RESTRICTED\n\nB"),
+        (401, True, ""),
+        ({"status": "ok", "text": "B", "trust": "restricted"}, True, "B"),
+        ({"status": "ok", "text": "B", "trust": "full"}, False, "B"),
+    ],
+    ids=["401", "restricted", "401-enrolled", "restricted-enrolled", "full"],
+)
+def test_a_harness_may_word_the_explainers_itself(tmp_path, reply, enrolled, expected):
+    """``not_enrolled`` and ``restricted`` replace the explainers rendered from the hint,
+    used exactly as given, under the same conditions; the hint is then not used."""
+    board = _http_error(reply) if isinstance(reply, int) else reply
+    settings = _settings(tmp_path, enrolled=enrolled)
+    words = {"not_enrolled": "NOT ENROLLED", "restricted": "RESTRICTED"}
+    got = context.board_part(_FakeClient(board=board), None, settings, login_hint="x", **words)
+    assert got == expected
+    parts = context.board_parts(_FakeClient(board=board), None, settings, **words)
+    assert "\n\n".join(parts) == expected
 
 
 def test_nothing_to_say_is_empty(tmp_path):

@@ -193,6 +193,29 @@ def test_invalid_json_raises_value_error(srv):
         Transport(srv.url, _TOKEN, _UA).get_json("/bad")
 
 
+def test_open_returns_the_raw_reply_and_sends_the_body_as_given(srv):
+    srv.routes["/ingest"] = lambda h: h.reply(200, raw=b"not json, 202 accepted")
+    t = Transport(srv.url + "/", _TOKEN, _UA, 7)
+    headers = {"Content-Type": "application/json"}
+    with t.open("POST", "/ingest", b'{"records": []}', headers) as resp:
+        assert resp.read() == b"not json, 202 accepted"
+    req = srv.seen[-1]
+    assert (req["method"], req["path"], req["body"]) == ("POST", "/ingest", b'{"records": []}')
+    assert req["headers"]["user-agent"] == _UA
+    assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
+    assert req["headers"]["content-type"] == "application/json"
+
+
+def test_open_keeps_the_bearer_rule_and_raises_on_http_errors(serve):
+    home, other = serve(), serve()
+    other.routes["/x"] = lambda h: h.reply(500, raw=b"boom")
+    with pytest.raises(urllib.error.HTTPError) as err:
+        Transport(home.url, _TOKEN, _UA).open("GET", other.url + "/x")
+    assert err.value.code == 500
+    assert "authorization" not in other.seen[-1]["headers"]
+    assert other.seen[-1]["body"] == b""
+
+
 def test_the_repr_leaves_the_token_out():
     assert _TOKEN not in repr(Transport("https://s.example", _TOKEN, _UA))
 

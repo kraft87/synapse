@@ -30,7 +30,7 @@ from types import ModuleType
 
 import pytest
 
-from tests.helpers.client_core import core_http
+from tests.helpers.client_core import core_http, fake_urlopen
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
@@ -150,7 +150,7 @@ def _no_token_material(text: str) -> None:
 def _board_payload(monkeypatch, capsys) -> dict:
     """Run the SessionStart board hook against a canned board; return its JSON output."""
     hook = _load("board_block")
-    monkeypatch.setattr(hook, "get_json", lambda *_a, **_k: {"status": "ok", "text": "BOARD"})
+    fake_urlopen(monkeypatch, {"status": "ok", "text": "BOARD"})
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     hook.main()
     out = capsys.readouterr().out
@@ -251,18 +251,15 @@ def test_the_notice_survives_a_disabled_board_and_a_down_server(monkeypatch, tmp
         env={"SYNAPSE_INGEST_TOKEN": _STALE, "SYNAPSE_BOARD": "0"},
     )
     hook = _load("board_block")
-    monkeypatch.setattr(hook, "get_json", lambda *_a, **_k: pytest.fail("board disabled"))
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "text": "BOARD"})
     hook.main()
+    assert seen == []  # board disabled: no request
     out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert out.startswith("[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored")
 
     monkeypatch.delenv("SYNAPSE_BOARD")
     hook = _load("board_block")
-
-    def down(*_a, **_k):
-        raise ConnectionError("server down")
-
-    monkeypatch.setattr(hook, "get_json", down)
+    fake_urlopen(monkeypatch, ConnectionError("server down"))
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     hook.main()
     out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]

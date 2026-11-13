@@ -118,6 +118,34 @@ def test_only_synapse_names_are_kept_from_the_environment(tmp_path):
     assert s.flag("PATH") == ""
 
 
+def test_with_sources_flags_like_a_load_of_the_same_sources(tmp_path):
+    """A process whose environment or config.json changed reads its flags anew."""
+    home = tmp_path / "h"
+    _write_config(home, {"role": "work", "url": "https://a.example"})
+    s = Settings.load(env={"SYNAPSE_BOARD": "1"}, home=home)
+    env = {"SYNAPSE_BOARD": "0", "SYNAPSE_SURFACE": "", "PATH": "/bin"}
+    config = {"role": "", "skills_sync": True}
+    extras = [("plugin_option", {"SYNAPSE_SURFACE": "opt", "SYNAPSE_PREFS_BLOCK": None})]
+    fresh = s.with_sources(environ=env, config=config, extra_candidates=extras)
+    _write_config(home, config)
+    loaded = Settings.load(env=env, home=home, extra_candidates=extras)
+    for name in ("SYNAPSE_BOARD", "SYNAPSE_SURFACE", "SYNAPSE_MACHINE_ROLE", "SYNAPSE_SKILLS_SYNC"):
+        assert fresh.flag(name, "dflt") == loaded.flag(name, "dflt"), name
+    assert fresh.flag("SYNAPSE_PREFS_BLOCK", "1") == "1"
+    assert dict(fresh.environ) == {"SYNAPSE_BOARD": "0", "SYNAPSE_SURFACE": ""}
+
+
+def test_with_sources_keeps_what_was_resolved(tmp_path):
+    home = tmp_path / "h"
+    _write_config(home, {"url": "https://a.example", "token": _TOKEN})
+    s = Settings.load(env={}, home=home)
+    fresh = s.with_sources(environ={"SYNAPSE_URL": "https://b.example"}, config={})
+    assert (fresh.base_url, fresh.ingest_url, fresh.token) == (s.base_url, s.ingest_url, _TOKEN)
+    assert fresh.flag("SYNAPSE_URL") == "https://b.example"
+    assert s.with_sources() == s
+    assert s.with_sources(config={}).environ == s.environ
+
+
 def test_a_malformed_config_json_reads_as_nothing_configured(tmp_path):
     home = tmp_path / "h"
     home.mkdir()

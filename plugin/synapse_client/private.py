@@ -3,7 +3,7 @@
 Private mode is a marker at ``<private_dir>/<session_id>``, written by the private-mode
 command alongside the durable server-side flag. This local check is the fast half: it
 keeps the turns from ever leaving the machine, and it works while the server is down.
-A port of plugin/scripts/ingest_hook.py's ``_is_private``.
+The Claude Code Stop hook (plugin/scripts/ingest_hook.py) and Codex's run this check.
 """
 
 from __future__ import annotations

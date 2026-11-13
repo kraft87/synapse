@@ -87,15 +87,16 @@ Env (all optional):
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import json
 import os
 import subprocess
 import sys
 import time
-import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -103,6 +104,11 @@ import config
 import synapse_ingest_retry as retry
 import synapse_project
 from synapse_filelock import lock_exclusive
+
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client import private
+from synapse_client.http import Transport
 
 
 def _env_number(name: str, default: str, kind: type = float) -> Any:
@@ -128,7 +134,6 @@ _HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
 _WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
 _WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
-_PRIVATE_TTL_HOURS = _env_number("SYNAPSE_PRIVATE_TTL_HOURS", "12")
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -347,60 +352,32 @@ def _emit_failure_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _plain_name(session_id: str) -> bool:
-    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
-    core's rule (synapse_client/private.py), copied: a record's sessionId is joined into
-    a path below, and an id like ``../x`` would stat and unlink outside PRIVATE_DIR."""
-    seps = {"/", "\\", os.sep, os.altsep or "/"}
-    return (
-        session_id not in (".", "..")
-        and "\0" not in session_id
-        and not any(sep in session_id for sep in seps)
-    )
-
-
 def _is_private(session_id: str) -> bool:
     """True if `session_id` is in private mode → ship NOTHING for it.
 
     Private mode is a marker file at PRIVATE_DIR/<session_id>, written by
     private_mode.py (which also sets the durable server-side flag). This local check
     is the fast half: it keeps the turns from ever leaving the machine, and it works
-    while the server is unreachable.
+    while the server is unreachable. The check is the client core's
+    (synapse_client.private.is_private), the one every harness runs:
 
-    Two deliberate behaviours:
-      * STALE markers (older than _PRIVATE_TTL_HOURS) are ignored AND deleted. A
-        marker outlives its session — a crashed SessionEnd hook leaves one behind, and
-        Claude Code reuses no session id, so an orphan would otherwise sit there
-        forever. The server-side row is the durable record; the marker is a live flag.
+      * STALE markers (older than SYNAPSE_PRIVATE_TTL_HOURS, default 12) are ignored
+        AND deleted. A marker outlives its session — a crashed SessionEnd hook leaves
+        one behind, and Claude Code reuses no session id, so an orphan would otherwise
+        sit there forever. The server-side row is the durable record; the marker is a
+        live flag.
       * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
         private, silently capturing it is the unacceptable failure; a deferred turn is
         not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
+      * An id that is not one plain file name (``../x``, ``a/b``) names no marker
+        private_mode.py could have written: it reads as not private, and nothing outside
+        PRIVATE_DIR is touched.
 
-    An id that is not a plain file name (``_plain_name``) names no marker private_mode.py
-    could have written: it reads as not private, and nothing outside PRIVATE_DIR is
-    touched.
+    The TTL is read from the environment only, as this hook always has.
     """
-    if not session_id:
-        return False
-    if not _plain_name(session_id):
-        _log(f"PRIVATE ignored a session id that is not a file name: {session_id[:80]!r}")
-        return False
-    marker = os.path.join(str(PRIVATE_DIR), session_id)
-    try:
-        age = time.time() - os.stat(marker).st_mtime
-    except FileNotFoundError:
-        return False  # no marker (or no private dir at all) — normal case
-    except OSError as e:
-        _log(f"PRIVATE unreadable {session_id}: {type(e).__name__} — skipping ingestion")
-        return True
-    if age > _PRIVATE_TTL_HOURS * 3600:
-        try:
-            os.unlink(marker)
-        except OSError:
-            pass
-        _log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
-        return False
-    return True
+    settings = config.SETTINGS.with_sources(environ=os.environ, config={}, extra_candidates=())
+    settings = dataclasses.replace(settings, private_dir=Path(PRIVATE_DIR))
+    return private.is_private(settings, session_id, _log)
 
 
 def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -435,16 +412,17 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
         # cwd (an older server ignores this and labels each turn from the cwd's basename).
         payload["cwd_projects"] = by_cwd
     body = json.dumps(payload).encode()
-    # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
-    # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
-    # soft, so without it every ingest is silently dropped.
-    headers = {"Content-Type": "application/json", "User-Agent": config._UA}
-    if INGEST_TOKEN:
-        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
-    req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
-    # Through the core, as config.post_json: the bearer does not follow a redirect to
-    # another origin.
-    with config._urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
+    # Through the core's Transport, as config.post_json: a real User-Agent (Cloudflare in
+    # front of a hosted server 403s urllib's default "Python-urllib/x", "error code:
+    # 1010", and this hook fails soft, so without it every ingest is silently dropped),
+    # and a bearer that does not follow a redirect to another origin. The Transport holds
+    # its URL without trailing slashes; they go back on as the path, so the POST goes to
+    # INGEST_URL exactly as configured.
+    url = str(INGEST_URL)
+    base = url.rstrip("/")
+    transport = Transport(base, INGEST_TOKEN, config.USER_AGENT, TIMEOUT)
+    headers = {"Content-Type": "application/json"}
+    with transport.open("POST", url[len(base) :], body, headers) as resp:
         return resp.read().decode()[:200]
 
 

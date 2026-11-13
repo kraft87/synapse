@@ -106,8 +106,9 @@ def test_every_copy_of_the_rule_agrees_with_the_core(scratch):
     use_core()
     from synapse_client.private import _plain_name as core
 
+    # The Claude ingest hook keeps no copy: its _is_private is the core's is_private
+    # (the tests below run it through the hook).
     copies = {
-        "ingest_hook": load_script("ingest_hook")._plain_name,
         "claude private_mode": _private_mode("claude")._plain_name,
         "codex private_mode": _private_mode("codex")._plain_name,
     }
