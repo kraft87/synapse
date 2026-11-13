@@ -258,6 +258,8 @@ def _ensure_path(bin_dir):
             return
         _say("Add " + str(bin_dir) + " to your PATH to run `synapse`.")
         return
+    if _link_into_local_bin(bin_dir):
+        return
     shell = os.path.basename(os.environ.get("SHELL", ""))
     # macOS terminals start login shells: a login bash never reads ~/.bashrc, and reads
     # only the first of these that exists (creating ~/.bash_profile would hide ~/.profile).
@@ -280,6 +282,33 @@ def _ensure_path(bin_dir):
         else 'export PATH="' + str(bin_dir) + ':$PATH"'
     )
     _say(str(bin_dir) + " is not on your PATH. Add this line to " + rc + ":\n    " + line)
+
+
+def _link_into_local_bin(bin_dir):
+    """Link the shim into ``~/.local/bin`` when that directory is on PATH, so ``synapse``
+    runs with no profile edit. True when the command now resolves through the link.
+
+    Only for the default home: a ``SYNAPSE_HOME`` somewhere else is a side install and must
+    not take the name. Never over anything that is not this link already."""
+    local = Path(os.path.expanduser("~/.local/bin"))
+    default = Path(os.path.expanduser("~/.synapse")) / "bin"
+    if os.path.abspath(str(bin_dir)) != os.path.abspath(str(default)):
+        return False
+    if not (local.is_dir() and _on_path(local)):
+        return False
+    link, shim = local / "synapse", os.path.abspath(str(bin_dir / "synapse"))
+    try:
+        if link.is_symlink():
+            if os.path.abspath(os.path.join(str(local), os.readlink(link))) == shim:
+                return True
+        if link.is_symlink() or link.exists():
+            _say(str(link) + " is not this client's link; left as it is.")
+            return False
+        link.symlink_to(shim)
+    except OSError:
+        return False
+    _say("Linked " + str(link) + " to " + shim + ".")
+    return True
 
 
 def _add_to_windows_path(entry):
