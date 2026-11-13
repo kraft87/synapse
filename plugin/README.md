@@ -277,23 +277,31 @@ set` when Hermes already has a config there, by writing a new two-line file when
 none. Hermes runs one external memory provider at a time, so a different one already
 selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
 either way. `synapse update` rebuilds the folder for a new client version, and `synapse
-status` says whether it is wired. Restart Hermes to load it.
+status` says whether it is wired. Restart Hermes to load it: `hermes chat` and the TUI run
+their turns in Hermes's gateway daemon, so stop it with `hermes gateway stop` (the next
+`hermes chat` starts it again).
 
 **What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
 ACP editor): the board and your preferences in the system prompt at session start, the
 recall nudge each turn, the memory tools (`recall`, `recall_full_turns`, `fetch`,
-`fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded. Cron jobs
-get the tools and nothing else. Chat-platform sessions (Telegram, Discord, Slack and the
-rest, through Hermes's gateway), the API server, and subagents get nothing: there, other
-people talk to the agent, and they must not read your memory or be stored as you. The
-reasons and the Hermes source behind them: [docs/client-harnesses.md](../docs/client-harnesses.md).
+`fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded.
+Chat-platform sessions (Telegram, Discord, Slack and the rest, through Hermes's gateway),
+the API server, the Bot Chat and Desktop Group Chats, cron jobs, side agents and subagents
+get nothing, not even the tools, and a session stops for good at the first turn another
+agent or person wrote: there, others talk to the agent, and they must not read your memory
+or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
+its branches stay off after a rename or a restart. To turn one back on, delete every file
+there that names it (each holds the id it is for), once nothing in the chat says Bot Chat
+or Group any more. The reasons, the limits and the Hermes source behind them:
+[docs/client-harnesses.md](../docs/client-harnesses.md).
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
 with this machine's device token. At session start: `GET /context` and
-`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn: a
-`POST /ingest` (format `messages`, client `hermes`) holding the session id, the project
-label and working directory, the model name, and per message its role, text, tool-call
-names and arguments (first 1000 characters), tool results (first 2000) and timestamp.
+`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn, not
+one that failed: a `POST /ingest` (format `messages`, client `hermes`) holding the
+session id, the project label and working directory, the model name, and per message its
+role, text, tool-call names and arguments (first 1000 characters), tool results (first
+2000) and timestamp.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries, the memory context it injects
 into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait in

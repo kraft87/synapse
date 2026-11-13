@@ -19,7 +19,8 @@ Then the provider is selected, ``memory.provider: synapse`` in the home's config
   ``replace`` is given, since Hermes runs one at a time. The program is not run for a
   home without config.yaml: a first launch sets up that home, a large download.
 - otherwise a home with no config.yaml gets one of two lines; one that has a config.yaml
-  is left as it is and the report names the command that selects the provider.
+  is left as it is and the report names the command that selects the provider, unless
+  the file already selects it (``selected_in``).
 
 The Hermes home is the ``hermes_home`` option, else ``$HERMES_HOME``, else Hermes's
 platform default (hermes_constants.get_hermes_home). The URL is not stored here: the
@@ -30,7 +31,9 @@ Importable without Hermes: nothing here imports ``provider``.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import shutil
 import string
@@ -45,8 +48,9 @@ from ... import __version__
 
 PLUGIN = "synapse"
 #: What Hermes treats as "no external provider" (agent/memory_provider.py's
-#: CORE_MEMORY_PROVIDER_SENTINELS), and how `hermes config get` prints a None.
-_BUILT_IN = frozenset({"", "default", "builtin", "built-in", "none", "null"})
+#: CORE_MEMORY_PROVIDER_SENTINELS). A None value reads as "" (``config get --json``
+#: prints null); the string "null" is a provider's name to Hermes.
+_BUILT_IN = frozenset({"", "default", "builtin", "built-in", "none"})
 _CONFIG_LINES = "memory:\n  provider: synapse\n"
 _TIMEOUT = 60
 
@@ -134,6 +138,31 @@ def installed_version(home: Path) -> str:
         if key.strip() == "version":
             return value.strip().strip("\"'")
     return ""
+
+
+def selected_in(config: Path) -> bool:
+    """config.yaml names this provider as ``memory.provider``, read without a YAML parser:
+    only the block layout Hermes and this installer write (``memory:``, then
+    ``provider: synapse`` one level in) counts. False for any other layout or an
+    unreadable file, so it can only spare the user a command, never select anything."""
+    try:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    found, inside, indent = None, False, ""
+    for line in lines:
+        body = line.lstrip()
+        if not body or body.startswith("#"):
+            continue
+        if body == line:  # a top-level key
+            inside, indent = line.split("#", 1)[0].rstrip() == "memory:", ""
+            continue
+        here = line[: len(line) - len(body)]
+        indent = indent or here
+        match = re.fullmatch(r"provider:\s*([^#]*?)\s*(#.*)?", body)
+        if inside and here == indent and match:
+            found = match.group(1).strip("'\"")
+    return found == PLUGIN
 
 
 class HermesHarness:
@@ -234,6 +263,8 @@ class HermesHarness:
         if program and config.is_file():
             return self._select_with(program, home, dry_run=dry_run, replace=replace)
         if config.exists():
+            if selected_in(config):
+                return "already selected"
             return f"select it with `{self._command(home)}`"
         if dry_run:
             return f"would write {config} selecting it"
@@ -257,15 +288,23 @@ class HermesHarness:
         )
 
     def _current(self, program: str, home: Path) -> str | None:
-        """``memory.provider`` as Hermes reads it ("" when unset), or None when the
-        program could not tell."""
+        """``memory.provider`` as Hermes reads it ("" when unset or None), or None when
+        the program could not tell. Read as JSON, since the plain form prints a None and
+        the string "null" alike."""
         try:
-            done = self._run(program, home, ("get", "memory.provider"))
+            done = self._run(program, home, ("get", "memory.provider", "--json"))
         except (OSError, subprocess.SubprocessError):
             return None
         if done.returncode == 0:
             lines = (done.stdout or "").splitlines()
-            return lines[0].strip() if lines else ""
+            line = lines[0].strip() if lines else ""
+            try:
+                value = json.loads(line)
+            except ValueError:
+                return line
+            if value is None:
+                return ""
+            return value.strip() if isinstance(value, str) else None
         if "not set" in (done.stderr or "") + (done.stdout or ""):
             return ""
         return None
@@ -274,6 +313,8 @@ class HermesHarness:
         current = self._current(program, home)
         command = self._command(home)
         if current is None:
+            if selected_in(home / "config.yaml"):
+                return "already selected"
             return f"could not read memory.provider; select it with `{command}`"
         if current == PLUGIN:
             return "already selected"
