@@ -541,9 +541,8 @@ model. Asked directly before the accept, with a description that did not cover t
 missed phrasings, the check answered 0/3. The accept's own answer, after the retune was
 written, was 3/3, and the accept took 6.6 seconds.
 
-**Still open**: the comment at the top of `plugin/scripts/skill_review.py` still says the
-check "runs first". Changing it is a client change and needs a client version, so it was
-left for the next one.
+The comment at the top of `plugin/scripts/skill_review.py` said the check "runs first"; it
+was corrected with the next client version (plugin 0.24.10).
 
 ## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
 
