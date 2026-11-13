@@ -20,6 +20,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -897,7 +898,17 @@ def test_the_registry_is_the_one_of_the_core_config_imported(scratch, tmp_path):
     (other.parent / "__init__.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
     (other / "__init__.py").write_text("def registry():\n    return ['other']\n")
     (home / "lib" / "CURRENT").write_text("9.9.9\n", encoding="utf-8")
+    # A managed client as the installer leaves one (the launcher, the Codex installer):
+    # the registry used to be taken from there when there was one.
+    (home / "bin").mkdir(parents=True)
+    shutil.copy(PLUGIN / "scripts" / "synapse_run.py", home / "bin" / "synapse_run.py")
+    (home / "lib" / "9.9.9" / "plugin-codex").mkdir()
+    shutil.copy(
+        PLUGIN.parent / "plugin-codex" / "install.py",
+        home / "lib" / "9.9.9" / "plugin-codex" / "install.py",
+    )
     harness = load_script("harness")
+    assert harness.managed_root() == (home / "lib" / "9.9.9").resolve()
     loaded = sys.modules["synapse_client"]
     assert [h.name for h in harness._core_registry()] == ["hermes"]
     assert sys.modules["synapse_client"] is loaded

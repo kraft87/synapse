@@ -82,8 +82,8 @@ def base_url(url: str) -> str:
 
 def normalize_url(url: str) -> str:
     """The base URL to store: no trailing slash, no endpoint suffix (``/install`` too).
-    Raises ValueError when it isn't a plain http(s) URL. A port of
-    plugin/scripts/harness.py's ``normalize_url``, for installers."""
+    Raises ValueError when it isn't a plain http(s) URL. The one rule: the CLI
+    (plugin/scripts/harness.py) and the installers use this function."""
     out = (url or "").strip().rstrip("/")
     for suffix in (*_ENDPOINTS, "/install"):
         if out.endswith(suffix) and "://" in out[: -len(suffix)]:
