@@ -18,24 +18,26 @@ the hooks import. Settings are read when a hook starts (at import), as before.
 
 from __future__ import annotations
 
-import dataclasses
-import importlib.util
 import json
 import os
-import socket
 import sys
 import types
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 # The client core is the sibling plugin/ package, reached the way
 # plugin/scripts/synapse_project.py reaches it: plugin/ first on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "plugin"))
 from synapse_client import __version__, context
-from synapse_client.api import Client
-from synapse_client.http import Transport
 from synapse_client.settings import Settings
+
+if TYPE_CHECKING:
+    # What sends a request (urllib, http, ssl, socket) is imported where one is sent:
+    # every hook imports this module, and the ones that run at each prompt only read
+    # flags.
+    from synapse_client.api import Client
+    from synapse_client.http import Transport
 
 #: Where requests go when no URL is configured anywhere. The core sends nothing then;
 #: the Codex hooks have always tried a local server.
@@ -52,11 +54,14 @@ _HOME_PY = Path(__file__).resolve().parents[2] / "plugin" / "scripts" / "synapse
 def _load_home() -> Any:
     mod = sys.modules.get("synapse_home")
     if mod is None:
-        spec = importlib.util.spec_from_file_location("synapse_home", _HOME_PY)
-        assert spec and spec.loader
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["synapse_home"] = mod
-        spec.loader.exec_module(mod)
+        # Its directory leads sys.path for the one import, as in plugin/scripts/config.py:
+        # importlib.util would load the file by path, and brings threading with it.
+        there = str(_HOME_PY.parent)
+        sys.path.insert(0, there)
+        try:
+            import synapse_home as mod
+        finally:
+            sys.path.remove(there)
     return mod
 
 
@@ -113,7 +118,7 @@ def live_settings() -> Settings:
     at start; flags and kill switches follow a variable set or removed since (the hooks'
     ``_cfg`` always read the live environment)."""
     snapshot = {k: v for k, v in os.environ.items() if k.startswith("SYNAPSE_")}
-    return dataclasses.replace(SETTINGS, environ=types.MappingProxyType(snapshot))
+    return SETTINGS.replace(environ=types.MappingProxyType(snapshot))
 
 
 def _cfg(key: str, default: str = "") -> str:
@@ -130,20 +135,20 @@ def token_override_notice() -> str:
 
 
 PRIVATE_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
-# This machine's display NAME. Since schema 054 it grants nothing and identifies
-# nothing — trust rides on the device token. Same env-override + hostname fallback as
-# plugin/scripts/config.py so the label matches across both plugins.
-SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
 
 def client() -> Client:
     """The core's API client for this machine's server and credential."""
+    from synapse_client.api import Client
+
     return Client(SETTINGS, USER_AGENT)
 
 
 def _transport() -> Transport:
     # Built per request from the module's names, so a caller that repoints them (a test)
     # is obeyed. The bearer goes to BASE_URL's origin and to INGEST_URL's.
+    from synapse_client.http import Transport
+
     return Transport(BASE_URL, TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
 
 

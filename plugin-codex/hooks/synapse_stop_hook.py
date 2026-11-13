@@ -93,7 +93,6 @@ import synapse_ingest_retry as retry
 import synapse_project
 from common import INGEST_URL, SETTINGS, TOKEN, USER_AGENT
 from synapse_client import private
-from synapse_client.http import Transport
 from synapse_filelock import lock_exclusive
 
 
@@ -280,7 +279,10 @@ def _post(
     # RAISES private.PrivateSession, before any request, for a session in private mode.
     private.check_payload(SETTINGS, body, (), _log)
     # Through the core's Transport: the bearer goes to INGEST_URL's origin and does not
-    # follow a redirect to another.
+    # follow a redirect to another. Imported here, where a request is sent: the process
+    # Codex waits for only starts the detached worker.
+    from synapse_client.http import Transport
+
     transport = Transport("", TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
     resp: dict[str, Any] = transport.post_json(INGEST_URL, body, timeout=TIMEOUT)
     return resp

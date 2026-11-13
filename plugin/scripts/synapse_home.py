@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 
 #: config.json key -> the env / plugin-option name the rest of the client resolves by.
@@ -74,6 +73,8 @@ def load(path: Path | None = None) -> dict:
 def save(data: dict, path: Path | None = None) -> None:
     """Write ``data`` atomically, owner-only. Raises OSError: callers decide whether a
     failed write is fatal (the CLI) or ignorable (hook bookkeeping)."""
+    import tempfile  # here, not at the top: every hook loads this module and few write
+
     path = path or config_file()
     created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)

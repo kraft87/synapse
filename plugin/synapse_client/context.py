@@ -25,13 +25,16 @@ from __future__ import annotations
 
 import time
 import types
-import urllib.error
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import credentials
-from .api import Client
-from .settings import Settings
+
+if TYPE_CHECKING:
+    # Only named in signatures. A hook that prints the prompt nudge reads flags and
+    # sends nothing, so it does not load the request stack (urllib, http, ssl) for it.
+    from .api import Client
+    from .settings import Settings
 
 DEFAULT_LOGIN_HINT = "run `synapse login` in a terminal"
 #: The command that mints a device token on a server with no identity provider (a local
@@ -212,6 +215,8 @@ def server_parts(
         parts = [name for name, on in (("board", want_board), ("preferences", want_prefs)) if on]
         if not parts:
             return "", ""
+        import urllib.error  # with the request stack, which the client has loaded
+
         started = time.monotonic()
         try:
             # The project is the board's: the preferences are not scoped by one.
