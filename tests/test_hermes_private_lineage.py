@@ -284,6 +284,85 @@ def test_a_record_that_cannot_be_kept_leaves_the_session_unsettled(tmp_path):
     assert not carried.settled(tmp_path, "")
 
 
+def test_a_session_found_to_hold_copies_has_a_record_of_its_own(tmp_path):
+    """Kept apart from what was settled: it says what the session holds, and closes no
+    question about a session its row may name."""
+    assert not carried.copied(tmp_path, _CHILD)
+    carried.note_copied(tmp_path, _CHILD)
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.copied(tmp_path, _CHILD) and not carried.copied(tmp_path, _PARENT)
+    assert not carried.settled(tmp_path, _CHILD) and not carried.held(tmp_path, _CHILD)
+    (record,) = (tmp_path / "synapse" / "copied").iterdir()
+    assert len(record.name) == 64 and record.read_bytes() == b""
+    assert record.stat().st_mode & 0o777 == 0o600
+    for folder in (record.parent, record.parent.parent):
+        assert folder.stat().st_mode & 0o777 == 0o700
+    assert not (tmp_path / "synapse" / "settled").exists()
+    carried.settle(tmp_path, _PARENT, True)  # neither record is taken for the other
+    assert not carried.copied(tmp_path, _PARENT)
+
+
+def test_copies_that_cannot_be_recorded_are_not_kept(tmp_path, monkeypatch):
+    here, home = tmp_path / "cwd", tmp_path / "home"
+    here.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(here)
+    for none in (None, ""):
+        carried.note_copied(none, _CHILD)
+        assert not carried.copied(none, _CHILD)
+    carried.note_copied(home, "")
+    assert not carried.copied(home, "")
+    assert list(here.iterdir()) == [] and list(home.iterdir()) == []
+    (home / "synapse").write_text("a file where the folder goes", encoding="utf-8")
+    carried.note_copied(home, _CHILD)
+    assert not carried.copied(home, _CHILD)
+
+
+def test_with_no_session_to_ask_about_a_carry_goes_by_the_copies_record(tmp_path):
+    """A row that names no session leaves nothing to ask. Whether the session holds
+    another's turns is what was found of it (an ACP fork), and nothing is settled."""
+    uploader = _Carrier(True)
+    assert carried.carry(uploader, tmp_path, [], _CHILD, None) is False
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, [None, ""], _CHILD, None) is True
+    assert carried.carry(uploader, tmp_path, [], _PARENT, None) is False
+    assert uploader.calls == [] and not carried.settled(tmp_path, _CHILD)
+
+
+@pytest.mark.parametrize("ids", [[], [_PARENT]], ids=["no session named", "one named"])
+def test_a_settled_session_answers_by_both_its_records(tmp_path, ids):
+    """Settled as on the record, and found to hold copies: in either order, since the
+    question can close after the copies are found (a fork moved to a new id before its
+    first turn). The copies stay out. And one settled as holding turns from off the
+    record says so with no session named: its record is read before anything else."""
+    uploader = _Carrier(True)
+    carried.settle(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, ids, _CHILD, None) is False
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, ids, _CHILD, None) is True
+    carried.settle(tmp_path, _GRAND, True)
+    assert carried.carry(uploader, tmp_path, ids, _GRAND, None) is True
+    assert uploader.calls == []
+
+
+@pytest.mark.parametrize("made", [False, True], ids=["on the record", "made private"])
+@pytest.mark.parametrize("whose", ["its own", "those of a session it goes on from"])
+def test_a_session_with_copies_is_asked_about_all_the_same_and_keeps_them_out(
+    tmp_path, made, whose
+):
+    """A copies record closes no question: the session a row names may be private
+    (Desktop writes a branch's row at its first prompt, after its agent was built), so
+    it is asked about. Whatever the answer, the copies are turns from off the record
+    as far as anyone can tell, in the session and in one that goes on from it."""
+    carried.note_copied(tmp_path, _CHILD if whose == "its own" else _GRAND)
+    uploader = _Carrier(made)
+    assert carried.carry(uploader, tmp_path, [_PARENT, _GRAND], _CHILD, 5) is True
+    assert uploader.calls == [([_PARENT, _GRAND], _CHILD, 5)]
+    assert not carried.settled(tmp_path, _CHILD)
+    uploader.settled(made)
+    assert carried.held(tmp_path, _CHILD)
+
+
 # ---------------------------------------------------------------------------
 # A new agent for a session that holds another's turns
 # ---------------------------------------------------------------------------

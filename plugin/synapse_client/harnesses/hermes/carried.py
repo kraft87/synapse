@@ -22,9 +22,21 @@ A settled session's own answer stands for the sessions above it: it took them in
 account when it was settled. So a session is asked about up its chain only as far as the
 first settled one (``to_ask``).
 
+A session whose row names no session has nothing to be asked about, and can hold
+another's turns all the same: Hermes copies them into an ACP fork and records no
+origin. The uploader finds that out from the fork's first turn (turn_upload: a session
+said to be new that holds turns from before), in memory. ``note_copied`` keeps it, in a
+file of its own under ``<hermes_home>/synapse/copied/``: an agent built for the session
+later looks back at none of its turns either, and a session that goes on from it holds
+turns from off the record as far as anyone can tell (``carry``). It settles nothing: a
+row that names a session later is still asked about, since that one may be private. And
+it stands whatever is settled: the copies stay out also when the answer is "no".
+
 Nothing here raises. A record that cannot be written or read leaves the session to be
-asked about again, which errs on the side of private. One that holds turns from off the
-record is written whole or not at all (a file beside it, moved into place).
+asked about again: it is private for as long as the session it came from is, and an
+agent built once that one is back on the record looks back at its turns, as does one
+built for a session whose copies could not be recorded. One that holds turns from off
+the record is written whole or not at all (a file beside it, moved into place).
 """
 
 from __future__ import annotations
@@ -38,24 +50,39 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ...upload import Uploader
 
-_DIR = ("synapse", "settled")
+_SETTLED = "settled"
+_COPIED = "copied"
 
 
-def _file(home: Any, session_id: str) -> Path:
+def _file(home: Any, session_id: str, kind: str = _SETTLED) -> Path:
     digest = hashlib.sha256(session_id.encode("utf-8", "replace")).hexdigest()
-    return Path(str(home)).joinpath(*_DIR, digest)
+    return Path(str(home)) / "synapse" / kind / digest
+
+
+def _folder(home: Any, kind: str) -> None:
+    """Make ``<home>/synapse/<kind>``, owner-only. RAISES what the file system does."""
+    folder = Path(str(home))
+    for part in ("synapse", kind):
+        folder = folder / part
+        if not folder.is_dir():
+            folder.mkdir(mode=0o700, exist_ok=True)
+
+
+def _size(home: Any, session_id: str, kind: str = _SETTLED) -> int:
+    """The size of the session's record of ``kind``; -1 when there is none, when it
+    cannot be read, and without a home or an id."""
+    if not home or not session_id:
+        return -1
+    try:
+        return os.lstat(_file(home, session_id, kind)).st_size
+    except (OSError, ValueError):
+        return -1
 
 
 def settled(home: Any, session_id: str) -> bool:
     """Whether ``session_id`` was settled under ``home``. False when that cannot be
     read, and without a home or an id."""
-    if not home or not session_id:
-        return False
-    try:
-        os.lstat(_file(home, session_id))
-    except (OSError, ValueError):
-        return False
-    return True
+    return _size(home, session_id) >= 0
 
 
 def to_ask(home: Any, chain: Iterable[str]) -> list[str]:
@@ -73,12 +100,26 @@ def held(home: Any, session_id: str) -> bool:
     """Whether ``session_id`` was settled as one made private because a session it
     holds turns of was: it holds turns spoken off the record, whatever it is now.
     False when that cannot be read, and without a home or an id."""
+    return _size(home, session_id) > 0
+
+
+def copied(home: Any, session_id: str) -> bool:
+    """Whether ``session_id`` was found to hold turns copied from a session nothing
+    names (``note_copied``). False when that cannot be read, and without a home or an
+    id."""
+    return _size(home, session_id, _COPIED) >= 0
+
+
+def note_copied(home: Any, session_id: str) -> None:
+    """Record that ``session_id`` holds turns copied from a session nothing names.
+    Without a home or an id, and when the record cannot be written, nothing is kept."""
     if not home or not session_id:
-        return False
+        return
     try:
-        return os.lstat(_file(home, session_id)).st_size > 0
+        _folder(home, _COPIED)
+        os.close(os.open(_file(home, session_id, _COPIED), os.O_WRONLY | os.O_CREAT, 0o600))
     except (OSError, ValueError):
-        return False
+        return
 
 
 def settle(home: Any, session_id: str, made: bool = False) -> None:
@@ -88,11 +129,7 @@ def settle(home: Any, session_id: str, made: bool = False) -> None:
     if not home or not session_id:
         return
     try:
-        folder = Path(str(home))
-        for part in _DIR:
-            folder = folder / part
-            if not folder.is_dir():
-                folder.mkdir(mode=0o700, exist_ok=True)
+        _folder(home, _SETTLED)
         path = _file(home, session_id)
         if not made:
             os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
@@ -114,19 +151,22 @@ def carry(
     """Whether ``session_id`` holds turns spoken off the record because of a session of
     ``earlier``, whose turns it holds: that one is private (Uploader.carry_private:
     ``session_id`` is made private too), or it holds such turns itself, also when it is
-    back on the record (``held``: ``session_id`` is left on the record). With no marker
-    to say a session of ``earlier`` is private the server is asked at the session's
-    first upload, and that part of the answer is False for now. Once per session of
-    ``home``: a settled one is left as it is, and the answer is what its record says.
-    With ``timeout`` None no request is made here, and telling the server is left to
-    the caller or that upload."""
+    back on the record (``held``, ``copied``: ``session_id`` is left on the record), or
+    ``session_id`` was found to hold copies itself. With no marker to say a session of
+    ``earlier`` is private the server is asked at the session's first upload, and that
+    part of the answer is False for now. Once per session of ``home``: a settled one is
+    left as it is, and the answer is what its records say. With no session in
+    ``earlier`` nothing is asked or settled, and the answer is whether ``session_id``
+    was found to hold copies. With ``timeout`` None no request is made here, and telling
+    the server is left to the caller or that upload."""
     sid = str(session_id or "")
+    own = copied(home, sid)
     if settled(home, sid):
-        return held(home, sid)
+        return own or held(home, sid)
     ids = [str(one) for one in earlier if one]
     if not sid or not ids:
-        return False
-    passed = any(held(home, one) for one in ids)
+        return own
+    passed = own or any(held(home, one) or copied(home, one) for one in ids)
     made = uploader.carry_private(
         ids, sid, timeout=timeout, settled=lambda made: settle(home, sid, made or passed)
     )

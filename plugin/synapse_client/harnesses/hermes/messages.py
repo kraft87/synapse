@@ -30,12 +30,14 @@ actually sent, with the memory context it injected, our own nudge included), not
   opens no turn, so its reply lands on the turn before; the row stays in the records to
   show that this reply answers something later than that turn (the core's
   ``messages.joined``). No user row is left out, whatever it holds.
-- A user row Hermes folded a later message into (a message typed after one that got no
-  reply: agent/agent_runtime_helpers.py ``_merge_consecutive_users``, which leaves
-  ``_merged_turn_prefix`` on the row, and ``_absorbed_message_uids`` in the store too)
-  holds two messages typed at different times. It is sent as it is, followed by a
-  ``synthetic`` row with no text, which says so to the core: ``messages.joined``
-  cannot read it off one row.
+- A user row Hermes folded another message into holds messages typed at different
+  times: one typed after a message that got no reply (agent/agent_runtime_helpers.py
+  ``_merge_consecutive_users``, which leaves ``_merged_turn_prefix`` on the row, and
+  ``_absorbed_message_uids`` in the store too), or rows a compression merged
+  (agent/conversation_compression.py and agent/micro_compaction.py leave
+  ``_absorbed_message_uids`` as well). It is sent as it is, followed by a ``synthetic``
+  row with no text, which says so to the core: ``messages.joined`` cannot read it off
+  one row.
 - An assistant row is a reply only when it shows what the user got. Hermes types the
   two kinds of assistant row that are not (agent/turn_failure_copy.py and its writers):
   ``display_kind`` "failed_turn", the boundary Hermes appends when a turn fails ("This

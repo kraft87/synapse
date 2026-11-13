@@ -11,7 +11,10 @@ it was moved to, a late upload for the one it left. Pinned here:
     holds more than its own exchange, or was there before any turn start was seen;
   * an upload that ends no turn notes the turns it is shown and settles nothing more,
     and one that runs late is not taken for the end of another turn;
-  * a session said to be new is not believed when its turn starts show otherwise;
+  * a turn begun off the record is counted once however often its session is started,
+    and until its end is seen no flush sends a turn;
+  * a session said to be new is not believed when its turn starts show otherwise, and
+    the harness is told (``copied``), so that it can say so later (``keep_out``);
   * an upload acts on the server's answer only when it got the answer itself
     (``Uploader.settle``).
 
@@ -737,10 +740,92 @@ def test_turns_begun_off_the_record_under_two_ids_left_are_all_counted(tmp_path)
     assert wire.tries == 0
 
 
+def test_a_session_started_again_counts_the_sessions_it_goes_on_from_once(tmp_path):
+    """A harness may start an id twice before its first upload, naming the id left both
+    times (Hermes: at the switch, and again when the session's row is read). The turn
+    begun off the record under the id left is one turn: the upload that ends it takes
+    the count, and the turn after it goes up."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")  # turn 2, off the record
+    turns.start("s-1", 0, continues=["s-0"])
+    turns.start("s-1", 0, continues=["s-0"])
+    marker.unlink()
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3)]
+
+
+def test_a_session_started_again_counts_one_it_did_not_go_on_from_before(tmp_path):
+    """The second start names a session the first did not, with a turn begun off the
+    record of its own: that one is counted then, beside what the id already holds. And
+    a third start, which names nothing, keeps both."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    for left in ("s-a", "s-b"):
+        turns.start(left, 0)
+        marker = _mark(tmp_path, left)
+        turns.begin(left)
+        marker.unlink()
+    turns.start("s-1", 0, continues=["s-a"])
+    turns.start("s-1", 0, continues=["s-a", "s-b"])
+    turns.start("s-1", 0)
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(3) + _turn(4), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(4)]
+
+
+def test_a_third_start_does_not_count_again_what_the_first_took(tmp_path):
+    """What an id took over stays noted across its starts: named again at a third
+    start, after one that named nothing, the id left is still not counted twice."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")
+    marker.unlink()
+    turns.start("s-1", 0, continues=["s-0"])
+    turns.start("s-1", 0)
+    turns.start("s-1", 0, continues=["s-0"])
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3)]
+
+
+def test_a_flush_sends_no_new_turn_while_a_turn_begun_off_the_record_is_to_end(tmp_path):
+    """Turn 4 began off the record and its rows are complete: its reply was cut short
+    while it came in (Hermes keeps the part that came and sends no upload), or its
+    upload runs late. Back on the record, a flush is not the upload that ends it and
+    cannot tell it from a turn spoken there: it sends nothing new. The upload that ends
+    a turn notes it, and it stays out."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 4, off the record
+    marker.unlink()
+    said = said + _turn(4)
+    assert turns.upload(said, "s-1", timeout=5) is False
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert turns.upload(said, "s-1", timeout=5) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3), _turn(5)]
+
+
 def test_a_flush_is_not_the_end_of_a_turn_begun_off_the_record(tmp_path):
     """Turn 4 ended on the record and its upload waits. A flush while turn 5, begun off
-    the record, runs sends it: only an upload that ends a turn takes one for begun off
-    the record. Sent, turn 4 stays on the record when that upload comes."""
+    the record, runs takes no count: the two uploads still to come are both taken for
+    turns begun off the record, as with no flush, and neither turn goes up. That costs
+    turn 4, which the flush does not send either."""
     turns, wire = _back(tmp_path)
     said = _turn(1) + _turn(2) + _turn(3)
     turns.begin("s-1")
@@ -750,9 +835,57 @@ def test_a_flush_is_not_the_end_of_a_turn_begun_off_the_record(tmp_path):
     turns.begin("s-1")  # turn 5, off it
     marker.unlink()
     said = said + _turn(4)
-    assert turns.upload(said + _turn(5, done=False), "s-1", timeout=5) is True
+    assert turns.upload(said + _turn(5, done=False), "s-1", timeout=5) is False
     assert turns.upload(said, "s-1", timeout=5, finished=True) is False
     assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is False
+    assert _records(wire) == [_turn(3)]
+
+
+def test_a_flush_sends_a_turn_begun_on_the_record_with_none_begun_off_it_to_end(tmp_path):
+    """The rule holds only while a turn begun off the record is still to end. Turn 4
+    began on the record in a session back on it, and the upload that ends it has not
+    run when the harness flushes (it exits): the flush sends it."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1")  # turn 4, on the record
+    assert turns.upload(said + _turn(4), "s-1", timeout=5) is True
+    assert _records(wire) == [_turn(3), _turn(3) + _turn(4)]
+
+
+def test_a_flush_of_a_session_never_off_the_record_sends_what_it_holds(tmp_path):
+    """The rule above is for a session that held turns from off the record. One marked
+    private by hand and put back holds no such turn to keep out: its flush sends the
+    turns not sent yet, the one begun while it was private too."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.begin("s-1")
+    assert turns.upload(_turn(1), "s-1", timeout=5, finished=True) is True
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 2, while private by hand
+    marker.unlink()
+    assert turns.upload(_turn(1) + _turn(2), "s-1", timeout=5) is True
+    assert _records(wire) == [_turn(1), _turn(1) + _turn(2)]
+
+
+def test_turns_kept_for_the_servers_answer_go_up_at_a_flush_all_the_same(tmp_path):
+    """Turn 4 was spoken on the record and kept while the server had not answered. The
+    flush that sends no new turn still hands over what was kept: it was owed."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    wire.fail_private = _DOWN
+    turns.uploader.carry_private(["s-0"], "s-1", timeout=None)
+    turns.begin("s-1")  # turn 4: the server has not said, so it counts as on the record
+    said = said + _turn(4)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False  # kept
+    wire.fail_private = None
+    assert turns.uploader.settle("s-1") == upload.OPEN
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 5, off the record
+    marker.unlink()
+    assert turns.upload(said + _turn(5), "s-1", timeout=5) is True
     assert _records(wire) == [_turn(3), _turn(3) + _turn(4)]
 
 
@@ -854,6 +987,161 @@ def test_the_turns_begun_under_the_id_left_count_for_the_new_one(tmp_path):
     turns.start("s-3", 10, continues=["s-2"])  # the doubt is settled: s-3 looks back
     assert turns.upload(said, "s-3", timeout=5) is True
     assert _sent(wire) == [("s-2", ["u2"]), ("s-3", ["u2"])]
+
+
+def test_a_session_found_to_hold_copies_at_a_turn_start_is_named_to_the_harness(tmp_path):
+    """What the uploader finds is in memory only. ``copied`` hands the id to the
+    harness, once, at the turn start that showed it and before any upload."""
+    found: list[str] = []
+    turns, wire = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.begin("s-1", earlier=True)
+    assert found == ["s-1"] and wire.tries == 0
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1", earlier=True)
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(2), _turn(2) + _turn(3)]
+    assert found == ["s-1"]
+
+
+@pytest.mark.parametrize("finished", [True, False], ids=["a turn's end", "a flush"])
+def test_a_session_found_to_hold_copies_at_its_first_upload_is_named_too(tmp_path, finished):
+    found: list[str] = []
+    turns, _ = _turns(tmp_path, begins=True, copied=found.append)
+    turns.begin("s-1")
+    said = _turn(1) + _turn(2) + _turn(3, done=finished)
+    turns.upload(said, "s-1", timeout=5, finished=finished)
+    assert found == ["s-1"]
+
+
+def test_a_session_that_holds_its_own_turns_is_not_named(tmp_path):
+    """New and found to be so, resumed with a look-back, or one that names the session
+    it goes on from: none of them was found to hold copies."""
+    found: list[str] = []
+    turns, _ = _turns(tmp_path, begins=True, lookback=10, copied=found.append)
+    turns.start("s-new")
+    turns.begin("s-new")
+    assert turns.upload(_turn(1), "s-new", timeout=5, finished=True) is True
+    turns.begin("s-resumed", earlier=True)
+    assert turns.upload(_turn(1) + _turn(2), "s-resumed", timeout=5, finished=True) is True
+    turns.start("s-branch", continues=["s-0"])
+    turns.begin("s-branch", earlier=True)
+    assert turns.upload(_turn(1) + _turn(2), "s-branch", timeout=5, finished=True) is True
+    assert found == []
+
+
+def test_the_id_left_is_named_with_the_one_the_doubt_went_on_to(tmp_path):
+    """The doubt was settled under the new id. The id left holds the same copies and
+    is still said to be new here: it is named as well, and closed, so an upload under
+    it looks back at nothing either."""
+    found: list[str] = []
+    turns, wire = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.start("s-2", 10, continues=["s-1"])
+    turns.begin("s-2", earlier=True)
+    assert found == ["s-2", "s-1"]
+    copies = _turn(1) + _turn(2)
+    assert turns.upload(copies, "s-1", timeout=5, finished=True) is False
+    assert wire.tries == 0
+
+
+def test_the_turns_begun_under_the_id_left_are_counted_once_too(tmp_path):
+    """The harness starts the new id at the switch and again when it reads the id's
+    row, before the first upload. One turn was begun and the upload shows two: the
+    other is a copy, whichever start is asked."""
+    found: list[str] = []
+    turns, wire = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.begin("s-1")  # nothing said a turn came before this one
+    turns.start("s-2", 10, continues=["s-1"])
+    turns.start("s-2", 10, continues=["s-1"])
+    assert turns.upload(_turn(1) + _turn(2), "s-2", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(2)] and found == ["s-2", "s-1"]
+
+
+def test_an_id_left_that_was_not_in_doubt_is_not_named(tmp_path):
+    """The id left had a look-back: it was never said to be new, and the copies found
+    under the id the conversation went on to say nothing about it."""
+    found: list[str] = []
+    turns, _ = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-0", 10)
+    turns.start("s-1")
+    turns.start("s-2", 10, continues=["s-1", "s-0"])
+    turns.begin("s-2", earlier=True)
+    assert found == ["s-2", "s-1"]
+
+
+def test_a_session_found_to_hold_copies_is_not_looked_back_at_under_a_later_id(tmp_path):
+    """What was found stays with the conversation in this process, whatever the harness
+    kept of it: the id it goes on under asks for a look-back in vain, as after time off
+    the record."""
+    turns, wire = _turns(tmp_path, begins=True)
+    turns.start("s-1")
+    copies = _turn(1) + _turn(2)
+    turns.begin("s-1", earlier=True)
+    assert turns.upload(copies + _turn(3), "s-1", timeout=5, finished=True) is True
+    turns.start("s-2", 10, continues=["s-1"])
+    turns.begin("s-2", earlier=True)
+    said = copies + _turn(3) + _turn(4)
+    assert turns.upload(said, "s-2", timeout=5, finished=True) is True
+    assert _sent(wire) == [("s-1", ["u3"]), ("s-2", ["u4"])]
+
+
+def test_a_harness_whose_note_fails_stops_no_upload(tmp_path):
+    def fails(session_id: str) -> None:
+        raise OSError("read-only")
+
+    turns, wire = _turns(tmp_path, begins=True, copied=fails)
+    turns.begin("s-1", earlier=True)  # found at the turn start
+    assert turns.upload(_turn(1) + _turn(2), "s-1", timeout=5, finished=True) is True
+    turns.begin("s-2")  # found at the upload
+    assert turns.upload(_turn(1) + _turn(2), "s-2", timeout=5, finished=True) is True
+    assert _sent(wire) == [("s-1", ["u2"]), ("s-2", ["u2"])]
+
+
+def test_a_session_the_harness_knows_to_hold_copies_is_not_looked_back_at(tmp_path):
+    """A process built later was not there when the copies were found. The harness
+    says so from what it kept (``keep_out``): for an id the uploader has not met, and
+    for one it was told to look back at (a session resumed in place)."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.keep_out("s-1")
+    turns.start("s-2", 10)
+    turns.keep_out("s-2")
+    copies = _turn(1) + _turn(2)
+    for sid in ("s-1", "s-2"):
+        assert turns.upload(copies, sid, timeout=5) is False  # a flush before the turn
+        turns.begin(sid, earlier=True)
+        assert turns.upload(copies + _turn(3), sid, timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3), _turn(3)] and wire.tries == 2
+
+
+def test_keeping_a_session_out_forgets_nothing_it_sent(tmp_path):
+    """The harness may say so in the middle of a session's life: the turns sent stay
+    sent, and on the record, as the context of the next one too."""
+    turns, wire = _turns(tmp_path, begins=True)
+    turns.begin("s-1")
+    assert turns.upload(_turn(1), "s-1", timeout=5, finished=True) is True
+    turns.keep_out("s-1")
+    turns.begin("s-1", earlier=True)
+    assert turns.upload(_turn(1) + _turn(2), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(1), _turn(1) + _turn(2)]
+
+
+def test_a_session_kept_out_already_is_left_as_it_is(tmp_path):
+    """The harness reads its note at every upload and says so each time. The turns
+    from before were noted once, at the first upload that showed them all: a turn of
+    the session's own that no upload came for still goes up with the next one."""
+    turns, wire = _turns(tmp_path, begins=True)
+    turns.keep_out("s-1")
+    turns.begin("s-1", earlier=True)
+    assert turns.upload(_turn(1) + _turn(2), "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1", earlier=True)  # turn 3, cut short while the reply streamed
+    turns.keep_out("s-1")
+    turns.begin("s-1", earlier=True)
+    said = _turn(1) + _turn(2) + _turn(3) + _turn(4)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    assert _sent(wire) == [("s-1", ["u2"]), ("s-1", ["u2", "u3", "u4"])]
 
 
 def test_a_session_that_names_the_one_it_goes_on_from_is_not_said_to_be_new(tmp_path):

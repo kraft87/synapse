@@ -299,17 +299,20 @@ or Group any more. The reasons, the limits and the Hermes source behind them:
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
 with this machine's device token. At session start: `GET /context` and
-`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each turn that ended with
-a reply, not one that failed or was cut short: a `POST /ingest` (format `messages`,
-client `hermes`) holding the session id, the project label and working directory, the
-model name, and per message its role, text, tool-call names and arguments (first 1000
-characters), tool results (first 2000) and timestamp.
+`GET /preferences/top`. Each tool call: one MCP `tools/call`. After each turn that ended
+with a reply, not after one that failed or was cut short: a `POST /ingest` (format
+`messages`, client `hermes`) holding the session id, the project label and working
+directory, the model name, and per message its role, text, tool-call names and
+arguments (first 1000 characters), tool results (first 2000) and timestamp. It holds
+every finished turn not sent yet: a reply you stopped while it came in is stored by
+Hermes as far as it got, and goes up with the next one.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its
 own bookkeeping fields. With `gateway.managed_workers` on, Hermes builds an agent for
 every turn and tells it the session is new: each turn goes up without the one before
-as context, and one you steered while it ran (`/steer`) is not uploaded.
+as context, and one you steered while it ran (`/steer`), or whose message Hermes folded
+into an earlier one that got no reply, is not uploaded.
 Uploads that fail wait in `$HERMES_HOME/synapse/outbox/` and go with the next
 successful one. A session marked
 private (`synapse private on <session-id>`, in a terminal; `hermes sessions list` shows
@@ -326,9 +329,12 @@ finish are kept in memory.
 `/new` and `/resume` open another conversation: nothing is carried to it from the one
 you left, and it is on the record unless you mark it or its own row says it continues a
 private session. An ACP fork names no session it came from: it is on the record, and
-uploads the turns begun in it, not the ones copied into it. One narrow case is left:
-the copy of a single turn whose message had no text (a picture alone) can go up with
-the fork's first turn. A session seeded with another's messages names none either, and
+uploads the turns begun in it, not the ones copied into it. A file under
+`$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds for the
+fork later keeps them out too. Two narrow cases are left: the copy of a single turn
+whose message had no text (a picture alone) can go up with the fork's first turn, and
+an agent built for the fork before its first turn (the ACP adapter restarted) looks
+back ten turns. A session seeded with another's messages names none either, and
 is taken for a resumed one: up to ten of the copied turns are uploaded, whatever the
 session they came from was.
 `synapse private off --forget <id>` puts a session back on the record with the turns
@@ -336,7 +342,8 @@ spoken in it. A session that was private because of the one it continues keeps t
 turns out, and uploads the turns an agent sees begin on the record from then on. That
 holds for every agent Hermes builds for it under this `HERMES_HOME`, and for a branch
 or a compression made from it later: a file under `$HERMES_HOME/synapse/settled/` says
-the session holds turns from off the record. Such an agent does not look back: a turn
+the session holds turns from off the record, written once the server has had the
+session's row. Such an agent does not look back: a turn
 that had not been uploaded when Hermes replaced the agent before it is not picked up.
 The first turn back is left out when Hermes added a row of its own to it (a nudge, a
 reply to a background-process notice), when its message had no text, or when Hermes

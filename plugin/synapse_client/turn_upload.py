@@ -19,13 +19,15 @@ context, by the row that opens each (messages.opening_key): however such a turn 
 or ends later, it is the same turn. An upload notes the turns it is shown, and one that
 ends no turn may be shown part of the conversation (a flush before a compression): for
 a harness that says when turns start, the session stays as it was first found until an
-upload that ends a turn has shown all of it.
+upload that ends a turn has shown all of it. And while a turn begun off the record is
+still to end in such a session, an upload that ends none sends no new turn: that turn's
+rows may be whole.
 """
 
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 from . import messages
 from .upload import LOST, PRIVATE, QUEUED, SENT, TAKEN, WAITING, Uploader
@@ -55,6 +57,8 @@ class _Session:
         self.begun = 0
         self.began = False  # the last turn to start began on the record, its end not seen
         self.unseen = 0  # turns begun off the record whose end has not been seen
+        # The sessions it goes on from whose counts are in its own (``start``).
+        self.took: frozenset[str] = frozenset()
 
     def close(self) -> None:
         """It holds turns from before after all: none of them is looked back at."""
@@ -81,8 +85,9 @@ class TurnUploader:
     ``begin`` at every turn start), one started with no look-back and no session it
     goes on from is checked: when its first turn start or its first upload shows it
     holds turns from before (copies, written after the harness said it was new, from a
-    session nothing names), it is treated as one that was off the record. Safe across
-    threads."""
+    session nothing names), it is treated as one that was off the record, and
+    ``copied`` is called with its id: the harness's chance to keep that for a process
+    built later, which this one's memory does not reach. Safe across threads."""
 
     def __init__(
         self,
@@ -92,6 +97,7 @@ class TurnUploader:
         source: str,
         lookback: int | None = None,
         begins: bool = False,
+        copied: Callable[[str], None] | None = None,
     ) -> None:
         self.uploader = uploader
         self._client = client
@@ -99,6 +105,7 @@ class TurnUploader:
         self._lock = threading.Lock()
         self._lookback = lookback
         self._begins = begins
+        self._copied = copied
         self._sessions: dict[str, _Session] = {}
 
     def start(
@@ -111,28 +118,67 @@ class TurnUploader:
         the record here: no later look-back may reach a turn spoken then. What is known
         of the turn now running stays, also from the sessions it goes on from (a turn
         that began under one of them ends under this id), as does a doubt not settled
-        yet: whether one said to be new holds turns from before. A session that names
-        the ones it goes on from is not said to be new: what they are says whether
-        their turns may go up."""
+        yet: whether one said to be new holds turns from before. Each of those
+        sessions is counted once, however often this id is started. A session that
+        names the ones it goes on from is not said to be new: what they are says
+        whether their turns may go up."""
         with self._lock:
             ids = dict.fromkeys((session_id, *continues))
-            past = [self._sessions[sid] for sid in ids if sid in self._sessions]
-            if any(one.was_private for one in past):
+            past = {sid: self._sessions[sid] for sid in ids if sid in self._sessions}
+            if any(one.was_private for one in past.values()):
                 lookback = 0
+            # Started before, this id holds the counts of the sessions it took then.
+            took = past[session_id].took if session_id in past else frozenset()
+            fresh = [one for sid, one in past.items() if sid not in took]
             state = self._sessions[session_id] = _Session(lookback, self._begins and len(ids) == 1)
-            state.new = state.new or (lookback != 0 and any(one.new for one in past))
-            state.begun = sum(one.begun for one in past if one.new)
-            state.began = any(one.began for one in past)
-            state.unseen = sum(one.unseen for one in past)
+            state.took = took | (past.keys() - {session_id})
+            state.new = state.new or (lookback != 0 and any(one.new for one in past.values()))
+            state.begun = sum(one.begun for one in fresh if one.new)
+            state.began = any(one.began for one in past.values())
+            state.unseen = sum(one.unseen for one in fresh)
+
+    def keep_out(self, session_id: str) -> None:
+        """``session_id`` holds turns from before that are not its own to upload, and
+        the harness knows: by what ``copied`` told a process before this one. It is
+        treated as a session that was off the record, from its next upload. What is
+        remembered of it stays, and one treated so already is left as it is."""
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                self._sessions[session_id] = _Session(0, self._begins)
+            elif not state.was_private:
+                state.close()
+
+    def _close(self, session_id: str, state: _Session) -> list[str]:
+        """``state``, said to be new, holds turns from before after all. So does a
+        session it took that doubt over from, which is closed with it. The ids, for
+        ``_found``. Called with the lock held."""
+        found = [session_id]
+        state.close()
+        for sid in sorted(state.took):
+            other = self._sessions.get(sid)
+            if other is not None and other.new:
+                other.close()
+                found.append(sid)
+        return found
+
+    def _found(self, ids: Iterable[str]) -> None:
+        """Tell the harness which sessions were found to hold copies (``copied``).
+        Called without the lock; what the harness raises stops nothing here."""
+        for session_id in ids if self._copied is not None else ():
+            try:
+                self._copied(session_id)
+            except Exception:
+                pass
 
     def begin(self, session_id: str, *, earlier: bool = False) -> None:
         """A turn starts in ``session_id``, now. A harness calls this from its
         turn-start hook: of the turns a session holds when it is first found on the
         record (it was off it, or they are copies), only one seen here to begin on the
-        record is uploaded. One begun while the session is private is counted until the
-        upload that ends it (``finished``) has been seen, and the turn before is counted
-        with it when its end was not seen yet. Which turn an upload ends is not known
-        here, so the count errs to private: the late upload of a turn begun off the
+        record is uploaded. One begun while the session is private is counted once,
+        until the upload that ends it (``finished``) has been seen, and the turn before
+        is counted with it when its end was not seen yet. Which turn an upload ends is
+        not known here, so the count errs to private: the late upload of a turn begun off the
         record is not taken for the end of a later turn, and the late upload of the turn
         before is not taken for the end of the one begun off the record (neither goes
         up then). One begun while the server has not said yet counts as begun on the
@@ -147,6 +193,7 @@ class TurnUploader:
             return
         asking = self.uploader.asking(session_id)
         private = not asking and self.uploader.is_private(session_id)
+        found: list[str] = []
         with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
@@ -159,8 +206,9 @@ class TurnUploader:
             # is counted too, or it would pass for the end of this turn.
             state.unseen += private + (private and unended)
             if state.new and not state.begun and earlier:
-                state.close()
+                found = self._close(session_id, state)
             state.begun += 1
+        self._found(found)
 
     def upload(
         self,
@@ -200,7 +248,10 @@ class TurnUploader:
         says when turns start, the noting is done again at each upload until one that
         ends a turn. It is done as well when the turn that has just ended began off the
         record, and at every upload refused as private. Nothing else is remembered of a
-        private session.
+        private session. While a turn begun off the record is still to end, an upload
+        without ``finished`` picks no turn to send: that turn may be whole in the
+        records (its reply cut short, its upload late), and only the upload that ends a
+        turn notes it. The turns kept for the server's answer still go.
 
         A session said to be new (``start``) uploads nothing at a flush before its
         first turn start, and is taken to hold turns from before when its first upload
@@ -222,6 +273,7 @@ class TurnUploader:
         key, opening = messages.turn_key, messages.opening_key
         given_up = 0
         held = None  # the opening of a last turn left for the next upload to settle
+        found: list[str] = []
         with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
@@ -251,7 +303,7 @@ class TurnUploader:
                 if not state.begun and not finished:
                     return False  # what it holds is not known before its first turn
                 if len(all_turns) > state.begun + (not finished):
-                    state.close()
+                    found = self._close(session_id, state)
                 state.new = False
             if state.lookback == 0 or (began_off and state.was_private):
                 # A flush may hold part of the conversation only (a compression hands
@@ -273,8 +325,12 @@ class TurnUploader:
                 older = done[: max(0, len(done) - state.lookback)]
                 state.sent |= {key(turn) for turn in older}
                 state.lookback = None
+            # A turn begun off the record is still to end, and its rows may be whole
+            # (a reply cut short, an upload that runs late). The upload that ends a
+            # turn notes it: until then one that ends none picks no turn to send.
+            quiet = not finished and state.unseen > 0 and state.was_private
             selected: list[_Pair] = []
-            for before, turn in messages.pending(all_turns, state.sent):
+            for before, turn in () if quiet else messages.pending(all_turns, state.sent):
                 if opening(turn) in state.off or opening(turn) == held:
                     continue
                 if before is not None and opening(before) in state.off:
@@ -298,6 +354,7 @@ class TurnUploader:
                 state.kept.clear()
                 # Claimed before the request: a concurrent upload must not send them again.
                 state.sent |= {key(turn) for _, turn in selected}
+        self._found(found)
         if waiting:
             if given_up:
                 self.uploader.warn(

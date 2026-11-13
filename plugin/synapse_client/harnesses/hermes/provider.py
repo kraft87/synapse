@@ -68,7 +68,7 @@ open another conversation: nothing is carried to it. Put back on the record (``s
 private off --forget``), such a session keeps the turns from before out, under any id it
 goes on with and in agents built for it later (carried.py's record), and uploads those
 an agent sees begin there (``on_turn_start``); so does one Hermes said was new, once its
-first turn start or upload shows it holds turns all the same (an ACP fork's copies).
+first turn start or upload shows it holds copies (an ACP fork's), which is recorded too.
 
 Compression
 -----------
@@ -241,7 +241,12 @@ class SynapseMemoryProvider(MemoryProvider):
         private_too = mode == ACTIVE and carried.carry(uploader, home, earlier, session_id, None)
         # A session first met at an upload is looked back at as a resumed one is.
         turns = TurnUploader(
-            uploader, client="hermes", source="hermes-sync", lookback=LOOKBACK, begins=True
+            uploader,
+            client="hermes",
+            source="hermes-sync",
+            lookback=LOOKBACK,
+            begins=True,
+            copied=lambda found: carried.note_copied(home, found),
         )
         # Turns spoken off the record are not looked back at.
         lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
@@ -249,11 +254,10 @@ class SynapseMemoryProvider(MemoryProvider):
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
-        user_id, chat_id, route = (
+        self._owner_id, self._chat_id, self._route = (
             kwargs.get(key) if self._gateway and isinstance(kwargs.get(key), str) else None
             for key in ("user_id", "chat_id", "gateway_session_key")
         )
-        self._owner_id, self._chat_id, self._route = user_id, chat_id, route
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
@@ -310,14 +314,8 @@ class SynapseMemoryProvider(MemoryProvider):
         with done:
             board, prefs = got.get("board", ""), got.get("preferences", "")
         warning = failure_warning(outbox) if outbox is not None else None
-        return context.assemble(
-            (
-                context.notice_part(settings, env_location=_ENV_LOCATION),
-                warning,
-                board,
-                prefs,
-            )
-        )
+        notice = context.notice_part(settings, env_location=_ENV_LOCATION)
+        return context.assemble((notice, warning, board, prefs))
 
     def system_prompt_block(self) -> str:
         """The session-start block, for a session still the owner's (``_still_owner``).
@@ -550,7 +548,11 @@ class SynapseMemoryProvider(MemoryProvider):
         uploader, turns = self._uploader, self._turns
         with self._lock:
             known = session_id in self._followed
-        if known or not continues or uploader is None or turns is None:
+        if known or uploader is None or turns is None:
+            return
+        if not continues:
+            if carried.carry(uploader, self._home, (), session_id, None):
+                turns.keep_out(session_id)  # recorded as holding copies: no look-back
             return
         earlier = carried.to_ask(self._home, continues)
         private_too = carried.carry(uploader, self._home, earlier, session_id, None)

@@ -806,6 +806,32 @@ def test_a_settled_that_raises_changes_nothing(tmp_path):
     assert up.settle_private("s-new") is True and not up.is_private("s-new")
 
 
+@pytest.mark.parametrize("private", [False, True], ids=["on the record", "private"])
+def test_a_session_carried_again_while_its_question_is_open_tells_every_caller(tmp_path, private):
+    """A harness asks about one session twice before the server has said: where it
+    moves to the id, and where the id's first upload reads its row. Each call has its
+    own note to write, and the later one does not take the earlier one's place. One
+    that raises keeps none of the others from being called."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    first: list[bool] = []
+    last: list[bool] = []
+
+    def broken(made: bool) -> None:
+        raise RuntimeError("no disk")
+
+    if private:
+        wire.rows.add("s-old")
+    assert up.carry_private(["s-old"], "s-new", settled=first.append) is False
+    assert up.carry_private(["s-old"], "s-new", settled=broken) is False
+    assert up.carry_private(["s-old", "s-parent"], "s-new", settled=last.append) is False
+    assert first == [] and last == []
+    assert up.settle_private("s-new") is True
+    assert first == [private] and last == [private]
+    # Once each: a later settle has no one left to tell.
+    assert up.settle_private("s-new") is True and first == [private] and last == [private]
+
+
 def test_carrying_without_a_timeout_tells_the_server_at_the_next_upload(tmp_path):
     client, wire = _client(tmp_path)
     lines: list[str] = []
