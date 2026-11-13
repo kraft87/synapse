@@ -8,7 +8,8 @@ reads; ``harnesses/hermes/lineage.py`` copies the ``model_config`` keys under wh
 branch, a reset and a compressed continuation name the session they came from;
 ``harnesses/hermes/provider.py`` reads how a session switch is announced (``reset``, and
 ``reason="resume"``) to tell a conversation that goes on under a new id from another
-conversation. A Hermes that renames any of them would turn a failed turn back into an
+conversation, and, for a session a new agent is built for, takes the same from its row
+(``lineage.continues``). A Hermes that renames any of them would turn a failed turn back into an
 uploaded reply, the owner's ``hermes chat`` back into an inert session, a copy of a Bot
 Chat back into the owner's chat once its parent is deleted, or a compressed private
 conversation back into an uploaded one, without a unit test noticing: these checks ask
@@ -44,7 +45,7 @@ pytestmark = pytest.mark.skipif(
 
 _DRIVER = textwrap.dedent(
     """
-    import inspect, json, os, sqlite3
+    import inspect, json, os, re, sqlite3
     from pathlib import Path
 
     import hermes_state_mutation_branch as branch
@@ -55,7 +56,7 @@ _DRIVER = textwrap.dedent(
     from gateway.session import SessionSource, build_session_key
     from gateway.session_policy import STORED_AS_LOCAL, SURFACES
     from hermes_state_keys import local_identity
-    from hermes_state_common import SCHEMA_SQL
+    from hermes_state_common import SCHEMA_SQL, _non_continuation_child_sql
     from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX
 
     store = sqlite3.connect(":memory:")
@@ -85,7 +86,17 @@ _DRIVER = textwrap.dedent(
         "new_session": says("hermes_cli/cli_session_mixin.py",
                             'reset=True, reason="new_session")'),
     }
+    forks = _non_continuation_child_sql("c.", "?")
+    tui = Path("tui_gateway/methods_session_branch.py").read_text(encoding="utf-8")
+    tui = tui[tui.index("def _branch_live("):]
     print("RESULT " + json.dumps({
+        "fork_keys": sorted(set(re.findall(r"[$][.](_[a-z_]+)", forks))),
+        "fork_keys_name_the_parent": forks.count("!= ?"),
+        "tui_branch_row": says(
+            "tui_gateway/methods_session.py",
+            'db.create_session(new_key, source=source, model=model, '
+            'model_config={"_branched_from": parent_key}, parent_session_id=parent_key,'),
+        "tui_branch_row_first": 0 < tui.find("_persist_branch(") < tui.find("_build_branch_agent("),
         "failed_kind": failures.FAILED_TURN_DISPLAY_KIND,
         "failed_notices": notices,
         "untyped": [failures.untyped_failed_turn_display_kind("assistant", n) for n in notices],
@@ -171,6 +182,27 @@ def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[
     three gateway writers, by their source text: it does not run a delete, and it does
     not cover the in-process writers."""
     assert names["origins"] == list(hl._ORIGINS)
+
+
+def test_this_hermes_tells_a_copy_from_another_conversation_the_way_the_rule_does(
+    names: dict[str, Any],
+) -> None:
+    """``lineage.continues`` decides from a row whether the session holds its parent's
+    turns, and so whether it is private with it: a branch and a compressed continuation
+    do, a reset and a subagent do not. Hermes's own list of the keys that make a child
+    something other than a continuation, each read only when it names the parent: a new
+    key there is a new kind of child, and someone has to say whether it carries turns."""
+    assert names["fork_keys"] == sorted({"_branched_from", *hl._OWN_CONVERSATION})
+    assert names["fork_keys_name_the_parent"] >= 3
+
+
+def test_this_hermes_writes_a_tui_branchs_row_before_it_builds_its_agent(
+    names: dict[str, Any],
+) -> None:
+    """The TUI and Desktop build a new agent for a branch and announce no switch: the
+    row, written first with the parent link and ``_branched_from``, is all the provider
+    has to know the session holds a private parent's turns. By the source text."""
+    assert names["tui_branch_row"] == 1 and names["tui_branch_row_first"] is True
 
 
 def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(

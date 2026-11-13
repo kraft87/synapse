@@ -739,10 +739,15 @@ def _skill_scope(args) -> int:
 # ---------------------------------------------------------------------- passthrough
 
 _PASSTHROUGH = {"devices": "device_admin", "private": "private_mode", "import": "import_history"}
+#: The tools told the name they were run under, for the lines in which they name a command.
+_NAMED = {"private": "synapse private"}
 
 
-def _passthrough(module: str, rest: list[str]) -> int:
-    return importlib.import_module(module).main(rest) or 0
+def _passthrough(command: str, rest: list[str]) -> int:
+    tool = importlib.import_module(_PASSTHROUGH[command]).main
+    if command in _NAMED:
+        return tool(rest, program=_NAMED[command]) or 0
+    return tool(rest) or 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -833,7 +838,7 @@ def _onoff(text: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in _PASSTHROUGH:
-        return _passthrough(_PASSTHROUGH[argv[0]], argv[1:])
+        return _passthrough(argv[0], argv[1:])
     args = _parser().parse_args(argv)
     return int(args.func(args) or 0)
 

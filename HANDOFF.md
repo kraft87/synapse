@@ -13,19 +13,47 @@ changed, what to do on each machine, what was proven, and what is still open.
   `private.unmark`), the server row through the client (`Client.private_put`,
   `private_get`, `private_delete`), the read-back, and what `off` and `--forget` leave
   behind. Both scripts build a client from their plugin's settings and hand it the
-  arguments. Same commands, same lines printed, same exit codes.
+  arguments. The commands and what they do are the same. The lines printed are now one
+  wording for both plugins (the Codex script worded a few of them its own way), and
+  `synapse private` names itself in the lines that name a command to run next; it said
+  `private_mode.py`.
+- **A server URL that cannot be read fails the request, not the program.** Building a
+  `Transport` raised on a URL `urlsplit` rejects (`http://[bad`), before the caller had
+  done anything. For the toggle that meant `on` wrote no marker and the `SessionEnd` hook
+  left the marker in place. Now such a URL names no server for the bearer, and a request
+  to it raises where every caller already expects a failure.
 - **Hermes: private mode follows the conversation.** Hermes gives a conversation a new
-  session id when it compresses or branches it. Private mode is kept per session id, so
-  the turns spoken off the record were uploaded under the new id at its first finished
-  turn, up to ten of them. Now a switch to a new id that is neither a reset nor a resume
-  checks the id it leaves and the parent Hermes names: when either is private (or has a
-  marker that cannot be read), the new id gets the marker and the server row, and no
-  turn from before the switch is looked back at. `/new` and `/resume` open another
-  conversation and inherit nothing.
-- **When a write fails at that switch**, the provider refuses the new session itself and
-  says so as a WARNING in Hermes's log. No marker could be written: until Hermes exits.
-  The server could not be told (a 5-second request): until the server has the row; the
-  request is made again each time that session finishes a turn.
+  session id when it branches it, and when a compression starts a new session (rotation;
+  a compression in place keeps the id). Private mode is kept per session id, so the
+  turns spoken off the record were uploaded under the new id at its first finished turn,
+  up to ten of them. Now the new id is private when the session it continues is: it gets
+  the marker and the server row, and no turn from before is looked back at. `/new` and
+  `/resume` open another conversation and inherit nothing.
+- **Hermes says "new id" in two ways, and both are covered.** The classic CLI moves its
+  agent to the new id (`on_session_switch`): a switch that is neither a reset nor a
+  resume checks the id it leaves and the parent Hermes names. The TUI, the desktop app
+  and the gateway build a new agent for a branch, so the provider only sees `initialize`
+  with an id it has never met. There it reads the session's row in Hermes's store, by
+  Hermes's own rule (`hermes_state_common.py`, `_non_continuation_child_sql`): a row with
+  a parent holds that parent's turns, unless its `model_config` names the parent as what
+  it was reset or delegated from. The rule is followed up the store, since a branch of a
+  branch holds the turns of both.
+- **The marker is not the only thing asked.** A marker lasts twelve hours and `off`
+  removes it, while the server's row stays and keeps dropping that session's turns. So
+  when no marker says an earlier session is private, the server is asked
+  (`GET /private-sessions/<earlier id>`) at the new session's first upload. Until it has
+  answered, nothing is uploaded or queued for that session. Turns finished in the
+  meantime go up once it says the earlier session is on the record.
+- **Asked once per session.** The answer is recorded as an empty file under
+  `$HERMES_HOME/synapse/settled/`, named by a hash of the session id. So
+  `synapse private off --forget` on a branch holds, and a branch made before its parent
+  went private stays on the record. A session with a recorded answer speaks for the ones
+  above it, so the chain is asked about only as far up as the first such session.
+- **When a write fails**, the uploader refuses the new session itself and says so as a
+  WARNING in Hermes's log. No marker could be written: for as long as that agent lives
+  (the next one for the session asks again). The server could not be told (a 5-second
+  request): until it has the row; the request is made again each time that session
+  finishes a turn, and after any upload that is delivered, for every session still owed.
 - **Hermes has no command of its own for private mode.** It is `synapse private
   on|off|status <session-id>` in a terminal, the command the other two harnesses use
   (`hermes sessions list` shows the id). That was already so; the README now says it.
@@ -33,40 +61,67 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**
 
 1. `synapse update` for plugin 0.24.10. Nothing to migrate, no setting to change, no
-   server change.
+   server change. A Hermes session that continues another is asked about once, at its
+   next upload: one `GET /private-sessions/<id>`.
 
 **Proven**
 
 - `tests/test_private_mode.py` (every toggle case against a local server, run for the
-  Claude Code script and the Codex script) passes unchanged on the wrappers.
-  `tests/test_client_core_private_toggle.py` (new) covers the core toggle and the marker
-  functions directly.
+  Claude Code script and the Codex script): the cases that were there pass on the
+  wrappers as they were. Added: with a server URL that cannot be read, `on` exits 1 with
+  the marker written, `status` reports the marker, and `--session-end` exits 0 and
+  removes it. `tests/test_client_core_private_toggle.py` (new) covers the core toggle and
+  the marker functions directly; `tests/test_client_core_http.py` the `Transport`.
 - `tests/test_client_core_upload.py`: a session that continues a private one is private
-  for any uploader; nothing is written when no earlier id is private; a marker that
-  cannot be written, and an id no marker can be named by, are held by the uploader,
-  queued uploads included; a held session is carried on to the next; a server that was
-  down is asked again at each turn and once it answers is not asked again.
+  for any uploader; with no marker to go by the server is asked before anything is
+  uploaded, and a reply that does not say, or no reply, keeps the session held; a server
+  row alone carries; a session still waiting passes its question on to the next id; the
+  turns finished while it waited are sent when the answer is "on the record" and never
+  when it is "private"; a marker that cannot be written, and an id no marker can be named
+  by, are held by the uploader, queued uploads included; every session the server is
+  still to be told about is told once it answers.
 - `tests/test_hermes_provider.py`: a compression or a branch from a private session
   uploads nothing under the new id, at a turn, before a compression or at exit; a
-  private parent is enough; `/resume` and `/new` do not inherit; with the new id's marker
-  removed the earlier turns stay unsent; an inert session writes nothing.
-- Each of those tests fails with its line of the change taken out (eight changes tried).
+  private parent is enough, by marker or by server row; `/resume` and `/new` do not
+  inherit; an inert session writes nothing.
+- `tests/test_hermes_private_lineage.py` (new): the rule over rows built like Hermes's
+  (19 cases), and a new agent for a branch or a compressed continuation of a private
+  session: nothing is uploaded, no request is made while the session is bound, the
+  answer is recorded once, a reset or a subagent is not carried, a branch of a branch is
+  private with the session at the top, and with the server down nothing leaves and the
+  next agent asks again.
+- Each of those fails with its line of the change taken out (31 changes tried).
 - In a real Hermes checkout (bca51750): `tests/test_hermes_integration.py` marks a
   session private and makes the calls a compression makes on Hermes's own
   `MemoryManager`; the child id gets the marker and the row and nothing is uploaded
-  under either id, in-process and in Hermes's plugin host. It fails without the
-  carry-over. `tests/test_hermes_checkout_names.py` reads the call sites that announce a
-  switch: compression and branch pass `reset=False`, resume passes `reason="resume"`,
-  `/new` passes `reset=True`.
+  under either id, in-process and in Hermes's plugin host. `tests/test_hermes_checkout_names.py`
+  reads the call sites that announce a switch (compression and branch pass
+  `reset=False`, resume passes `reason="resume"`, `/new` passes `reset=True`), the keys
+  Hermes's own rule tells a copy from another conversation by, and that the TUI writes a
+  branch's row before it builds the branch's agent.
 
 **Still open**
 
-- A carried session whose server row never lands before Hermes exits is kept off the
-  record by its marker alone, for twelve hours. Resumed after that, up to ten of its
-  turns are uploaded. The WARNING line names the session; `synapse private on <id>`
-  settles it.
+- Turns of a continued session finished while the server cannot be reached are not
+  queued: another process's drain would send them without knowing the question is open.
+  If Hermes exits before the server answers, they are not uploaded. A later resume looks
+  back ten turns.
+- While the server is down, each upload for a session it has not answered about, or has
+  not been told about, waits up to 5 seconds per request, on Hermes's background worker.
+- A session from before this version is asked about once too, up its whole chain (one
+  request per session in it). A branch made before a session above it went private then
+  turns private. `synapse private off --forget <id>` puts it back, and that holds.
+- `off --forget` puts a session back on the record whole, as it does everywhere: a later
+  agent for a branch looks back ten turns, the copied ones included. The agent that
+  carried it does not look back, but the last turn from before can go along as the
+  context that leads its first upload after.
+- `off --forget` on a session the server has not been told about yet is undone when it
+  is told. Run it again after the WARNING line stops.
+- Errs private: any switch reason but `resume` carries, and a reset child from a Hermes
+  that did not yet write `_reset_from` reads as a continuation.
 - Not seen in a live Hermes session: the switch was driven through Hermes's own
-  manager in tests, not by a real compression with a real model.
+  manager in tests, not by a real compression or a TUI branch with a real model. Not run
+  on Windows.
 - A Hermes slash command or tool for private mode. The toggle is typed in a terminal.
 - From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
   uploaded and are lost at exit.

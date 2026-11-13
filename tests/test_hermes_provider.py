@@ -222,13 +222,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"status": "ok", "text": "BOARD-TEXT", "trust": "full"})
         elif self.path.startswith("/preferences/top"):
             self._send(200, {"items": [{"pref": "Kyle likes small commits", "polarity": "like"}]})
+        elif self.path.startswith("/private-sessions/") and self.server.private_status == 200:
+            held = self.path.rsplit("/", 1)[-1] in self.server.private_rows
+            self._send(200, {"status": "ok", "private": held})
+        elif self.path.startswith("/private-sessions/"):
+            self._send(self.server.private_status, {"error": "down"})
         else:
             self._send(404, {})
 
     def do_PUT(self) -> None:
         self._record()
         if self.path.startswith("/private-sessions/") and self.server.private_status == 200:
-            self._send(200, {"private": True})
+            self.server.private_rows.add(self.path.rsplit("/", 1)[-1])
+            self._send(200, {"status": "ok", "private": True})
         else:
             self._send(self.server.private_status, {"error": "down"})
 
@@ -270,6 +276,7 @@ class _Server(ThreadingHTTPServer):
         self.release = threading.Event()
         self.ingest_status = 200
         self.private_status = 200
+        self.private_rows: set[str] = set()  # the sessions the server holds off the record
         self.tool_error = False
         self.tool_text = ""
 
@@ -282,6 +289,11 @@ class _Server(ThreadingHTTPServer):
 
     def puts(self) -> list[str]:
         return [r["path"] for r in self.seen if r["method"] == "PUT"]
+
+    def asked(self) -> list[str]:
+        """The sessions the server was asked about, in order."""
+        gets = [r["path"] for r in self.seen if r["method"] == "GET"]
+        return [p.rsplit("/", 1)[-1] for p in gets if p.startswith("/private-sessions/")]
 
 
 @pytest.fixture()
@@ -666,6 +678,65 @@ def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tm
     assert len(server.puts()) == told + 1 and server.posts() == []
     provider.sync_turn("q", "a", messages=_conversation(3))
     assert len(server.puts()) == told + 1  # told once: not asked again
+
+
+@pytest.mark.parametrize("reason", ["compression", "branch"])
+def test_with_no_marker_the_server_says_whether_the_new_id_is_private(
+    plugin, server, tmp_path, reason
+):
+    """`private off` removed the marker, or its twelve hours passed: the server's row
+    still drops the old id's turns, and the new id starts with copies of them."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    server.private_rows.add(_SID)
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason=reason)
+    assert server.asked() == [] and server.puts() == []  # asked at the next upload
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    assert server.asked() == [_SID] and server.puts() == [f"/private-sessions/{_NEXT}"]
+    assert server.posts() == [] and (tmp_path / "private" / _NEXT).is_file()
+    # What was said before the answer is not looked back at once the marker goes.
+    (tmp_path / "private" / _NEXT).unlink()
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    assert server.posts() == [] and server.asked() == [_SID]
+
+
+def test_a_second_new_id_is_private_after_the_first_ones_marker_is_gone(plugin, server, tmp_path):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, _SID)
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    (tmp_path / "private" / _NEXT).unlink()  # its twelve hours
+    (tmp_path / "private" / _SID).unlink()
+    third = "20261113_090000_cccccc"
+    provider.on_session_switch(third, parent_session_id=_NEXT, reason="compression")
+    provider.sync_turn("q", "a", messages=_conversation(2))
+    assert server.asked() == [_NEXT] and server.posts() == []
+    assert (tmp_path / "private" / third).is_file()
+    assert server.puts() == [f"/private-sessions/{_NEXT}", f"/private-sessions/{third}"]
+
+
+def test_a_new_id_of_a_conversation_on_the_record_is_asked_about_and_uploaded(
+    plugin, server, tmp_path
+):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    provider.sync_turn("q", "a", messages=_conversation(2))
+    (body,) = server.posts()
+    assert body["session_id"] == _NEXT and server.asked() == [_SID] and server.puts() == []
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    assert len(server.posts()) == 2 and server.asked() == [_SID]  # asked once
+
+
+def test_no_answer_about_the_new_id_holds_its_turns_back(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    provider = _start(_new(plugin), home)
+    server.private_status = 503
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    provider.sync_turn("q", "a", messages=_conversation(1))
+    provider.on_pre_compress(_conversation(1))
+    assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
+    server.private_status = 200
+    provider.sync_turn("q", "a", messages=_conversation(2))
+    (body,) = server.posts()
+    assert _users(body["records"]) == ["question 1", "question 2"]
 
 
 def test_a_session_that_is_off_carries_nothing(plugin, server, tmp_path):

@@ -309,10 +309,15 @@ Not sent: the system prompt, Hermes's compaction summaries, the memory context i
 into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait in
 `$HERMES_HOME/synapse/outbox/` and go with the next successful one. A session marked
 private (`synapse private on <session-id>`, in a terminal; `hermes sessions list` shows
-the id) uploads nothing. Hermes gives a conversation a new session id when it compresses
-or branches it: the new id is made private too, marker and server row, so what was said
-off the record stays there. `/new` and `/resume` open another conversation, which is on
-the record until you mark it.
+the id) uploads nothing. Hermes gives a conversation a new session id when it branches
+it, and when a compression starts a new session: the new id is private when a session it
+holds turns of is, and gets the marker and the server row, so what was said off the
+record stays there. A marker lasts twelve hours and `off` removes it, so when none says,
+the server is asked (`GET /private-sessions/<earlier id>`) before the new session's
+first upload, once per session; until it answers, nothing is uploaded for that session.
+`/new` and `/resume` open another conversation, which is on the record until you mark
+it. `synapse private off --forget <id>` puts a session back on the record with the turns
+it holds, copied ones included.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

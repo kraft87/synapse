@@ -2083,17 +2083,24 @@ def test_a_codex_rewire_failure_after_an_update_is_reported_not_fatal(cli, capsy
 
 
 @pytest.mark.parametrize(
-    ("command", "module"),
-    [("devices", "device_admin"), ("private", "private_mode"), ("import", "import_history")],
+    ("command", "module", "named"),
+    [
+        ("devices", "device_admin", {}),
+        # The toggle names a command to run next: it is told the one the user typed.
+        ("private", "private_mode", {"program": "synapse private"}),
+        ("import", "import_history", {}),
+    ],
 )
-def test_passthrough_commands_hand_their_arguments_to_the_tool(cli, monkeypatch, command, module):
-    calls: list[list[str]] = []
+def test_passthrough_commands_hand_their_arguments_to_the_tool(
+    cli, monkeypatch, command, module, named
+):
+    calls: list[tuple[list[str], dict]] = []
     fake = types.ModuleType(module)
-    fake.main = lambda argv: calls.append(argv)
+    fake.main = lambda argv, **kwargs: calls.append((argv, kwargs))
     monkeypatch.setitem(sys.modules, module, fake)
 
     assert cli.run(command, "list", "--json") == 0
-    assert calls == [["list", "--json"]]
+    assert calls == [(["list", "--json"], named)]
 
 
 def test_a_passthrough_tools_exit_code_is_the_commands(cli, monkeypatch):

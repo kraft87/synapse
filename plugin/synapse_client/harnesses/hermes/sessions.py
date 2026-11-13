@@ -142,7 +142,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .lineage import Parent, lineage
+from .lineage import Parent, chain, lineage
 from .marks import mark, marked
 
 ACTIVE = "active"
@@ -185,13 +185,16 @@ _MARKED = "a chat other agents or people have written into (marked when that was
 
 
 class Verdict(NamedTuple):
-    """``mode`` (ACTIVE or INERT), why it is INERT, a gateway session's cwd, and whether
-    the reason is that others write into the chat (``foreign``; such a chat is marked)."""
+    """``mode`` (ACTIVE or INERT), why it is INERT, a gateway session's cwd, whether the
+    reason is that others write into the chat (``foreign``; such a chat is marked), and,
+    for an ACTIVE session read from the store, the sessions whose turns it holds, nearest
+    first (``continues``, lineage.chain)."""
 
     mode: str
     reason: str = ""
     cwd: str | None = None
     foreign: bool = False
+    continues: tuple[str, ...] = ()
 
 
 class StoreError(Exception):
@@ -492,6 +495,8 @@ def _verdict(
                 return Verdict(INERT, _MARKED, foreign=True)
         if marked(home, [session_id, *chats]):
             return Verdict(INERT, _MARKED, foreign=True)
+        if row is not None:
+            return found._replace(continues=chain(conn, row[4], row[3]))
     return found
 
 

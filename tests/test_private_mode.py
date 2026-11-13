@@ -488,6 +488,15 @@ def test_on_exits_nonzero_when_the_server_write_does_not_land(toggle, stub_serve
     assert "NOT off the record" in capsys.readouterr().err
 
 
+def test_run_as_synapse_private_the_toggle_names_that_command(monkeypatch, tmp_path, capsys):
+    # `synapse private` hands over the name it was typed as (synapse_cli._NAMED).
+    mod = _load_toggle(_TOGGLE, monkeypatch, tmp_path, "http://127.0.0.1:1")  # no listener
+    assert mod.main([], program="synapse private") == 2
+    assert "usage: synapse private on|off|status" in capsys.readouterr().err
+    assert mod.main([]) == 2
+    assert "usage: private_mode.py on|off|status" in capsys.readouterr().err
+
+
 def test_on_exits_nonzero_when_the_server_is_unreachable(
     toggle_script, monkeypatch, tmp_path, capsys
 ):
@@ -645,6 +654,50 @@ def test_session_end_removes_marker_but_not_the_row(toggle, stub_server, monkeyp
     assert not (toggle.PRIVATE_DIR / sid).exists()
     assert stub_server.calls == []
     assert sid in stub_server.rows
+
+
+# A server URL urlsplit rejects ("Invalid IPv6 URL"). The toggle builds its client before it
+# knows whether it will make a request: the URL must fail the requests, not the command.
+_UNREADABLE = "http://[bad"
+
+
+def test_on_with_a_server_url_that_cannot_be_read_keeps_the_marker_and_says_so(
+    toggle_script, monkeypatch, tmp_path, capsys
+):
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert (mod.PRIVATE_DIR / "s-abc").exists()
+    assert "NOT off the record" in err
+    assert "ValueError" in err
+
+
+def test_status_with_a_server_url_that_cannot_be_read_reports_the_marker(
+    toggle_script, monkeypatch, tmp_path, capsys
+):
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", "s-abc"]) == 1
+    capsys.readouterr()
+    mod.main(["status", "s-abc"])
+    assert "marker=yes server=unknown (ValueError)" in capsys.readouterr().out
+
+
+def test_session_end_with_a_server_url_that_cannot_be_read_still_removes_the_marker(
+    toggle_script, monkeypatch, tmp_path
+):
+    sid = "s-abc"
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", sid]) == 1
+    assert (mod.PRIVATE_DIR / sid).exists()
+
+    class _Stdin:
+        @staticmethod
+        def read() -> str:
+            return json.dumps({"session_id": sid, "reason": "clear"})
+
+    monkeypatch.setattr(mod.sys, "stdin", _Stdin())
+    assert mod.main(["--session-end"]) == 0  # a hook must never break session teardown
+    assert not (mod.PRIVATE_DIR / sid).exists()
 
 
 def test_session_end_is_fail_soft_on_garbage_payload(toggle, monkeypatch):

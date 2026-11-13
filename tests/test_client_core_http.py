@@ -30,6 +30,7 @@ from synapse_client.settings import Settings  # noqa: E402
 
 _TOKEN = "tkHTTP7c2Vb9Qx4Ln"
 _UA = "synapse-test/1.0"
+_UNREADABLE = "http://[bad"  # urlsplit raises ValueError on it
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +219,26 @@ def test_open_keeps_the_bearer_rule_and_raises_on_http_errors(serve):
 
 def test_the_repr_leaves_the_token_out():
     assert _TOKEN not in repr(Transport("https://s.example", _TOKEN, _UA))
+
+
+def test_a_server_url_that_cannot_be_read_fails_the_request_not_the_transport(serve):
+    # A hook builds its Transport before it knows whether it will make a request (the
+    # private toggle's --session-end makes none): a URL urlsplit rejects must not stop it.
+    other = serve()
+    other.routes["/x"] = _echo
+    t = Transport(_UNREADABLE, _TOKEN, _UA)
+    with pytest.raises(ValueError):
+        t.get_json("/context")
+    t.post_json(other.url + "/x", {})
+    assert "authorization" not in other.seen[-1]["headers"]
+
+
+def test_an_unreadable_token_origin_names_no_server_and_leaves_the_others(serve):
+    home, other = serve(), serve()
+    other.routes["/x"] = _echo
+    t = Transport(home.url, _TOKEN, _UA, token_origins=[_UNREADABLE, other.url + "/x"])
+    t.post_json(other.url + "/x", {})
+    assert other.seen[-1]["headers"]["authorization"] == f"Bearer {_TOKEN}"
 
 
 # ---------------------------------------------------------------------------
