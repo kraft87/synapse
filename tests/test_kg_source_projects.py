@@ -417,8 +417,12 @@ def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
     executed: list[tuple[str, Any]] = []
 
     class _Rec:
-        def __init__(self, cur):
-            self._cur = cur
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, **kw):
+            self._cur = self._conn.cursor(**kw)
+            return self
 
         def execute(self, sql, params=None):
             executed.append((sql, params))
@@ -427,8 +431,8 @@ def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
         def fetchall(self):
             return self._cur.fetchall()
 
-    with psycopg.connect(db_url) as c, c.cursor() as cur:
-        kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 5, [WORK])
+    with psycopg.connect(db_url) as c:
+        kg_pg.search_kg_postgres(_Rec(c), "q", onehot(0), "default", [], 5, [WORK])
     hop_queries = [s for s, _ in executed if "src_uuid = %s OR tgt_uuid = %s" in s]
     assert hop_queries == [], "no in-scope edge, so no seed, so no hop query"
 
@@ -574,10 +578,13 @@ def test_restricted_recall_scopes_the_supersession_extras(kg, db_url):
 
 
 class _RecordingConn:
-    """Records every statement; answers with no rows."""
+    """Records every statement; answers with no rows. Every cursor asked of it is itself."""
 
     def __init__(self) -> None:
         self.sql: list[str] = []
+
+    def cursor(self, **_kw):
+        return self
 
     def execute(self, sql, params=None):
         self.sql.append(sql)

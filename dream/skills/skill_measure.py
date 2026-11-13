@@ -26,8 +26,11 @@ import os
 import re
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from psycopg.rows import class_row
 
 from . import claude_cli, config
 
@@ -63,17 +66,25 @@ def skill_description(text: str) -> str:
     return ""
 
 
+@dataclass(frozen=True, slots=True)
+class _CatalogRow:
+    """One active skill's name and trigger description (empty when unset)."""
+
+    name: str
+    description: str
+
+
 def load_catalog(conn) -> list[tuple[str, str]]:
     """(name, description) for ACTIVE skills, ordered by name — the lane-wide registry read
     every detector shares. Server-side the registry IS the catalog (the dream container has no
     ~/.claude/skills); the client's skills_sync owns the disk<->registry publish. `description`
     is the trigger surface."""
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_CatalogRow))
     cur.execute(
-        "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
+        "SELECT name, COALESCE(description, '') AS description FROM skills_lane.skill_registry "
         "WHERE status = 'active' ORDER BY name"
     )
-    return [(name, desc) for name, desc in cur.fetchall()]
+    return [(r.name, r.description) for r in cur.fetchall()]
 
 
 def load_scopes(conn) -> dict[str, str]:

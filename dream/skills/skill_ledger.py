@@ -28,6 +28,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from typing import Any
+
+from psycopg.rows import class_row
 
 from ingestion.schema_check import ColumnProbe
 
@@ -229,6 +234,14 @@ def _standing_reject(evidence: list[dict]) -> bool:
     return last == "reject"
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionDayRow:
+    """One session's first episode day (None when the day is not known)."""
+
+    session_id: str
+    day: date | None
+
+
 def _fill_session_dates(cur, evidence: list[dict]) -> None:
     """Stamp `date` in place on the entries of every session with no dated entry yet: the
     session's first episode day, min(created_at), the same clock the rest of the lane
@@ -236,12 +249,16 @@ def _fill_session_dates(cur, evidence: list[dict]) -> None:
     sids = sorted(s for s, d in _session_dates(evidence).items() if not d)
     if not sids:
         return
-    cur.execute(
-        "SELECT session_id, min(created_at)::date FROM episodes "
-        "WHERE session_id = ANY(%s) GROUP BY session_id",
-        (sids,),
+    rows = (
+        cur.connection.cursor(row_factory=class_row(_SessionDayRow))
+        .execute(
+            "SELECT session_id, min(created_at)::date AS day FROM episodes "
+            "WHERE session_id = ANY(%s) GROUP BY session_id",
+            (sids,),
+        )
+        .fetchall()
     )
-    found = {sid: d.isoformat() for sid, d in cur.fetchall() if d}
+    found = {r.session_id: r.day.isoformat() for r in rows if r.day}
     for e in evidence:
         if e.get("session_id") in found and not e.get("date"):
             e["date"] = found[e["session_id"]]
@@ -270,6 +287,25 @@ def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
     return len(j_sess), len(g_sess), jw, gw
 
 
+@dataclass(frozen=True, slots=True)
+class _RetuneMatchRow:
+    """The candidate row a retune/consolidate key already occupies."""
+
+    id: int
+    evidence: list[dict[str, Any]]
+    cooling: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _DeriveMatchRow:
+    """One open, rejected or recently retired derive row the identity resolver compares."""
+
+    id: int
+    evidence: list[dict[str, Any]]
+    signature_key: str | None
+    cooling: bool
+
+
 def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions):
     """Return (id, evidence, cooling) of the matching candidate, or None. `cooling` is True
     when the row is rejected inside its 30d suppression window (rejected_until)."""
@@ -278,15 +314,18 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         # terminal state (promoted/rejected/retired) still occupies (kind, name, direction);
         # filtering it out here sent merge_candidate down the INSERT path straight into a
         # UniqueViolation every night the lane re-derived the same candidate.
-        cur.execute(
-            "SELECT id, evidence, "
-            "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
-            "FROM skills_lane.skill_gap_candidates "
-            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') LIMIT 1",
-            (kind, name, direction),
+        r = (
+            cur.connection.cursor(row_factory=class_row(_RetuneMatchRow))
+            .execute(
+                "SELECT id, evidence, "
+                "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
+                "FROM skills_lane.skill_gap_candidates "
+                "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') LIMIT 1",
+                (kind, name, direction),
+            )
+            .fetchone()
         )
-        r = cur.fetchone()
-        return (r[0], r[1], r[2]) if r else None
+        return (r.id, r.evidence, r.cooling) if r else None
     # derive: semantic identity over open rows, rejected ones (a revival inherits the
     # cooldown and the human reject instead of coming back as a fresh row) and ones retired
     # in the last REOPEN_RETIRED_DAYS (a repeat after decay reopens the row it repeats).
@@ -294,20 +333,24 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
     # must never wildcard-match (and clobber) an existing empty-keyed row — each leg only
     # counts when BOTH sides are non-empty. Open rows come first, so on a tie the sighting
     # joins the open row rather than an old one's cooldown.
-    cur.execute(
-        "SELECT id, evidence, signature_key, "
-        "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
-        "FROM skills_lane.skill_gap_candidates "
-        "WHERE kind='derive' AND (status IN ('observe','proposed','rejected') "
-        "  OR (status='retired' AND updated_at > now() - (%s || ' days')::interval)) "
-        "ORDER BY (status IN ('observe','proposed')) DESC, id",
-        (str(REOPEN_RETIRED_DAYS),),
+    rows = (
+        cur.connection.cursor(row_factory=class_row(_DeriveMatchRow))
+        .execute(
+            "SELECT id, evidence, signature_key, "
+            "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
+            "FROM skills_lane.skill_gap_candidates "
+            "WHERE kind='derive' AND (status IN ('observe','proposed','rejected') "
+            "  OR (status='retired' AND updated_at > now() - (%s || ' days')::interval)) "
+            "ORDER BY (status IN ('observe','proposed')) DESC, id",
+            (str(REOPEN_RETIRED_DAYS),),
+        )
+        .fetchall()
     )
     best, best_score = None, 0.0
     new_toks = set((sigkey or "").split())
-    for cid, ev, rk, cooling in cur.fetchall():
-        old_sessions = _ev_sessions(ev or [])
-        old_toks = set((rk or "").split())
+    for r in rows:
+        old_sessions = _ev_sessions(r.evidence or [])
+        old_toks = set((r.signature_key or "").split())
         sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
         tj = _jaccard(new_toks, old_toks) if new_toks and old_toks else 0.0
         # Signature disagreement vetoes session-overlap identity: one long session
@@ -319,7 +362,7 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
-                best, best_score = (cid, ev or [], bool(cooling)), rank
+                best, best_score = (r.id, r.evidence or [], bool(r.cooling)), rank
     return best
 
 
@@ -347,6 +390,25 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
             return True
         return _recurrence(evidence)
     return False
+
+
+@dataclass(frozen=True, slots=True)
+class _UpsertedRow:
+    """The candidate row an upsert wrote: its id, status, score and salience."""
+
+    id: int
+    status: str
+    score: float | None
+    salience: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _OccupantRow:
+    """The candidate row that occupies a (kind, name, direction) key."""
+
+    id: int
+    status: str
+    score: float | None
 
 
 def merge_candidate(
@@ -408,8 +470,9 @@ def merge_candidate(
     ev_json = json.dumps(evidence)
     tgt = list(target_skills or [])
 
+    ret = conn.cursor(row_factory=class_row(_UpsertedRow))
     if cid:
-        cur.execute(
+        ret.execute(
             """UPDATE skills_lane.skill_gap_candidates SET
                  evidence=%s::jsonb, judge_sessions=%s, grounded_sessions=%s,
                  judge_weight=%s, grounded_weight=%s,
@@ -442,7 +505,7 @@ def merge_candidate(
             ),
         )
     else:
-        cur.execute(
+        ret.execute(
             """INSERT INTO skills_lane.skill_gap_candidates
                  (kind, name, signature_key, target_skills, direction, summary, signature,
                   trigger_phrasings, summary_embedding, evidence,
@@ -472,25 +535,28 @@ def merge_candidate(
                 proposed_patch,
             ),
         )
-    row = cur.fetchone()
+    row = ret.fetchone()
     if row is None:
         # ON CONFLICT backstop fired: the unique key is occupied by a row the resolver
         # didn't see (e.g. a concurrent writer landed it between resolve and insert).
         # Never crash the lane — report the occupying row, untouched.
         conn.commit()
-        cur.execute(
-            "SELECT id, status, score FROM skills_lane.skill_gap_candidates "
-            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-')",
-            (kind, name, direction),
+        r = (
+            conn.cursor(row_factory=class_row(_OccupantRow))
+            .execute(
+                "SELECT id, status, score FROM skills_lane.skill_gap_candidates "
+                "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-')",
+                (kind, name, direction),
+            )
+            .fetchone()
         )
-        r = cur.fetchone()
         return {
-            "id": r[0] if r else None,
-            "status": r[1] if r else None,
-            "score": r[2] if r else None,
+            "id": r.id if r else None,
+            "status": r.status if r else None,
+            "score": r.score if r else None,
             "merged": False,
         }
-    rid, status, score, row_salience = row
+    rid, status, score, row_salience = row.id, row.status, row.score, row.salience
 
     # A re-sighted terminal row REOPENS (rejected past its cooldown, or retired-stale):
     # back to 'observe' so the gates below re-decide. The old reject evidence merged in
@@ -522,28 +588,41 @@ def _mark_proposed(conn, cur, rid) -> None:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ObserveDeriveRow:
+    """One 'observe' derive row the nightly re-gate re-reads."""
+
+    id: int
+    evidence: list[dict[str, Any]]
+    salience: int | None
+
+
 def regate_observe(conn) -> dict:
     """Re-run the derive gate over 'observe' derive rows, so the recurrence gate (and the
     session days of rows written before the nightly stamped them) takes effect without
     waiting for a re-sighting. Only rows that now pass are written: their evidence with the
     days filled in, and status 'proposed'."""
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, evidence, salience FROM skills_lane.skill_gap_candidates "
-        "WHERE kind='derive' AND status='observe'"
+    rows = (
+        conn.cursor(row_factory=class_row(_ObserveDeriveRow))
+        .execute(
+            "SELECT id, evidence, salience FROM skills_lane.skill_gap_candidates "
+            "WHERE kind='derive' AND status='observe'"
+        )
+        .fetchall()
     )
     raised = []
-    for rid, ev, salience in cur.fetchall():
-        ev = list(ev or [])
+    for r in rows:
+        ev = list(r.evidence or [])
         _fill_session_dates(cur, ev)
         _js, _gs, jw, gw = _rollup(ev)
-        if _passes_gate("derive", ev, gw + 0.5 * jw, salience):
+        if _passes_gate("derive", ev, gw + 0.5 * jw, r.salience):
             cur.execute(
                 "UPDATE skills_lane.skill_gap_candidates SET evidence=%s::jsonb WHERE id=%s",
-                (json.dumps(ev), rid),
+                (json.dumps(ev), r.id),
             )
-            _mark_proposed(conn, cur, rid)
-            raised.append(rid)
+            _mark_proposed(conn, cur, r.id)
+            raised.append(r.id)
     conn.commit()
     return {"regated": len(raised), "ids": raised}
 
@@ -566,13 +645,23 @@ def decay_stale(conn, ttl_days: int = DECAY_TTL_DAYS) -> dict:
     return {"retired": retired}
 
 
+@dataclass(frozen=True, slots=True)
+class _ScanCursorRow:
+    """The lane's scan watermark row."""
+
+    last_scan_at: datetime | None
+    last_run_at: datetime | None
+    runs: int
+    config: dict[str, Any]
+
+
 def get_cursor(conn) -> dict:
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_ScanCursorRow))
     cur.execute(
         "SELECT last_scan_at, last_run_at, runs, config FROM skills_lane.skill_scan_cursor WHERE id=1"
     )
     r = cur.fetchone()
-    return {"last_scan_at": r[0], "last_run_at": r[1], "runs": r[2], "config": r[3]} if r else {}
+    return asdict(r) if r else {}
 
 
 def update_cursor(conn, last_scan_at, config=None) -> None:
@@ -593,6 +682,15 @@ def update_cursor(conn, last_scan_at, config=None) -> None:
 
 
 # ------------------------------------------------------------------------ selftest
+@dataclass(frozen=True, slots=True)
+class _SelftestRow:
+    """The selftest candidates' row count, best judge-session count and best score."""
+
+    n: int
+    jsess: int | None
+    score: float | None
+
+
 def _selftest() -> None:
     """Insert two derive candidates for the same procedure under DIFFERENT names (the drift case),
     confirm they MERGE into one accumulating row, then clean up. Verifies the Oracle Q1 fix."""
@@ -645,13 +743,17 @@ def _selftest() -> None:
         summary="nightly restic backup workflow",
         do_embed=False,
     )
-    cur.execute(
-        "SELECT count(*), max(judge_sessions), max(score) FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%'"
+    seen = (
+        conn.cursor(row_factory=class_row(_SelftestRow))
+        .execute(
+            "SELECT count(*) AS n, max(judge_sessions) AS jsess, max(score) AS score "
+            "FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%'"
+        )
+        .fetchone()
     )
-    n, jsess, score = cur.fetchone()
     print(f"r1={r1}\nr2={r2}")
     print(
-        f"rows={n} (want 1 = merged despite name drift)  judge_sessions={jsess} (want 2)  score={score}"
+        f"rows={seen.n} (want 1 = merged despite name drift)  judge_sessions={seen.jsess} (want 2)  score={seen.score}"
     )
     # grounded signal advances
     r3 = merge_candidate(

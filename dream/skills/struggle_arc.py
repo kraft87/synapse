@@ -36,6 +36,10 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
+from datetime import datetime
+
+from psycopg.rows import class_row
 
 from . import config
 from . import skill_db_source as DB
@@ -211,11 +215,22 @@ def group_arcs(flagged: list[dict], gap: int = ARC_GAP) -> list[dict]:
     return arcs
 
 
+@dataclass(frozen=True, slots=True)
+class _ArcTurnRow:
+    """One new episode of a session, as the struggle-arc prescreen reads it."""
+
+    session_id: str
+    sequence: int
+    created_at: datetime
+    human_turn: str | None
+    content_head: str
+
+
 def _fetch_new_episodes(conn, since) -> list[dict]:
     """Episodes newer than `since` (None -> 30d), claude_code only, foreign skill
     environments excluded. With STRUGGLE_INCLUDE_PROJECTS set, only allowlisted
     projects are scanned (untagged episodes drop too). Only prescreen fields."""
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_ArcTurnRow))
     where_time = (
         "created_at > %s" if since is not None else "created_at > now() - interval '30 days'"
     )
@@ -228,7 +243,7 @@ def _fetch_new_episodes(conn, since) -> list[dict]:
         where_project = "(project IS NULL OR project <> ALL(%s))"
         params.append(list(EXCLUDED_PROJECTS))
     cur.execute(
-        f"""SELECT session_id, sequence, created_at, human_turn, LEFT(content, 400)
+        f"""SELECT session_id, sequence, created_at, human_turn, LEFT(content, 400) AS content_head
               FROM episodes
              WHERE platform = 'claude_code' AND {where_time} AND {where_project}
              ORDER BY session_id, sequence""",
@@ -236,19 +251,28 @@ def _fetch_new_episodes(conn, since) -> list[dict]:
     )
     return [
         {
-            "session_id": str(sid),
-            "sequence": seq,
-            "created_at": ts,
-            "human_turn": human or "",
-            "content_head": head or "",
+            "session_id": str(r.session_id),
+            "sequence": r.sequence,
+            "created_at": r.created_at,
+            "human_turn": r.human_turn or "",
+            "content_head": r.content_head or "",
         }
-        for sid, seq, ts, human, head in cur.fetchall()
+        for r in cur.fetchall()
     ]
 
 
 # ------------------------------------------------------------------ Stage B: judge
+@dataclass(frozen=True, slots=True)
+class _WindowRow:
+    """One episode of an arc window, as the judge reads it."""
+
+    sequence: int
+    human_turn: str | None
+    content: str
+
+
 def _fetch_window(conn, session_id: str, lo: int, hi: int) -> list[dict]:
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_WindowRow))
     cur.execute(
         """SELECT sequence, human_turn, content FROM episodes
             WHERE session_id = %s AND sequence BETWEEN %s AND %s
@@ -256,8 +280,8 @@ def _fetch_window(conn, session_id: str, lo: int, hi: int) -> list[dict]:
         (session_id, lo, hi, MAX_WINDOW_EPISODES),
     )
     return [
-        {"sequence": seq, "human_turn": human or "", "content": content or ""}
-        for seq, human, content in cur.fetchall()
+        {"sequence": r.sequence, "human_turn": r.human_turn or "", "content": r.content or ""}
+        for r in cur.fetchall()
     ]
 
 

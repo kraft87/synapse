@@ -30,12 +30,14 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from fastmcp.resources.base import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.providers.base import Provider
 from fastmcp.utilities.versions import VersionSpec
+from psycopg.rows import class_row
 from pydantic import AnyUrl
 
 from ingestion import pg_pool
@@ -52,13 +54,35 @@ _MANIFEST = "_manifest"
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveSkillRow:
+    """One active skill: what a listing shows, and the scope that decides who sees it."""
+
+    name: str
+    description: str
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FileMetaRow:
+    """One bundled file of a skill, without its content."""
+
+    path: str
+    size: int
+    sha256: str
+
+
 def _fetch_active(db_url: str, access: SkillAccess) -> list[tuple[str, str]]:
     with pg_pool.connection(db_url, autocommit=False) as c:
-        rows = c.execute(
-            "SELECT name, COALESCE(description, ''), scope FROM skills_lane.skill_registry "
-            "WHERE status = 'active' ORDER BY name"
-        ).fetchall()
-    return [(r[0], r[1]) for r in rows if access.serves(r[2])]
+        rows = (
+            c.cursor(row_factory=class_row(_ActiveSkillRow))
+            .execute(
+                "SELECT name, COALESCE(description, '') AS description, scope "
+                "FROM skills_lane.skill_registry WHERE status = 'active' ORDER BY name"
+            )
+            .fetchall()
+        )
+    return [(r.name, r.description) for r in rows if access.serves(r.scope)]
 
 
 def _skill_active(db_url: str, name: str, access: SkillAccess) -> bool:
@@ -79,14 +103,17 @@ def _fetch_body(db_url: str, name: str) -> str | None:
     return row[0] if row and row[0] is not None else None
 
 
-def _fetch_files_meta(db_url: str, name: str) -> list[tuple[str, int, str]]:
+def _fetch_files_meta(db_url: str, name: str) -> list[_FileMetaRow]:
     with pg_pool.connection(db_url, autocommit=False) as c:
-        rows = c.execute(
-            "SELECT path, size, sha256 FROM skills_lane.skill_files "
-            "WHERE skill_name = %s ORDER BY path",
-            (name,),
-        ).fetchall()
-    return [(r[0], r[1], r[2]) for r in rows]
+        return (
+            c.cursor(row_factory=class_row(_FileMetaRow))
+            .execute(
+                "SELECT path, size, sha256 FROM skills_lane.skill_files "
+                "WHERE skill_name = %s ORDER BY path",
+                (name,),
+            )
+            .fetchall()
+        )
 
 
 def _fetch_file(db_url: str, name: str, path: str) -> bytes | None:
@@ -106,8 +133,8 @@ def _manifest_json(db_url: str, name: str, body: str | None) -> str:
         files.append(
             {"path": _MAIN, "size": len(raw), "hash": "sha256:" + hashlib.sha256(raw).hexdigest()}
         )
-    for path, size, sha in _fetch_files_meta(db_url, name):
-        files.append({"path": path, "size": size, "hash": "sha256:" + sha})
+    for f in _fetch_files_meta(db_url, name):
+        files.append({"path": f.path, "size": f.size, "hash": "sha256:" + f.sha256})
     return json.dumps({"skill": name, "files": files}, indent=2)
 
 

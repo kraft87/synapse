@@ -692,15 +692,15 @@ class NodeDeduper:
                 idx.type_map = {}
 
         for row in rows:
-            node_uuid = row[0]
-            name = row[1] or ""
-            summary = row[2] or ""
-            idx.supertype_by_uuid[node_uuid] = row[3]
+            node_uuid = row.uuid
+            name = row.name or ""
+            summary = row.summary or ""
+            idx.supertype_by_uuid[node_uuid] = row.entity_supertype
             # A row's key is the one the SQL lookup and the one-memory merge use: its stored
             # normalized_name, else lower(trim(name)) for a row written before that column (SQL
             # trim() takes spaces only). Not _normalize_name(name), which also strips punctuation
             # and inner spaces and would send a legacy row's name to another row than the lookup.
-            key = row[4] or name.strip(" ").lower()
+            key = row.normalized_name or name.strip(" ").lower()
             if key:
                 idx.uuid_by_normalized_name.setdefault(key, node_uuid)
             if not _normalize_name(name):

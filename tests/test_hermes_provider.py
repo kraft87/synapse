@@ -391,6 +391,17 @@ def _start(provider: Any, home: Path, session_id: str = _SID, **kwargs: Any) -> 
     return provider
 
 
+def _say(provider: Any, messages: list[dict[str, Any]], session_id: str = "") -> None:
+    """One turn as Hermes runs it: ``on_turn_start`` as it starts, with the user message
+    before this one (agent/turn_context.py), and ``sync_turn`` once it has ended, with
+    the conversation as it is then. A bare ``sync_turn`` in a test is one that runs
+    late, or the upload of a turn whose start the provider was not told of."""
+    asked = [row["content"] for row in messages if row["role"] == "user"]
+    previous = asked[-2] if len(asked) > 1 else ""
+    provider.on_turn_start(len(asked), asked[-1], previous_message=previous)
+    provider.sync_turn(asked[-1], "a", session_id=session_id, messages=messages)
+
+
 # ---------------------------------------------------------------------------
 # Session start and per prompt
 # ---------------------------------------------------------------------------
@@ -490,6 +501,7 @@ def test_a_finished_turn_is_uploaded(plugin, server, tmp_path):
 def test_an_unfinished_turn_waits(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     running = _conversation(1, tools=True)[:-1]  # ends in the tool result
+    provider.on_turn_start(1, "question 1", previous_message="")
     provider.sync_turn("question 1", "", session_id=_SID, messages=running)
     provider.sync_turn("question 1", "", session_id=_SID, messages=running[:-1])  # tool call
     assert server.posts() == []
@@ -501,9 +513,10 @@ def test_an_unfinished_turn_waits(plugin, server, tmp_path):
 
 def test_no_turn_is_sent_twice(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
+    provider.on_turn_start(1, "question 1", previous_message="")  # its own upload never ran
+    _say(provider, _conversation(2), _SID)
     provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(3))
+    _say(provider, _conversation(3), _SID)
     first, second = server.posts()
     assert _users(first["records"]) == ["question 1", "question 2"]
     # The turn before leads the batch as context.
@@ -512,6 +525,7 @@ def test_no_turn_is_sent_twice(plugin, server, tmp_path):
 
 def test_messages_none_sends_the_two_strings(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
+    provider.on_turn_start(1, "what is up", previous_message="")
     provider.sync_turn("what is up", "not much", session_id=_SID)
     provider.sync_turn("what is up", "not much", session_id=_SID)
     (body,) = server.posts()
@@ -530,8 +544,13 @@ def test_a_resumed_session_looks_back_ten_turns(plugin, server, tmp_path):
     assert _users(second["records"]) == ["question 15", "question 16"]
 
 
-def test_a_new_session_sends_its_whole_history(plugin, server, tmp_path):
+def test_a_new_session_sends_every_turn_it_saw_begin(plugin, server, tmp_path):
+    """No look-back in a session that is new here: when the uploads of its turns did not
+    run, more of them than LOOKBACK go up with the next one."""
     provider = _start(_new(plugin), tmp_path / "hermes-a")
+    for n in range(1, 16):
+        before = f"question {n - 1}" if n > 1 else ""
+        provider.on_turn_start(n, f"question {n}", previous_message=before)
     provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(15))
     (body,) = server.posts()
     assert len(_users(body["records"])) == 15
@@ -541,7 +560,7 @@ def test_a_failed_upload_waits_in_the_outbox_and_drains_after_a_success(plugin, 
     home = tmp_path / "hermes-a"
     provider = _start(_new(plugin), home)
     server.ingest_status = 503
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
+    _say(provider, _conversation(1), _SID)
     outbox = Outbox(home / "synapse" / "outbox")
     assert outbox.pending() == 1
     assert outbox.last_error() == "HTTP 503 Service Unavailable"
@@ -549,7 +568,7 @@ def test_a_failed_upload_waits_in_the_outbox_and_drains_after_a_success(plugin, 
     assert len(server.posts()) == 1  # handled: not tried again
 
     server.ingest_status = 200
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
+    _say(provider, _conversation(2), _SID)
     failed, fresh, drained = server.posts()
     assert drained == failed
     assert _users(fresh["records"]) == ["question 1", "question 2"]
@@ -561,11 +580,11 @@ def test_a_private_session_sends_nothing_and_keeps_its_turns(plugin, server, tmp
     marker = tmp_path / "private" / _SID
     marker.parent.mkdir(parents=True)
     marker.write_text("", encoding="utf-8")
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
+    _say(provider, _conversation(1), _SID)
     provider.on_session_end(_conversation(1))
     assert server.posts() == []
     marker.unlink()
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
+    _say(provider, _conversation(2), _SID)
     (body,) = server.posts()
     assert _users(body["records"]) == ["question 1", "question 2"]
 
@@ -576,7 +595,7 @@ def test_the_provider_does_not_drain_what_went_private_while_it_waited(plugin, s
     home = tmp_path / "hermes-a"
     provider = _start(_new(plugin), home)
     server.ingest_status = 503
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
+    _say(provider, _conversation(1), _SID)
     outbox = Outbox(home / "synapse" / "outbox")
     assert outbox.pending() == 1 and len(server.posts()) == 1
     marker = tmp_path / "private" / _SID
@@ -588,17 +607,36 @@ def test_the_provider_does_not_drain_what_went_private_while_it_waited(plugin, s
 
 
 def test_compression_and_session_end_upload_what_is_left(plugin, server, tmp_path):
+    """Turns no ``sync_turn`` came for (Hermes sends none for a turn cut short)."""
     provider = _start(_new(plugin), tmp_path / "hermes-a")
+    provider.on_turn_start(1, "question 1", previous_message="")
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
     assert provider.on_pre_compress(_conversation(2)) == ""
+    provider.on_turn_start(3, "question 3", previous_message="question 2")
     provider.on_session_end(_conversation(3))
     first, second = server.posts()
     assert _users(first["records"]) == ["question 1", "question 2"]
     assert _users(second["records"]) == ["question 2", "question 3"]
 
 
+@pytest.mark.parametrize("flush", ["on_pre_compress", "on_session_end"])
+def test_a_new_session_uploads_nothing_before_its_first_turn_starts(
+    plugin, server, tmp_path, flush
+):
+    """Hermes said the session was new, and a flush finds turns in it before any turn
+    has started here: nothing says they are its own (an ACP fork's are copies, written
+    after its agent was built). The first turn start says whether any came before."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    getattr(provider, flush)(_conversation(1))
+    assert server.posts() == []
+    _say(provider, _conversation(1))
+    assert [_users(body["records"]) for body in server.posts()] == [["question 1"]]
+
+
 def test_a_session_switch_rebinds(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
+    provider.on_turn_start(1, "question 1", previous_message="")
+    _say(provider, _conversation(2), _SID)
     provider.on_session_switch(_SID, rewound=True)
     provider.sync_turn("q", "a", messages=_conversation(2))
     assert len(server.posts()) == 1
@@ -630,13 +668,13 @@ def test_a_conversation_that_goes_on_under_a_new_id_stays_private(plugin, server
     mode is kept per id, so the turns spoken off the record went up under the new one."""
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     _private(tmp_path, _SID)
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
+    _say(provider, _conversation(2), _SID)
     provider.on_session_switch(
         _NEXT, parent_session_id=_SID, **({"reason": reason} if reason else {})
     )
     assert (tmp_path / "private" / _NEXT).is_file()
     assert server.puts() == [f"/private-sessions/{_NEXT}"]
-    provider.sync_turn("q", "a", messages=_conversation(3))
+    _say(provider, _conversation(3))
     provider.on_pre_compress(_conversation(3))
     provider.on_session_end(_conversation(3))
     assert server.posts() == []
@@ -646,7 +684,7 @@ def test_a_private_parent_is_enough_to_stay_private(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     _private(tmp_path, "20261111_090000_aaaaaa")
     provider.on_session_switch(_NEXT, parent_session_id="20261111_090000_aaaaaa", reason="branch")
-    provider.sync_turn("q", "a", messages=_conversation(1))
+    _say(provider, _conversation(1))
     assert (tmp_path / "private" / _NEXT).is_file() and server.posts() == []
 
 
@@ -662,7 +700,7 @@ def test_another_conversation_does_not_inherit_private_mode(plugin, server, tmp_
     _private(tmp_path, _SID)
     provider.on_session_switch(_NEXT, **switch)
     assert not (tmp_path / "private" / _NEXT).exists() and server.puts() == []
-    provider.sync_turn("q", "a", messages=_conversation(1))
+    _say(provider, _conversation(1))
     (body,) = server.posts()
     assert body["session_id"] == _NEXT
 
@@ -674,12 +712,12 @@ def test_turns_spoken_off_the_record_are_not_looked_back_at(plugin, server, tmp_
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     _private(tmp_path, _SID)
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
-    provider.sync_turn("q", "a", messages=_conversation(2))
+    _say(provider, _conversation(2))
     (tmp_path / "private" / _NEXT).unlink()
-    provider.sync_turn("q", "a", messages=_conversation(3))
+    _say(provider, _conversation(3))
     (body,) = server.posts()
     assert body["session_id"] == _NEXT and _users(body["records"]) == ["question 3"]
-    provider.sync_turn("q", "a", messages=_conversation(4))
+    _say(provider, _conversation(4))
     assert [_users(body["records"]) for body in server.posts()] == [
         ["question 3"],
         ["question 3", "question 4"],
@@ -694,17 +732,19 @@ def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tm
     told = len(server.puts())
     assert told >= 1 and (tmp_path / "private" / _NEXT).is_file()
     (tmp_path / "private" / _NEXT).unlink()  # the marker alone would not have lasted
-    provider.sync_turn("q", "a", messages=_conversation(1))
+    _say(provider, _conversation(1))
     assert len(server.puts()) > told and server.posts() == []
     server.private_status = 200
     told = len(server.puts())
-    provider.sync_turn("q", "a", messages=_conversation(2))
+    _say(provider, _conversation(2))
     assert len(server.puts()) == told + 1
     # The server has the row now and the marker is gone: the session is as private as
-    # one `on` and then `off` were run for. Its turns are sent, and the server drops
-    # them. The turn from before the row is not sent.
-    assert [_users(body["records"]) for body in server.posts()] == [["question 2"]]
-    provider.sync_turn("q", "a", messages=_conversation(3))
+    # one `on` and then `off` were run for. The turn that began while the server was
+    # still owed the row began off the record. The next one is sent, alone, and the
+    # server drops it.
+    assert server.posts() == []
+    _say(provider, _conversation(3))
+    assert [_users(body["records"]) for body in server.posts()] == [["question 3"]]
     assert len(server.puts()) == told + 1  # told once: not asked again
 
 
@@ -718,13 +758,13 @@ def test_with_no_marker_the_server_says_whether_the_new_id_is_private(
     server.private_rows.add(_SID)
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason=reason)
     assert server.asked() == [] and server.puts() == []  # asked at the next upload
-    provider.sync_turn("q", "a", messages=_conversation(3))
+    _say(provider, _conversation(3))
     assert server.asked() == [_SID] and server.puts() == [f"/private-sessions/{_NEXT}"]
     assert server.posts() == [] and (tmp_path / "private" / _NEXT).is_file()
     # What was said before the answer is not looked back at once the marker goes, and
     # is not sent beside the next turn either.
     (tmp_path / "private" / _NEXT).unlink()
-    provider.sync_turn("q", "a", messages=_conversation(4))
+    _say(provider, _conversation(4))
     assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
     assert server.asked() == [_SID]
 
@@ -737,7 +777,7 @@ def test_a_second_new_id_is_private_after_the_first_ones_marker_is_gone(plugin, 
     (tmp_path / "private" / _SID).unlink()
     third = "20261113_090000_cccccc"
     provider.on_session_switch(third, parent_session_id=_NEXT, reason="compression")
-    provider.sync_turn("q", "a", messages=_conversation(2))
+    _say(provider, _conversation(2))
     assert server.asked() == [_NEXT] and server.posts() == []
     assert (tmp_path / "private" / third).is_file()
     assert server.puts() == [f"/private-sessions/{_NEXT}", f"/private-sessions/{third}"]
@@ -748,10 +788,10 @@ def test_a_new_id_of_a_conversation_on_the_record_is_asked_about_and_uploaded(
 ):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
-    provider.sync_turn("q", "a", messages=_conversation(2))
+    _say(provider, _conversation(2))
     (body,) = server.posts()
     assert body["session_id"] == _NEXT and server.asked() == [_SID] and server.puts() == []
-    provider.sync_turn("q", "a", messages=_conversation(3))
+    _say(provider, _conversation(3))
     assert len(server.posts()) == 2 and server.asked() == [_SID]  # asked once
 
 
@@ -760,13 +800,13 @@ def test_no_answer_about_the_new_id_holds_its_turns_back(plugin, server, tmp_pat
     provider = _start(_new(plugin), home)
     server.private_status = 503
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
-    provider.sync_turn("q", "a", messages=_conversation(1))
+    _say(provider, _conversation(1))
     provider.on_pre_compress(_conversation(1))
     assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
     server.private_status = 200
     # The compression that was due took turn 1 out of the conversation: it was kept.
     system, *_, question, answer = _conversation(2)
-    provider.sync_turn("q", "a", messages=[system, question, answer])
+    _say(provider, [system, question, answer])
     (body,) = server.posts()
     assert _users(body["records"]) == ["question 1", "question 2"]
 
@@ -826,7 +866,7 @@ def test_an_inert_session_shows_nothing_sends_nothing_and_refuses_tools(
     provider = _start(_new(plugin), tmp_path / "hermes-a", **kwargs)
     assert provider.system_prompt_block() == ""
     assert provider.prefetch("anything") == ""
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
+    _say(provider, _conversation(1), _SID)
     provider.on_pre_compress(_conversation(1))
     provider.on_session_end(_conversation(1))
     out = json.loads(provider.handle_tool_call("recall", {"query": "x"}))
@@ -1008,11 +1048,11 @@ def test_two_instances_share_nothing(plugin, server, tmp_path):
     a = _start(_new(plugin), tmp_path / "hermes-a", session_id="sess-a")
     b = _start(_new(plugin), tmp_path / "hermes-b", session_id="sess-b")
     server.ingest_status = 503
-    a.sync_turn("q", "a", messages=_conversation(1))
+    _say(a, _conversation(1))
     assert Outbox(tmp_path / "hermes-a" / "synapse" / "outbox").pending() == 1
     assert Outbox(tmp_path / "hermes-b" / "synapse" / "outbox").pending() == 0
     server.ingest_status = 200
-    b.sync_turn("q", "a", messages=_conversation(1))
+    _say(b, _conversation(1))
     assert [p["session_id"] for p in server.posts()] == ["sess-a", "sess-b"]
     out = b.handle_tool_call("remember", {"content": "x"})
     assert json.loads(out)["session_id"] == "sess-b"

@@ -174,6 +174,15 @@ def test_schema_059_does_not_block_boot():
     assert is_optional_migration(path)
 
 
+def test_schema_070_does_not_block_boot():
+    """No service reads notes_history (its triggers fill it), so the boot guard must
+    start this build on a database still at 069."""
+    from ingestion.schema_check import is_optional_migration
+
+    path = Path(__file__).resolve().parent.parent / "schema" / "070_note_history.sql"
+    assert is_optional_migration(path)
+
+
 # ---------------------------------------------------------------------------
 # search_cache
 # ---------------------------------------------------------------------------

@@ -7,7 +7,8 @@ or Hermes builds a new agent for it, as the TUI and Desktop do for every branch
 (tui_gateway/methods_session_branch.py ``_branch_live``: the child's row is written,
 then the agent is built) and the gateway daemon does after a restart. These are the
 tests of the second way: what the session store says a session holds turns of
-(lineage.continues), and what ``initialize`` does with it.
+(lineage.continues), what ``initialize`` does with it, and what is recorded of a session
+once that is settled (carried.py).
 
 The fixtures are the provider tests' own: the plugin as Hermes loads it, a fake server
 that keeps the rows of the private-session routes, a ``state.db`` with the columns the
@@ -42,6 +43,7 @@ server = gs.server
 _process_env = pa._process_env
 _new = gs._new
 _conversation = gs._conversation
+_say = gs._say
 _users = gs._users
 _store = gs._store
 
@@ -182,6 +184,80 @@ def test_a_session_is_settled_once_it_is_recorded(tmp_path):
     (record,) = (tmp_path / "synapse" / "settled").iterdir()
     assert len(record.name) == 64 and record.read_bytes() == b""
     assert record.stat().st_mode & 0o777 == 0o600
+    # The names are hashes of session ids: the folders made for them are the owner's.
+    for folder in (record.parent, record.parent.parent):
+        assert folder.stat().st_mode & 0o777 == 0o700
+
+
+def test_the_record_says_whether_the_session_was_made_private(tmp_path):
+    """A session made private holds turns spoken off the record. Its record says so,
+    and goes on saying so whatever is recorded for it later."""
+    carried.settle(tmp_path, _CHILD)
+    assert carried.settled(tmp_path, _CHILD) and not carried.held(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD, True)
+    assert carried.held(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD, False)
+    assert carried.held(tmp_path, _CHILD) and carried.settled(tmp_path, _CHILD)
+    carried.settle(tmp_path, _PARENT, True)  # with no record before it
+    assert carried.held(tmp_path, _PARENT) and not carried.held(tmp_path, _GRAND)
+    records = sorted((tmp_path / "synapse" / "settled").iterdir())
+    assert len(records) == 2  # nothing is left beside them
+    for record in records:
+        assert record.read_bytes() == b"held\n" and record.stat().st_mode & 0o777 == 0o600
+    assert not carried.held(None, _CHILD) and not carried.held(tmp_path, "")
+
+
+class _Carrier:
+    """An uploader's ``carry_private``, with a set answer."""
+
+    def __init__(self, made: bool) -> None:
+        self.made = made
+        self.calls: list[tuple[list[str], str, float | None]] = []
+        self.settled: Any = None
+
+    def carry_private(
+        self, earlier: list[str], session_id: str, *, timeout: float | None, settled: Any
+    ) -> bool:
+        self.calls.append((list(earlier), session_id, timeout))
+        self.settled = settled
+        return self.made
+
+
+@pytest.mark.parametrize(
+    ("made", "passed"),
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["on the record", "made private", "holds a held one's turns", "both"],
+)
+def test_a_carry_answers_for_a_private_session_and_for_one_that_holds_such_turns(
+    tmp_path, made, passed
+):
+    """A session holds turns spoken off the record when one it holds turns of is
+    private, or holds such turns itself though it is back on the record. Its record
+    says which way the question ended once it is closed, not before."""
+    if passed:
+        carried.settle(tmp_path, _GRAND, True)
+    uploader = _Carrier(made)
+    answer = carried.carry(uploader, tmp_path, [_PARENT, None, _GRAND], _CHILD, 5)
+    assert answer is (made or passed)
+    assert uploader.calls == [([_PARENT, _GRAND], _CHILD, 5)]
+    assert not carried.settled(tmp_path, _CHILD)
+    uploader.settled(made)
+    assert carried.settled(tmp_path, _CHILD)
+    assert carried.held(tmp_path, _CHILD) is (made or passed)
+
+
+def test_a_settled_session_is_not_carried_again_and_its_record_answers(tmp_path):
+    uploader = _Carrier(True)
+    carried.settle(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, [_PARENT], _CHILD, None) is False
+    carried.settle(tmp_path, _CHILD, True)
+    assert carried.carry(uploader, tmp_path, [_PARENT], _CHILD, None) is True
+    # With no session to go by, or no id, there is nothing to ask.
+    carried.settle(tmp_path, _PARENT, True)
+    assert carried.carry(uploader, tmp_path, [None, ""], _GRAND, None) is False
+    assert carried.carry(uploader, tmp_path, [_PARENT], "", None) is False
+    assert uploader.calls == []
 
 
 def test_a_chain_is_asked_about_as_far_as_its_first_settled_session(tmp_path):
@@ -206,6 +282,85 @@ def test_a_record_that_cannot_be_kept_leaves_the_session_unsettled(tmp_path):
     assert not carried.settled(tmp_path, _CHILD)
     carried.settle(tmp_path, "")
     assert not carried.settled(tmp_path, "")
+
+
+def test_a_session_found_to_hold_copies_has_a_record_of_its_own(tmp_path):
+    """Kept apart from what was settled: it says what the session holds, and closes no
+    question about a session its row may name."""
+    assert not carried.copied(tmp_path, _CHILD)
+    carried.note_copied(tmp_path, _CHILD)
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.copied(tmp_path, _CHILD) and not carried.copied(tmp_path, _PARENT)
+    assert not carried.settled(tmp_path, _CHILD) and not carried.held(tmp_path, _CHILD)
+    (record,) = (tmp_path / "synapse" / "copied").iterdir()
+    assert len(record.name) == 64 and record.read_bytes() == b""
+    assert record.stat().st_mode & 0o777 == 0o600
+    for folder in (record.parent, record.parent.parent):
+        assert folder.stat().st_mode & 0o777 == 0o700
+    assert not (tmp_path / "synapse" / "settled").exists()
+    carried.settle(tmp_path, _PARENT, True)  # neither record is taken for the other
+    assert not carried.copied(tmp_path, _PARENT)
+
+
+def test_copies_that_cannot_be_recorded_are_not_kept(tmp_path, monkeypatch):
+    here, home = tmp_path / "cwd", tmp_path / "home"
+    here.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(here)
+    for none in (None, ""):
+        carried.note_copied(none, _CHILD)
+        assert not carried.copied(none, _CHILD)
+    carried.note_copied(home, "")
+    assert not carried.copied(home, "")
+    assert list(here.iterdir()) == [] and list(home.iterdir()) == []
+    (home / "synapse").write_text("a file where the folder goes", encoding="utf-8")
+    carried.note_copied(home, _CHILD)
+    assert not carried.copied(home, _CHILD)
+
+
+def test_with_no_session_to_ask_about_a_carry_goes_by_the_copies_record(tmp_path):
+    """A row that names no session leaves nothing to ask. Whether the session holds
+    another's turns is what was found of it (an ACP fork), and nothing is settled."""
+    uploader = _Carrier(True)
+    assert carried.carry(uploader, tmp_path, [], _CHILD, None) is False
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, [None, ""], _CHILD, None) is True
+    assert carried.carry(uploader, tmp_path, [], _PARENT, None) is False
+    assert uploader.calls == [] and not carried.settled(tmp_path, _CHILD)
+
+
+@pytest.mark.parametrize("ids", [[], [_PARENT]], ids=["no session named", "one named"])
+def test_a_settled_session_answers_by_both_its_records(tmp_path, ids):
+    """Settled as on the record, and found to hold copies: in either order, since the
+    question can close after the copies are found (a fork moved to a new id before its
+    first turn). The copies stay out. And one settled as holding turns from off the
+    record says so with no session named: its record is read before anything else."""
+    uploader = _Carrier(True)
+    carried.settle(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, ids, _CHILD, None) is False
+    carried.note_copied(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, ids, _CHILD, None) is True
+    carried.settle(tmp_path, _GRAND, True)
+    assert carried.carry(uploader, tmp_path, ids, _GRAND, None) is True
+    assert uploader.calls == []
+
+
+@pytest.mark.parametrize("made", [False, True], ids=["on the record", "made private"])
+@pytest.mark.parametrize("whose", ["its own", "those of a session it goes on from"])
+def test_a_session_with_copies_is_asked_about_all_the_same_and_keeps_them_out(
+    tmp_path, made, whose
+):
+    """A copies record closes no question: the session a row names may be private
+    (Desktop writes a branch's row at its first prompt, after its agent was built), so
+    it is asked about. Whatever the answer, the copies are turns from off the record
+    as far as anyone can tell, in the session and in one that goes on from it."""
+    carried.note_copied(tmp_path, _CHILD if whose == "its own" else _GRAND)
+    uploader = _Carrier(made)
+    assert carried.carry(uploader, tmp_path, [_PARENT, _GRAND], _CHILD, 5) is True
+    assert uploader.calls == [([_PARENT, _GRAND], _CHILD, 5)]
+    assert not carried.settled(tmp_path, _CHILD)
+    uploader.settled(made)
+    assert carried.held(tmp_path, _CHILD)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +394,7 @@ def test_a_branch_of_a_private_session_is_private_from_its_first_turn(plugin, se
     # before its first turn is then not undone by a row written later.
     assert server.puts() == [f"/private-sessions/{_CHILD}"] and server.asked() == []
     assert carried.settled(home, _CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     provider.on_session_end(_conversation(4))
     assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
 
@@ -253,17 +408,17 @@ def test_a_branch_put_back_on_the_record_does_not_send_the_turns_it_started_with
     _child(home)
     _marker(tmp_path, _PARENT)
     provider = _open(plugin, home, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
 
     (tmp_path / "private" / _CHILD).unlink()
     server.private_rows.discard(_CHILD)
     # The turn that ends next is the branch's own, spoken on the record: it goes up when
     # it ends, alone, also when the session ends with it.
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     provider.on_session_end(_conversation(4))
     assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    _say(provider, _conversation(5), _CHILD)
     assert _users(server.posts()[-1]["records"]) == ["question 4", "question 5"]
     assert len(server.posts()) == 2 and len(server.puts()) == 1  # and no row again
 
@@ -279,17 +434,17 @@ def test_a_branch_of_a_session_the_server_holds_private_is_private(
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home, resumed=resumed)
     assert not (tmp_path / "private" / _CHILD).exists() and server.asked() == []
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     assert server.asked() == [_PARENT] and server.puts() == [f"/private-sessions/{_CHILD}"]
     assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert server.posts() == [] and server.asked() == [_PARENT]
 
     # `private off --forget` on the branch holds: the next agent does not ask again.
     (tmp_path / "private" / _CHILD).unlink()
     server.private_rows.discard(_CHILD)
     again = _open(plugin, home, resumed=True)
-    again.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    _say(again, _conversation(5), _CHILD)
     assert server.asked() == [_PARENT] and len(server.puts()) == 1
     assert {body["session_id"] for body in server.posts()} == {_CHILD}
 
@@ -301,7 +456,7 @@ def test_a_branch_of_a_branch_is_private_with_the_session_at_the_top(plugin, ser
     _three(home)
     server.private_rows.add(_GRAND)
     provider = _open(plugin, home, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     assert server.asked() == [_PARENT, _GRAND]
     assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
 
@@ -314,7 +469,7 @@ def test_a_settled_session_answers_for_the_ones_above_it(plugin, server, tmp_pat
     carried.settle(home, _PARENT)
     server.private_rows.add(_GRAND)
     provider = _open(plugin, home)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     assert server.asked() == [_PARENT] and server.puts() == []
     assert {body["session_id"] for body in server.posts()} == {_CHILD}
 
@@ -323,7 +478,7 @@ def test_a_branch_made_before_its_parent_went_private_stays_on_the_record(plugin
     home = tmp_path / "hermes-a"
     _child(home)
     provider = _open(plugin, home)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     (first,) = server.posts()
     assert first["session_id"] == _CHILD and server.asked() == [_PARENT]
     assert _users(first["records"]) == ["question 1", "question 2"]
@@ -333,7 +488,7 @@ def test_a_branch_made_before_its_parent_went_private_stays_on_the_record(plugin
     server.private_rows.add(_PARENT)
     later = _open(plugin, home, resumed=True)
     assert not (tmp_path / "private" / _CHILD).exists()
-    later.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(later, _conversation(3), _CHILD)
     assert len(server.posts()) == 2 and server.asked() == [_PARENT] and server.puts() == []
 
 
@@ -349,7 +504,7 @@ def test_another_conversation_is_not_private_because_the_one_before_was(
     _marker(tmp_path, _PARENT)
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(1))
+    _say(provider, _conversation(1), _CHILD)
     (body,) = server.posts()
     assert body["session_id"] == _CHILD and server.asked() == [] and server.puts() == []
     assert not (tmp_path / "private" / _CHILD).exists()
@@ -365,7 +520,7 @@ def test_a_compressed_continuation_is_private_with_the_session_it_goes_on_from(
     _child(home, model_config)
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(provider, _conversation(2), _CHILD)
     assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
 
 
@@ -377,7 +532,7 @@ def test_while_the_server_does_not_answer_nothing_leaves_and_the_next_agent_asks
     server.private_rows.add(_PARENT)
     server.private_status = 503
     provider = _open(plugin, home, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(1))
+    _say(provider, _conversation(1), _CHILD)
     provider.on_session_end(_conversation(1))
     assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
     assert not carried.settled(home, _CHILD) and len(server.asked()) >= 2
@@ -385,7 +540,7 @@ def test_while_the_server_does_not_answer_nothing_leaves_and_the_next_agent_asks
     server.private_status = 200
     asked = len(server.asked())
     again = _open(plugin, home, resumed=True)
-    again.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    _say(again, _conversation(2), _CHILD)
     assert len(server.asked()) == asked + 1 and server.posts() == []
     assert (tmp_path / "private" / _CHILD).is_file() and carried.settled(home, _CHILD)
 
@@ -398,10 +553,10 @@ def test_turns_finished_while_the_server_did_not_answer_go_up_when_it_does(
     server.private_status = 503
     provider = _open(plugin, home, resumed=True)
     for count in (12, 13, 14):
-        provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(count))
+        _say(provider, _conversation(count), _CHILD)
     assert server.posts() == []
     server.private_status = 200
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(15))
+    _say(provider, _conversation(15), _CHILD)
     sent = {user for body in server.posts() for user in _users(body["records"])}
     # Ten back from the first turn held (12), and every turn since; 2 is 3's context.
     assert sent == {f"question {n}" for n in range(2, 16)}
@@ -414,7 +569,7 @@ def test_a_gateway_branch_of_a_private_session_is_private(plugin, server, tmp_pa
     _marker(tmp_path, gs._LOCAL)
     provider = gs._start_gateway(_new(plugin), home, pa._BRANCH, resumed=True)
     assert (tmp_path / "private" / pa._BRANCH).is_file()
-    provider.sync_turn("q", "a", session_id=pa._BRANCH, messages=_conversation(2))
+    _say(provider, _conversation(2), pa._BRANCH)
     assert server.posts() == [] and server.puts() == [f"/private-sessions/{pa._BRANCH}"]
 
 
@@ -434,12 +589,12 @@ def test_a_flush_after_forget_sends_no_turn_from_before(plugin, server, tmp_path
     _child(home)
     _marker(tmp_path, _PARENT)
     provider = _open(plugin, home, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     (tmp_path / "private" / _CHILD).unlink()
     server.private_rows.discard(_CHILD)
     getattr(provider, flush)(_conversation(3))
     assert server.posts() == []
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
 
 
@@ -455,7 +610,7 @@ def test_a_branch_put_back_on_the_record_before_its_first_turn_stays_there(
     provider = _open(plugin, home, resumed=True)
     (tmp_path / "private" / _CHILD).unlink()
     server.private_rows.discard(_CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert server.puts() == [f"/private-sessions/{_CHILD}"] and server.private_rows == set()
     assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
 
@@ -472,12 +627,12 @@ def test_a_server_that_cannot_be_told_as_a_branch_is_bound_is_a_warning(
     with caplog.at_level(logging.WARNING):
         provider = _open(plugin, home, resumed=True)
         assert (tmp_path / "private" / _CHILD).is_file() and not carried.settled(home, _CHILD)
-        provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+        _say(provider, _conversation(4), _CHILD)
     untold = [r.getMessage() for r in caplog.records if "could not be told" in r.getMessage()]
     assert len(untold) == 2 and all(_CHILD in line for line in untold)
     assert all(r.levelno == logging.WARNING for r in caplog.records if r.getMessage() in untold)
     server.private_status = 200
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    _say(provider, _conversation(5), _CHILD)
     assert server.posts() == [] and _CHILD in server.private_rows
     assert carried.settled(home, _CHILD)
 
@@ -513,7 +668,7 @@ def test_a_session_resumed_in_place_answers_for_the_session_it_continues(
     provider = _open(plugin, home, _OTHER)
     provider.on_session_switch(_CHILD, parent_session_id=_OTHER, reason="resume")
     assert server.asked() == [] and server.puts() == []
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     provider.on_session_end(_conversation(4))
     assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
     assert server.asked() == asked and server.puts() == [f"/private-sessions/{_CHILD}"]
@@ -531,13 +686,13 @@ def test_an_upload_for_an_id_the_agent_was_not_moved_to_goes_by_its_row(
     _child(home, None)  # a rotation child: the link alone
     asked = _private_parent(server, tmp_path, known)
     provider = _open(plugin, home, _PARENT, resumed=True)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
     assert server.asked() == asked and server.puts() == [f"/private-sessions/{_CHILD}"]
     # Read once: the session is not carried again at each turn.
     (tmp_path / "private" / _CHILD).unlink()
     server.private_rows.discard(_CHILD)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    _say(provider, _conversation(5), _CHILD)
     assert [_users(body["records"]) for body in server.posts()] == [["question 5"]]
     assert server.asked() == asked and len(server.puts()) == 1
 
@@ -551,11 +706,30 @@ def test_a_row_written_after_the_agent_was_built_is_read_at_the_first_upload(
     home = tmp_path / "hermes-a"
     _store(home, _PARENT, source="tui", receipt=False, chat_id="")
     server.private_rows.add(_PARENT)
-    provider = _open(plugin, home)
+    provider = _open(plugin, home, message_count=0)
     assert server.asked() == [] and not carried.settled(home, _CHILD)
     _store(home, _CHILD, source="tui", receipt=False, chat_id="")
     _link(home, _CHILD, _PARENT, _BRANCHED)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
+    assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
+    assert server.asked() == [_PARENT] and server.puts() == [f"/private-sessions/{_CHILD}"]
+
+
+def test_a_row_that_names_no_session_is_read_again_before_the_next_upload(plugin, server, tmp_path):
+    """A row that names no session settles nothing: it is read before every upload
+    until it names one. No order of Hermes's calls is known that puts an upload before
+    the write above, and none is counted on: a flush that found no row leaves the
+    session to be read again, and it is off the record from the upload after its row
+    names a private one."""
+    home = tmp_path / "hermes-a"
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    server.private_rows.add(_PARENT)
+    provider = _open(plugin, home, message_count=0)
+    provider.on_pre_compress(_conversation(3))
+    assert server.asked() == [] and server.posts() == []
+    _store(home, _CHILD, source="tui", receipt=False, chat_id="")
+    _link(home, _CHILD, _PARENT, _BRANCHED)
+    _say(provider, _conversation(4), _CHILD)
     assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
     assert server.asked() == [_PARENT] and server.puts() == [f"/private-sessions/{_CHILD}"]
 
@@ -570,9 +744,9 @@ def test_an_id_is_read_once_also_when_its_answer_could_not_be_recorded(
     _child(home, None)
     provider = _open(plugin, home, _PARENT, resumed=True)
     module = sys.modules[type(provider).__module__]  # the provider's own copy of the core
-    monkeypatch.setattr(module.carried, "settle", lambda home, session_id: None)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    monkeypatch.setattr(module.carried, "settle", lambda home, session_id, made=False: None)
+    _say(provider, _conversation(2), _CHILD)
+    _say(provider, _conversation(3), _CHILD)
     assert server.asked() == [_PARENT] and len(server.posts()) == 2
     assert not carried.settled(home, _CHILD)
 
@@ -596,7 +770,7 @@ def test_a_switch_whose_carry_raises_turns_the_provider_off(plugin, server, tmp_
     with monkeypatch.context() as patch:
         _carry_raises(patch, provider)
         provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    _say(provider, _conversation(3), _CHILD)
     provider.on_session_end(_conversation(3))
     assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
     assert provider._mode == "inert"
@@ -611,9 +785,9 @@ def test_an_upload_whose_carry_raises_sends_nothing_and_reads_the_row_again(
     provider = _open(plugin, home, _PARENT, resumed=True)
     with monkeypatch.context() as patch:
         _carry_raises(patch, provider)
-        provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+        _say(provider, _conversation(3), _CHILD)
     assert server.posts() == [] and server.asked() == []
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    _say(provider, _conversation(4), _CHILD)
     assert server.posts() == [] and server.asked() == [_PARENT]
     assert (tmp_path / "private" / _CHILD).is_file()
 
@@ -629,14 +803,14 @@ def test_turns_compressed_away_while_the_server_does_not_answer_go_up_when_it_do
     server.private_status = 503
     provider = _open(plugin, home, resumed=True)
     whole = _conversation(8)
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=whole)
+    _say(provider, whole, _CHILD)
     provider.on_pre_compress(whole)
     provider.on_session_end(whole)
     assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
     provider.on_session_switch(_CHILD, parent_session_id=_CHILD, reason="compression")
     nine = [whole[0], *whole[-4:], *_conversation(9)[-2:]]  # turns 7 and 8, then 9
     server.private_status = 200
-    provider.sync_turn("q", "a", session_id=_CHILD, messages=nine)
+    _say(provider, nine, _CHILD)
     sent = [text for body in server.posts() for text in _users(body["records"])]
     assert sent == [f"question {n}" for n in range(1, 10)]  # each once, oldest first
     assert carried.settled(home, _CHILD)

@@ -13,37 +13,27 @@ they allow, Hermes's own record of who created it (sessions.py has the rule and 
 Hermes lines it rests on):
 
 - ACTIVE: a primary session on a local surface ("cli", "tui", "desktop", "acp") of the
-  machine's owner. ``hermes chat`` and the TUI run their turns in the gateway daemon,
-  which passes a chat identity even for them: such a session is ACTIVE only with the
-  shape of a local session (``local-<hex>`` chat, its ``agent:<profile>:local:dm:``
-  route, ``user_id`` ``uid:<this OS user>``) and a creation receipt in
-  ``<hermes_home>/state.db`` that names the owner as its creator, an owner's chat as its
-  source (not ``--source tool``), no Bot Chat and no chat that follows its profile. A
-  session with no chat identity runs in the process that built it (the stdio TUI and
-  Desktop backend, ACP, the classic CLI) and is ACTIVE as before, unless that process
-  is the gateway daemon or was started with a ``--source`` that is not the owner's own.
-  The board, the nudge, uploads and the tools all work.
+  machine's owner: one that runs in the process that built it, or one the gateway
+  daemon runs with the shape of a local session and a creation receipt in
+  ``<hermes_home>/state.db`` that names the owner. The board, the nudge, uploads and
+  the tools all work.
 - INERT, everything else: every messaging platform, the API server, hosted rooms and
-  peer agents, the Bot Chat (by title, by its receipt, or by any row of its chat), a
-  Group Chat member, a cron job, a subagent, a memory flush or other fork, a side agent
-  the daemon builds (``/background``, ``/btw``), a session created by someone else or
-  by a third-party integration, one the store does not know, and any shape not listed
-  above. Nothing is injected or uploaded and a tool call returns a JSON error: someone
-  else must not read the owner's memory through the agent, nor have their messages
-  stored as the owner's. The reason is logged once per session.
+  peer agents, the Bot Chat, a Group Chat member, a cron job, a subagent or other fork,
+  a side agent the daemon builds, a session created by someone else, one the store does
+  not know, and any shape not listed. Nothing is injected or uploaded and a tool call
+  returns a JSON error: someone else must not read the owner's memory through the
+  agent, nor have their messages stored as the owner's. The reason is logged once.
 
-The session's rows in the store (title, source, chat, and every row of that chat) are
-read again before the system prompt block, each nudge, upload and tool call: a session
-renamed "Bot Chat" receives other agents' messages, and ``/resume`` or compression
-switches the agent to another session, without a new instance. A turn another agent or
-person wrote is never uploaded either: Hermes names a turn's author on ``on_turn_start``
-and in ``sync_turn``'s ``turn_author``. The gateway names one on every turn, the owner's
-own as the session's ``user_id`` and not a bot; in-process, a human turn has none. An
-author that is a bot, or not the session's user, means someone else wrote it. One that
-no longer passes turns the instance INERT for good.
-What is already in the system prompt (the board) cannot be taken back: Hermes stores
-the prompt and restores it verbatim for a continuing session, a renamed, branched or
-handed-off one included.
+The session's rows in the store are read again before the system prompt block, each
+nudge, upload and tool call: a session renamed "Bot Chat" receives other agents'
+messages, and ``/resume`` or compression switches the agent to another session, without
+a new instance. A turn another agent or person wrote is never uploaded either: Hermes
+names a turn's author on ``on_turn_start`` and in ``sync_turn``'s ``turn_author`` (the
+gateway on every turn, the owner's own as the session's ``user_id``; in-process, a human
+turn has none), and an author that is a bot, or not the session's user, turns the
+instance INERT for good, as does a session that no longer passes. What is already in
+the system prompt (the board) cannot be taken back: Hermes stores the prompt and
+restores it verbatim for a continuing session, a renamed or branched one included.
 
 The settings (URL, token) are read at each ``initialize``, so a later ``synapse login``
 reaches the next session. Environment variables are the process's own: in the gateway
@@ -51,53 +41,53 @@ daemon, those it was started with.
 
 Uploads
 -------
-Hermes calls ``sync_turn`` on its background worker after each turn with the whole
-conversation. messages.py turns it into records and the core uploads them
-(turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
-before it as context; a resumed session, and one first met at an upload, looks back at
-most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name no
-session: they upload under the last id Hermes named (live.py). Each
-batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before its request
-and removed once delivered, so a batch in flight when the process exits waits there;
-one that fails stays and counts as handled. The next successful upload drains the
-outbox, which every session of the home shares; no drain takes a batch in flight until
-its request has had three times its timeout. Turns are remembered in memory only: the
-server dedups on span id, so a restart that re-sends a turn costs a request, not a
-duplicate. A private session sends nothing and remembers nothing, as the Claude Code
-hook does: the core's uploader checks, here and again when the outbox drains.
+Hermes calls ``sync_turn`` on its background worker after each turn that ended with a
+reply, with the whole conversation. messages.py turns it into records and the core
+uploads them (turn_upload.TurnUploader): every complete turn not sent yet goes up, with
+the turn before it as context; a resumed session, and one first met at an upload, looks
+back at most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name
+no session: they upload under the id Hermes named last (live.py) when that is the bound
+one or goes on from it, and nothing otherwise, since nothing says then whose turns they
+hold. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
+its request and removed once delivered; one that fails stays and counts as handled. The
+next successful upload drains the outbox, which every session of the home shares; no
+drain takes a batch in flight until its request has had three times its timeout. Turns
+are remembered in memory only: the server dedups on span id, so a restart that re-sends
+a turn costs a request, not a duplicate. A private session sends nothing: the core's
+uploader checks, here and again when the outbox drains.
 
 Private mode is kept per session id, and a conversation gets a new one when it is
 branched, or compressed with rotation on. The new session holds turns of the one it came
 from, so it is off the record when that one is (upload.Uploader.carry_private): by that
 one's marker, or, with no marker, by what the server answers when asked at the session's
-first upload, until when nothing is uploaded for it. That is settled where the agent
-moves to the new id (``on_session_switch``, from the ids Hermes names), where Hermes
-builds a new agent for it (``initialize``, from the session store: the TUI and Desktop
-build one for every branch) and before the first upload under any other id (``_follow``,
-from the store too), once per session (carried.py). ``/new`` and ``/resume`` open another
-conversation: nothing is carried to it from the one left. A conversation that was off
-the record under this agent is never looked back at, under any id it goes on with.
+first upload, until when nothing is uploaded for it. That is settled once per session
+(carried.py): where the agent moves to the new id (``on_session_switch``), where Hermes
+builds a new agent for it (``initialize``, from the session store) and before the first
+upload under any other id (``_follow``, from the store too). ``/new`` and ``/resume``
+open another conversation: nothing is carried to it. Put back on the record (``synapse
+private off --forget``), such a session keeps the turns from before out, under any id it
+goes on with and in agents built for it later (carried.py's record), and uploads those
+an agent sees begin there (``on_turn_start``); so does one Hermes said was new, once its
+first turn start or upload shows it holds copies (an ACP fork: carried.noter records it).
 
 Compression
 -----------
 Recall leaves out the session's own turns, which the model still holds. When Hermes
 compresses a session in place it keeps the id and replaces the turns before that point
 with a summary, so from then on they are memory like any other: at the commit
-(``on_session_switch`` with ``reason="compression"`` and the same id) the provider takes
-the time, and sends it as ``self_since`` on recall and recall_full_turns, so only the turns
-since are left out. The time is the client's wall clock, the one Hermes stamps each
-message's ``timestamp`` with and so the time the server stores the turn under. A
-compression that moves to a new id needs no cut (the new id holds only what follows); a
-new id, a reset or a restart forgets the cut, and the session is left out whole again.
-Hermes signals an in-place compression even when its commit failed; that costs only
-some recall of turns still in the context.
+(``on_session_switch`` with ``reason="compression"`` and an id the agent is in) the
+provider takes the time and sends it as ``self_since`` on recall and recall_full_turns,
+so only the turns since are left out. The time is the client's wall clock, which Hermes
+stamps each message with and the server stores the turn under. A new id, a reset or a
+restart forgets the cut. Hermes signals an in-place compression even when its commit
+failed; that costs only some recall of turns still in the context.
 
-Every hook catches what it raises and logs it; nothing here raises into Hermes. Hermes
-builds one instance per agent (plugins/memory ``register`` runs per load), so each
-session of the gateway daemon has its own: an instance holds its own settings, client,
-outbox and sent turns, its own state is guarded by one lock, and every thread it starts
-goes through Hermes's ``spawn_context_thread``. Sessions share only the outbox folder,
-which is safe across threads and processes.
+A hook that reads the store or sends catches what it raises and logs it, and Hermes's
+manager catches what any hook raises. Hermes builds one instance per agent, so each
+session of the gateway daemon has its own settings, client, outbox and sent turns; its
+state is guarded by one lock, and every thread it starts goes through Hermes's
+``spawn_context_thread``. Sessions share only the outbox folder, which is safe across
+threads and processes.
 """
 
 from __future__ import annotations
@@ -250,18 +240,24 @@ class SynapseMemoryProvider(MemoryProvider):
         earlier = carried.to_ask(home, verdict.continues)
         private_too = mode == ACTIVE and carried.carry(uploader, home, earlier, session_id, None)
         # A session first met at an upload is looked back at as a resumed one is.
-        turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=LOOKBACK)
+        turns = TurnUploader(
+            uploader,
+            client="hermes",
+            source="hermes-sync",
+            lookback=LOOKBACK,
+            begins=True,
+            copied=carried.noter(home, kwargs.get("message_count")),
+        )
         # Turns spoken off the record are not looked back at.
         lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
-        turns.start(str(session_id or ""), lookback)
+        turns.start(str(session_id or ""), lookback, continues=verdict.continues)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
-        user_id, chat_id, route = (
+        self._owner_id, self._chat_id, self._route = (
             kwargs.get(key) if self._gateway and isinstance(kwargs.get(key), str) else None
             for key in ("user_id", "chat_id", "gateway_session_key")
         )
-        self._owner_id, self._chat_id, self._route = user_id, chat_id, route
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
@@ -307,14 +303,8 @@ class SynapseMemoryProvider(MemoryProvider):
         thread.join(START_BUDGET)
         board, prefs = got[0] if got else ("", "")
         warning = failure_warning(outbox) if outbox is not None else None
-        return context.assemble(
-            (
-                context.notice_part(settings, env_location=_ENV_LOCATION),
-                warning,
-                board,
-                prefs,
-            )
-        )
+        notice = context.notice_part(settings, env_location=_ENV_LOCATION)
+        return context.assemble((notice, warning, board, prefs))
 
     def system_prompt_block(self) -> str:
         """The session-start block, for a session still the owner's (``_still_owner``).
@@ -326,7 +316,7 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """The per-turn nudge (a timestamp and the recall/remember directive). No request."""
-        self._live.moved(str(session_id or ""))  # Hermes calls this as the turn starts
+        self._live.moved(str(session_id or ""))
         if self._mode != ACTIVE or self._settings is None:
             return ""
         if not self._still_owner():
@@ -376,15 +366,28 @@ class SynapseMemoryProvider(MemoryProvider):
         return None
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
-        """Note the turn's model. A turn someone else wrote (``_foreign``, from the
+        """Note the turn's model, and that a turn starts in the session Hermes named
+        last (``_begin``). A turn someone else wrote (sessions.foreign, from the
         ``author_*`` keywords agent/turn_context.py passes) turns the instance INERT
         before its nudge and tools, as ``sync_turn`` does with ``turn_author``."""
         model = kwargs.get("model")
         if isinstance(model, str):
             self._model = model
         author = kwargs.get("author_id"), kwargs.get("author_name"), kwargs.get("author_is_bot")
-        if self._foreign(*author):
+        if hs.foreign(self._owner_id, *author):
             self._authored()
+        self._begin(self._live.id, bool(kwargs.get("previous_message")))
+
+    def _begin(self, session_id: str, earlier: bool) -> None:
+        """A turn starts in ``session_id`` (TurnUploader.begin): what the uploader goes
+        by to tell a new turn from one spoken off the record. ``earlier``: Hermes says
+        the conversation held a user message before this one. Never raises."""
+        turns = self._turns
+        try:
+            if turns is not None and self._mode == ACTIVE:
+                turns.begin(session_id, earlier=earlier)
+        except Exception:
+            _log().warning("synapse: a turn start could not be noted", exc_info=True)
 
     def on_session_switch(
         self,
@@ -404,7 +407,10 @@ class SynapseMemoryProvider(MemoryProvider):
             new = str(new_session_id or "")
             with self._lock:
                 old = self._session_id
-            goes_on = bool(new) and new != old and not reset
+            here = self._live.id
+            # An id the agent is in already (Hermes moved it there without a call) is
+            # not gone on to: a compression of it is one in place.
+            goes_on = bool(new) and new not in (old, here) and not reset
             # The same conversation under a new id (a compression, a /branch) stays off
             # the record when the id it leaves is. /resume opens another conversation,
             # which answers for its own row at its first upload (_follow).
@@ -414,7 +420,7 @@ class SynapseMemoryProvider(MemoryProvider):
             try:
                 # The id left is the bound one and, after a move Hermes did not announce,
                 # the one its hooks named since.
-                earlier = [old, self._live.id, parent_session_id] if carries else []
+                earlier = [old, here, parent_session_id] if carries else []
                 private_too = carries and carried.carry(uploader, self._home, earlier, new, 5)
             except Exception:
                 self._mode = INERT  # undecided is not on the record
@@ -430,7 +436,8 @@ class SynapseMemoryProvider(MemoryProvider):
                     self._cut = _clock()
                 if new:
                     self._session_id = new
-            self._live.moved(new)
+            # The parent named is left too: no hook need have named it (live.py).
+            self._live.moved(new, (str(parent_session_id or ""),))
         except Exception:
             _log().warning("synapse: on_session_switch failed", exc_info=True)
 
@@ -446,12 +453,13 @@ class SynapseMemoryProvider(MemoryProvider):
         turn_author: dict[str, Any] | None = None,
     ) -> None:
         """Upload every complete turn not sent yet. Without ``messages``, the two strings
-        are the turn. A ``turn_author`` naming someone other than the owner (``_foreign``;
-        a bot or peer delivery names its sender, tools/bot_relay.py) means nothing is
-        uploaded and the instance turns INERT for good. Never raises."""
+        are the turn. A ``turn_author`` naming someone other than the owner
+        (sessions.foreign; a bot or peer delivery names its sender, tools/bot_relay.py)
+        means nothing is uploaded and the instance turns INERT for good. Never raises."""
         try:
             author = turn_author if isinstance(turn_author, Mapping) else {"id": turn_author}
-            if self._foreign(author.get("id"), author.get("name"), author.get("is_bot")):
+            who = author.get("id"), author.get("name"), author.get("is_bot")
+            if hs.foreign(self._owner_id, *who):
                 self._authored()
                 return
             if messages is None:
@@ -463,18 +471,6 @@ class SynapseMemoryProvider(MemoryProvider):
                 self._drain(SYNC_TIMEOUT)
         except Exception:
             _log().warning("synapse: sync_turn failed", exc_info=True)
-
-    def _foreign(self, author_id: Any, author_name: Any, is_bot: Any) -> bool:
-        """Whether a turn's author is someone other than the owner. No author: the owner
-        at the keyboard (in-process). The gateway names one on every turn, the owner's own
-        as ``{"id": <the session's user_id>, "is_bot": False}``
-        (gateway/run_turn_runner.py, ``ctx.source``, the source of ``user_id`` too); a bot,
-        another id, or any author where no user was bound is someone else."""
-        if is_bot:
-            return True
-        if author_id is None and author_name is None:
-            return False
-        return self._owner_id is None or author_id != self._owner_id
 
     def _authored(self) -> None:
         """A turn someone else wrote reached this agent: off for good, said once, and the
@@ -506,12 +502,19 @@ class SynapseMemoryProvider(MemoryProvider):
         """Send the complete turns of ``messages`` not sent yet (turn_upload.TurnUploader).
         True when at least one batch reached the server. ``finished``: a turn has just
         ended. The id is the one Hermes names, which need not be one this instance was
-        moved to, so what its row says it continues is read first (``_follow``); with
-        none named (a flush), the last one it named (live.py)."""
+        moved to, so what its row says it continues is read first (``_follow``). With
+        none named (a flush) it is the last one Hermes named (live.py), when that is
+        the bound id or its row says it goes on from it. Otherwise nothing says whose
+        turns the flush holds (after ``/new`` Hermes flushes the session left once the
+        next turn has named the new one), and nothing is sent."""
         turns = self._turns
         sid = self._live.named(str(session_id or ""))
         verdict = self._verdict(sid) if turns is not None else None
         if turns is None or verdict is None:
+            return False
+        with self._lock:
+            bound = self._session_id
+        if not session_id and sid != bound and bound not in verdict.continues:
             return False
         self._follow(sid, verdict.continues)
         return turns.upload(
@@ -529,12 +532,16 @@ class SynapseMemoryProvider(MemoryProvider):
         its row says it holds turns of (``continues``) is, once per id and instance.
         ``initialize`` does this for the id it is given. This is for the others: a
         session resumed in place, one Hermes moved the agent to without a call, and a
-        row written after ``initialize``. Noted only once done: a carry that raises
-        leaves the id to be read again, and no upload goes past it."""
+        row written after ``initialize``. Noted only once done: a carry that raises, and
+        a row that names no session yet, leave the id to be read at the next upload."""
         uploader, turns = self._uploader, self._turns
         with self._lock:
             known = session_id in self._followed
-        if known or not continues or uploader is None or turns is None:
+        if known or uploader is None or turns is None:
+            return
+        if not continues:
+            if carried.carry(uploader, self._home, (), session_id, None):
+                turns.keep_out(session_id)  # recorded as holding copies: no look-back
             return
         earlier = carried.to_ask(self._home, continues)
         private_too = carried.carry(uploader, self._home, earlier, session_id, None)
