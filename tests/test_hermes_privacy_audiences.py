@@ -718,6 +718,25 @@ def test_marking_never_raises_and_says_when_it_could_not(tmp_path, caplog):
         hs.marked(tmp_path, [_LOCAL])
 
 
+def test_a_marks_folder_made_between_two_looks_is_not_a_broken_link(tmp_path, monkeypatch):
+    """Another session of the home makes ``synapse/`` (its first upload, its first mark)
+    after this one found nothing there and before it asks whether a link stands there.
+    That is a folder, and no reason to skip the call."""
+    folder = tmp_path / "synapse"
+    real, raced = os.stat, []
+
+    def stat(path, *args, **kwargs):
+        if not raced and Path(path) == folder:
+            raced.append(path)
+            folder.mkdir()  # made by the other session, just after this look
+            raise FileNotFoundError(str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat)
+    assert not hs.marked(tmp_path, [_LOCAL])
+    assert raced and hs.recheck(tmp_path, _RESET_CHILD).mode == hs.ACTIVE
+
+
 def _broken_marks(home: Path, target: str = "inert") -> None:
     """A marks folder no lookup gets through: a link to itself, or (``target`` "gone")
     to a folder that is not there, as when the volume it lives on is not mounted."""

@@ -64,6 +64,23 @@ def mark(home: Any, keys: Iterable[Any], reason: str) -> None:
         )
 
 
+def _mode(folder: Path) -> int | None:
+    """What stands at ``folder`` (its ``st_mode``, links followed), or None for nothing.
+    RAISES OSError for a link whose target is gone, and for what cannot be looked at."""
+    try:
+        return os.stat(folder).st_mode
+    except FileNotFoundError:
+        try:
+            link = stat.S_ISLNK(os.lstat(folder).st_mode)
+        except FileNotFoundError:
+            return None  # nothing there: no mark was ever kept
+        if link:
+            raise  # a link whose target is gone
+    # Not a link, so it was made between the two looks: another session of this home
+    # writing its first mark or its first upload. Look once more.
+    return os.stat(folder).st_mode
+
+
 def _folder(home: Any) -> Path | None:
     """The marks folder, or None when there is none yet. RAISES OSError when something
     stands where it or its parent goes that is not a folder to look in: a file, a link
@@ -71,14 +88,9 @@ def _folder(home: Any) -> Path | None:
     folder = Path(str(home))
     for part in _MARK_DIR:
         folder = folder / part
-        try:
-            mode = os.stat(folder).st_mode
-        except FileNotFoundError:
-            try:
-                os.lstat(folder)
-            except FileNotFoundError:
-                return None  # nothing there: no mark was ever kept
-            raise  # a link whose target is gone
+        mode = _mode(folder)
+        if mode is None:
+            return None
         if not stat.S_ISDIR(mode):
             raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(folder))
     return folder

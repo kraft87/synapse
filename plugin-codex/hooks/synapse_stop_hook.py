@@ -276,6 +276,9 @@ def _post(
         # Resolved the way every client labels a project (synapse_project). Without it
         # the server labels the turns from the rollout's cwd: just the folder's name.
         body["project"] = project
+    # The private rule sits where a body leaves, so no caller can leave it out: this
+    # RAISES private.PrivateSession, before any request, for a session in private mode.
+    private.check_payload(SETTINGS, body, (), _log)
     # Through the core's Transport: the bearer goes to INGEST_URL's origin and does not
     # follow a redirect to another.
     transport = Transport("", TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
@@ -337,6 +340,11 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     project = synapse_project.project_label(cwd) if cwd else None
     try:
         resp = _post(records, session_id, project)
+    except private.PrivateSession:
+        # Taken off the record since the check above. Not a failed upload: the cursor
+        # stays where it is and nothing is marked pending.
+        _log(f"skip: private session {session_id} (at the request)")
+        return (0, 0)
     except Exception as e:
         _log(f"POST failed for {session_id} ({len(records)} records): {e}")
         try:

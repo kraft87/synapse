@@ -279,7 +279,7 @@ def _drain_in_another_process(home: Path, url: str) -> str:
 
 
 def _hold(provider: Any, *, fail: bool = False) -> tuple[_Held, threading.Thread]:
-    held = provider._client = _Held(provider._client, fail=fail)
+    held = provider._client = provider._uploader.client = _Held(provider._client, fail=fail)
     worker = threading.Thread(
         target=provider.sync_turn, args=("q", "a"), kwargs={"messages": base._conversation(1)}
     )

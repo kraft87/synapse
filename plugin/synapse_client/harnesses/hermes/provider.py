@@ -52,16 +52,17 @@ daemon, those it was started with.
 Uploads
 -------
 Hermes calls ``sync_turn`` on its background worker after each turn with the whole
-conversation. Every complete turn not sent yet goes up (messages.pending), with the
-turn before it as context; a resumed session looks back at most ten turns the first
-time. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
-its request and removed once delivered, so a batch in flight when the process exits
-waits there; one that fails stays and counts as handled. The next successful upload
-drains the outbox, which every session of the home shares; no drain takes a batch in
-flight until its request has had three times its timeout. Turns are remembered by
-``messages.turn_key`` in memory only: the server dedups on span id, so a restart that
-re-sends a turn costs a request, not a duplicate. A private session (private.is_private)
-sends nothing and remembers nothing, as the Claude Code hook does.
+conversation. messages.py turns it into records and the core uploads them
+(upload.TurnUploader): every complete turn not sent yet goes up, with the turn before
+it as context; a resumed session looks back at most ten turns the first time. Each
+batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before its request
+and removed once delivered, so a batch in flight when the process exits waits there;
+one that fails stays and counts as handled. The next successful upload drains the
+outbox, which every session of the home shares; no drain takes a batch in flight until
+its request has had three times its timeout. Turns are remembered in memory only: the
+server dedups on span id, so a restart that re-sends a turn costs a request, not a
+duplicate. A private session sends nothing and remembers nothing, as the Claude Code
+hook does: the core's uploader checks, here and again when the outbox drains.
 
 Compression
 -----------
@@ -98,10 +99,11 @@ from typing import Any
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 
-from ... import __version__, context, private, project, tools
+from ... import __version__, context, project, tools
 from ...api import Client
-from ...outbox import Outbox, failure_warning, short_reason
+from ...outbox import Outbox, failure_warning
 from ...settings import Settings
+from ...upload import TurnUploader, Uploader
 from . import messages as hm
 from . import sessions as hs
 
@@ -131,6 +133,10 @@ def _log() -> logging.Logger:
 
 def _say(line: str) -> None:
     _log().info("%s", line)
+
+
+def _warn(line: str) -> None:
+    _log().warning("%s", line)
 
 
 def _clock() -> str:
@@ -187,8 +193,8 @@ class SynapseMemoryProvider(MemoryProvider):
         self._cwd: str | None = None
         self._model = ""
         self._block = ""
-        self._sent: set[str] = set()
-        self._lookback: int | None = None
+        self._uploader: Uploader | None = None
+        self._turns: TurnUploader | None = None
         self._home: str | None = None
         self._said: set[str] = set()
         self._cut: str | None = None  # the last in-place compression, for self_since
@@ -238,6 +244,9 @@ class SynapseMemoryProvider(MemoryProvider):
         settings = Settings.load()
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
+        uploader = Uploader(client, outbox, log=_say, warn=_warn)
+        lookback = LOOKBACK if kwargs.get("resumed") else None
+        turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=lookback)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
@@ -249,11 +258,10 @@ class SynapseMemoryProvider(MemoryProvider):
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
+            self._uploader, self._turns = uploader, turns
             self._session_id = str(session_id or "")
             self._cwd = cwd
             self._project = project.project_label(cwd) if cwd else None
-            self._lookback = LOOKBACK if kwargs.get("resumed") else None
-            self._sent.clear()
             self._block = ""
             self._home = str(home) if home else None
             self._cut = None
@@ -381,8 +389,8 @@ class SynapseMemoryProvider(MemoryProvider):
             with self._lock:
                 new = str(new_session_id or "")
                 if reset or (new and new != self._session_id):
-                    self._sent.clear()
-                    self._lookback = LOOKBACK
+                    if self._turns is not None:
+                        self._turns.forget(LOOKBACK)
                     self._cut = None
                 elif kwargs.get("reason") == "compression":
                     self._cut = _clock()
@@ -458,96 +466,28 @@ class SynapseMemoryProvider(MemoryProvider):
         return ""
 
     def _upload(self, messages: Any, session_id: str, timeout: float) -> bool:
-        """Send the complete turns of ``messages`` not sent yet. True when at least one
-        batch reached the server."""
-        client, outbox, settings = self._client, self._outbox, self._settings
-        if self._mode != ACTIVE or client is None or settings is None:
+        """Send the complete turns of ``messages`` not sent yet (upload.TurnUploader).
+        True when at least one batch reached the server."""
+        turns = self._turns
+        if self._mode != ACTIVE or turns is None:
             return False
         if not self._still_owner(session_id):
             return False
-        sid = str(session_id or self._session_id)
-        if not sid or private.is_private(settings, sid, _say):
-            return False
-        all_turns = hm.turns(hm.to_records(messages))
-        with self._lock:
-            if self._lookback is not None:
-                # The turns before the window were this session's business before this
-                # process: count them as sent, now and for every later upload.
-                done = [turn for turn in all_turns if hm.complete(turn)]
-                older = done[: max(0, len(done) - self._lookback)]
-                self._sent |= {hm.turn_key(turn) for turn in older}
-                self._lookback = None
-            selected = hm.pending(all_turns, self._sent)
-            # Claimed before the request: a concurrent hook must not send them again.
-            claimed = {hm.turn_key(turn) for _, turn in selected}
-            self._sent |= claimed
-        sent_any = failed = False
-        reason = ""
-        for records, new in hm.batches(selected):
-            payload = self._payload(sid, records)
-            if not failed:
-                # Queued before the request, so a process that exits mid-request leaves
-                # it in the outbox; removed once delivered.
-                ahead = self._ahead(outbox, payload, timeout)
-                try:
-                    client.ingest(payload, timeout=timeout)
-                    sent_any = True
-                    if outbox is not None and ahead is not None:
-                        outbox.remove(ahead)
-                    continue
-                except Exception as err:
-                    failed = True
-                    reason = short_reason(err)
-                    _say(f"synapse: upload failed ({reason}); queued for retry")
-                    if outbox is not None and ahead is not None:
-                        outbox.keep(ahead, reason)
-                        continue
-            if not self._queue(outbox, payload, reason):
-                with self._lock:
-                    self._sent -= {hm.turn_key(turn) for turn in new}
-        return sent_any
-
-    def _payload(self, session_id: str, records: list[hm.Record]) -> dict[str, Any]:
-        return {
-            "format": "messages",
-            "client": "hermes",
-            "session_id": session_id,
-            "project": self._project,
-            "cwd": self._cwd,
-            "model": self._model or None,
-            "source": "hermes-sync",
-            "records": records,
-        }
-
-    @staticmethod
-    def _ahead(outbox: Outbox | None, payload: Mapping[str, Any], timeout: float) -> Path | None:
-        """``payload`` queued for this send, or None when it could not be (the batch is
-        then queued only if its send fails, as before). ``timeout`` bounds each socket
-        wait, not the request: no drain takes it for three times that."""
-        if outbox is None:
-            return None
-        try:
-            return outbox.put(payload, sending=3 * timeout)
-        except (OSError, TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _queue(outbox: Outbox | None, payload: Mapping[str, Any], reason: str) -> bool:
-        if outbox is None:
-            return False
-        try:
-            outbox.put(payload, reason=reason)
-            return True
-        except (OSError, TypeError, ValueError):
-            _log().warning("synapse: could not queue a failed upload", exc_info=True)
-            return False
+        return turns.upload(
+            hm.to_records(messages),
+            str(session_id or self._session_id),
+            timeout=timeout,
+            project=self._project,
+            cwd=self._cwd,
+            model=self._model or None,
+        )
 
     def _drain(self, timeout: float) -> None:
-        client, outbox = self._client, self._outbox
-        if client is None or outbox is None:
+        uploader = self._uploader
+        if uploader is None:
             return
         try:
-            outbox.drain(lambda payload: client.ingest(payload, timeout=timeout))
+            uploader.drain(timeout)
         except Exception:
             _log().warning("synapse: outbox drain failed", exc_info=True)
 

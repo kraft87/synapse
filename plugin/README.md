@@ -219,8 +219,9 @@ Two writes, both required, both verified — the command exits nonzero and says 
 fails, so "off the record" is never claimed on a half-write:
 
 - a marker file at `~/.synapse/private/<session-id>` — the `Stop` hook stats it before every
-  POST, so the turns never leave the machine even with the server down. It expires after 12h
-  and the `SessionEnd` hook removes it;
+  POST, so the turns never leave the machine even with the server down. The check sits in
+  the sender itself, so the catch-up sweep and `synapse-import` skip the session too. It
+  expires after 12h and the `SessionEnd` hook removes it;
 - a row in `private_sessions` on the server — the durable half. Your transcript stays on disk
   after the marker is gone, so this row is what stops a later catch-up sweep or
   `synapse-import` from ingesting the very turns the hook skipped.

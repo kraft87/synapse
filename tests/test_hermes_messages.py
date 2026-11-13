@@ -1,4 +1,5 @@
-"""The Hermes message normaliser and turn slicing (plugin/synapse_client/harnesses/hermes/messages.py).
+"""The Hermes message normaliser (plugin/synapse_client/harnesses/hermes/messages.py) and the
+core's turn slicing over its records (plugin/synapse_client/messages.py).
 
 The inputs are shaped like the live dicts Hermes hands a memory provider: OpenAI chat
 messages plus Hermes's own bookkeeping (``message_uid``, ``timestamp``, ``api_content``,
@@ -17,6 +18,7 @@ from ingestion.messages_client import MessagesParser
 from tests.helpers.client_core import use_core
 
 use_core()
+from synapse_client import messages as cm  # noqa: E402
 from synapse_client.harnesses.hermes import messages as hm  # noqa: E402
 
 SID = "20261112_101500_ab12cd"
@@ -247,15 +249,15 @@ def test_tool_arguments_are_capped_and_user_and_assistant_text_are_not():
 
 
 def test_turns_start_at_real_user_rows_and_only_finished_ones_count():
-    turns = hm.turns(hm.to_records(_conversation()))
+    turns = cm.turns(hm.to_records(_conversation()))
     assert [[r["id"] for r in t] for t in turns] == [
         ["u-1", "u-2", "u-3", "u-4"],
         ["u-5", "u-6", "u-7", "u-8", "u-9", "u-10", "u-11"],
         ["u-12", "u-13"],
     ]
-    assert [hm.complete(t) for t in turns] == [True, True, False]
+    assert [cm.complete(t) for t in turns] == [True, True, False]
     # An assistant row that calls tools is followed by their results: not finished yet.
-    assert not hm.complete(
+    assert not cm.complete(
         [
             {"role": "user", "content": "q"},
             {
@@ -265,7 +267,7 @@ def test_turns_start_at_real_user_rows_and_only_finished_ones_count():
             },
         ]
     )
-    assert not hm.complete([])
+    assert not cm.complete([])
 
 
 def test_records_before_the_first_user_row_belong_to_no_turn():
@@ -275,7 +277,7 @@ def test_records_before_the_first_user_row_belong_to_no_turn():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
-    assert hm.turns(records) == [records[2:]]
+    assert cm.turns(records) == [records[2:]]
 
 
 def test_turn_key_is_the_last_id_else_a_stable_hash():
@@ -283,12 +285,12 @@ def test_turn_key_is_the_last_id_else_a_stable_hash():
         {"role": "user", "content": "q", "id": "a"},
         {"role": "assistant", "content": "r", "id": "b"},
     ]
-    assert hm.turn_key(with_id) == "b"
+    assert cm.turn_key(with_id) == "b"
     without = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "r"}]
-    key = hm.turn_key(without)
+    key = cm.turn_key(without)
     assert key.startswith("sha256:")
-    assert key == hm.turn_key(copy.deepcopy(without))
-    assert key != hm.turn_key(
+    assert key == cm.turn_key(copy.deepcopy(without))
+    assert key != cm.turn_key(
         [{"role": "user", "content": "q"}, {"role": "assistant", "content": "s"}]
     )
 
@@ -302,11 +304,11 @@ def test_a_synthetic_row_after_a_finished_turn_neither_reopens_it_nor_changes_it
     ]
     snapshot = {"role": "user", "content": "[Your active task list", "synthetic": True}
     later = [*finished, {**snapshot, "id": "s"}]
-    assert hm.complete(later)
-    assert hm.turn_key(later) == hm.turn_key(finished) == "r"
+    assert cm.complete(later)
+    assert cm.turn_key(later) == cm.turn_key(finished) == "r"
     bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
-    assert hm.turn_key([*bare, snapshot]) == hm.turn_key(bare)
-    assert not hm.complete([{"role": "user", "content": "q"}, snapshot])
+    assert cm.turn_key([*bare, snapshot]) == cm.turn_key(bare)
+    assert not cm.complete([{"role": "user", "content": "q"}, snapshot])
 
 
 def _numbered(n: int) -> list[list[dict]]:
@@ -322,21 +324,21 @@ def _numbered(n: int) -> list[list[dict]]:
 def test_pending_pairs_each_unsent_turn_with_the_finished_turn_before_it():
     turns = _numbered(4)
     unfinished = [{"role": "user", "content": "q-open", "id": "q-open"}]
-    pairs = hm.pending([*turns, unfinished], {"a0", "a1"})
+    pairs = cm.pending([*turns, unfinished], {"a0", "a1"})
     assert [(c and c[-1]["id"], t[-1]["id"]) for c, t in pairs] == [("a1", "a2"), ("a2", "a3")]
-    assert hm.pending(turns, set())[0] == (None, turns[0])
+    assert cm.pending(turns, set())[0] == (None, turns[0])
 
 
 def test_pending_with_a_lookback_considers_only_the_last_turns():
     turns = _numbered(15)
-    pairs = hm.pending(turns, set(), lookback=10)
+    pairs = cm.pending(turns, set(), lookback=10)
     assert [t[-1]["id"] for _, t in pairs] == [f"a{i}" for i in range(5, 15)]
     assert pairs[0][0] == turns[4]  # its context is still the turn before
 
 
 def test_batches_split_by_count_and_lead_each_with_its_context():
     turns = _numbered(45)
-    out = hm.batches(hm.pending(turns, set()))
+    out = cm.batches(cm.pending(turns, set()))
     assert [len(new) for _, new in out] == [20, 20, 5]
     first, second, third = out
     assert first[0][0]["id"] == "q0"  # no context before the very first turn
@@ -351,12 +353,12 @@ def test_batches_split_by_size_and_an_oversized_turn_goes_alone():
         [{"role": "user", "content": f"q{i}"}, {"role": "assistant", "content": "z" * 100_000}]
         for i in range(5)
     ]
-    out = hm.batches(hm.pending(big, set()), max_bytes=256_000)
+    out = cm.batches(cm.pending(big, set()), max_bytes=256_000)
     # The leading context turn is part of the body, so it counts toward the size.
     assert [len(new) for _, new in out] == [2, 1, 1, 1]
     assert all(len(json.dumps(records)) < 256_000 for records, _ in out)
     huge = [[{"role": "user", "content": "q"}, {"role": "assistant", "content": "z" * 400_000}]]
-    assert [len(new) for _, new in hm.batches(hm.pending(huge, set()))] == [1]
+    assert [len(new) for _, new in cm.batches(cm.pending(huge, set()))] == [1]
 
 
 def _episodes(records: list[dict]):
@@ -366,8 +368,8 @@ def _episodes(records: list[dict]):
 
 
 def test_the_servers_parser_reads_the_records_as_the_two_finished_turns():
-    turns = hm.turns(hm.to_records(_conversation()))
-    records = [r for t in turns if hm.complete(t) for r in t]
+    turns = cm.turns(hm.to_records(_conversation()))
+    records = [r for t in turns if cm.complete(t) for r in t]
     first, second = _episodes(records)
 
     assert first.span_id == "hermes:u-4"
@@ -387,7 +389,7 @@ def test_the_servers_parser_reads_the_records_as_the_two_finished_turns():
 
 
 def test_a_turn_resent_with_its_context_converges_on_the_same_span_id():
-    turns = hm.turns(hm.to_records(_conversation()))
+    turns = cm.turns(hm.to_records(_conversation()))
     alone = _episodes(turns[1])
     with_context = _episodes([*turns[0], *turns[1]])
     assert alone[0].span_id == with_context[1].span_id == "hermes:u-11"
