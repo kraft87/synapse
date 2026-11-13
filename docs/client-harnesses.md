@@ -148,8 +148,10 @@ person wrote is not uploaded and turns the instance inert for good. Hermes names
 turn's author on `on_turn_start` and in `sync_turn`'s `turn_author`: the daemon names
 one on every turn, the owner's own as the session's `user_id` (`uid:<this OS user>`, not
 a bot); in-process, a human turn has none. An author that is a bot, or not the session's
-user, is someone else. A gateway session's project comes from the `cwd` its client
-sent, never the daemon's.
+user, is someone else. Hermes builds the system prompt before it names the first turn's
+author, so an in-process run whose environment still carries `HERMES_TURN_AUTHOR` (a
+bot-to-bot delivery run as a quiet one-shot) is inert from `initialize`. A gateway
+session's project comes from the `cwd` its client sent, never the daemon's.
 
 What this does not cover:
 
@@ -237,7 +239,7 @@ like every other harness, so there is no Hermes setup wizard step.
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
 | `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. |
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
-| `handle_tool_call(name, args)` | `tools.call()`: adds the session id the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, or a call in an inert session, comes back as a JSON object with an `error` field. |
+| `handle_tool_call(name, args)` | `tools.call()`: adds the session id the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
 
 **What is uploaded.** Hermes passes the whole conversation on every turn, as live message
 dicts, after scrubbing secrets from them. The normaliser keeps only `role`, the text

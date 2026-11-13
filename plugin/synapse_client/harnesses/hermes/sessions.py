@@ -33,7 +33,13 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
   ACTIVE, as before, that process belonging to the person who started it, unless the
   process says otherwise: ``HERMES_SESSION_SOURCE`` (``hermes chat --source``,
   hermes_cli/main.py; "kanban" for a Kanban worker, hermes_cli/kanban_db_dispatch.py)
-  naming a source outside ROW_SOURCES is INERT, and so is any agent the gateway daemon
+  naming a source outside ROW_SOURCES is INERT; so is a run whose environment still
+  carries ``HERMES_TURN_AUTHOR``, which a bot-to-bot dispatcher sets on the child that
+  runs a delivered message (tools/bot_relay.py ``delivery_env``). The quiet one-shot
+  builds its agent before it consumes that variable (hermes_cli/cli_single_query.py
+  ``_run_quiet_single_query``); the other one-shot path consumes it first, and there
+  the turn's own author is the only sign (the provider's ``_foreign``). And so is any
+  agent the gateway daemon
   itself builds without a chat: a ``/background`` or ``/btw`` side agent
   (gateway/session_tui_side.py ``_side_agent``) carries no identity and no parent, so
   nothing says whose session it serves. The daemon is recognised the way Hermes
@@ -137,6 +143,9 @@ ROW_SOURCES = frozenset({"cli", "tui", "desktop", "gui", "acp", "oneshot", "loca
 DB_TIMEOUT = 1.0
 #: The process's session source (hermes_cli/main.py ``--source``).
 SOURCE_ENV = "HERMES_SESSION_SOURCE"
+#: Who wrote a dispatched run's prompt, when it is not the person at the keyboard
+#: (agent/turn_author.py ``TURN_AUTHOR_ENV``).
+AUTHOR_ENV = "HERMES_TURN_AUTHOR"
 #: Largest gateway pid record read, in bytes.
 RECORD_LIMIT = 65536
 
@@ -254,6 +263,8 @@ def from_keywords(kwargs: Mapping[str, Any]) -> Verdict:
         source = _word(os.environ.get(SOURCE_ENV))
         if source and source not in ROW_SOURCES:
             return Verdict(INERT, f"started as {source!r}, not one of the owner's own chats")
+        if os.environ.get(AUTHOR_ENV, "").strip():
+            return Verdict(INERT, "a run that delivers another agent's message")
         return Verdict(ACTIVE)
     chat_id = kwargs.get("chat_id")
     if kwargs.get("chat_type") != "dm" or not (

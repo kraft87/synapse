@@ -425,13 +425,7 @@ def test_a_finished_turn_is_uploaded(plugin, server, tmp_path):
     provider.on_turn_start(1, "question 1", model="anthropic/claude-x", platform="cli")
     messages = _conversation(1, tools=True)
     snapshot = json.dumps(messages, sort_keys=True)
-    provider.sync_turn(
-        "question 1",
-        "answer 1",
-        session_id=_SID,
-        messages=messages,
-        turn_author={"id": "1", "name": "kyle", "is_bot": False},
-    )
+    provider.sync_turn("question 1", "answer 1", session_id=_SID, messages=messages)
     assert json.dumps(messages, sort_keys=True) == snapshot
     (body,) = server.posts()
     assert body == {
@@ -572,8 +566,8 @@ def test_a_session_switch_rebinds(plugin, server, tmp_path):
         ({"platform": "tui", "user_id": "kyle@example.net"}, "active"),
         ({"platform": "desktop", "agent_context": "primary"}, "active"),
         ({"platform": "acp"}, "active"),
-        ({"platform": "cron", "agent_context": "cron"}, "cron"),
-        ({"platform": "cli", "agent_context": "cron"}, "cron"),
+        ({"platform": "cron", "agent_context": "cron"}, "inert"),
+        ({"platform": "cli", "agent_context": "cron"}, "inert"),
         ({"platform": "cli", "agent_context": "subagent"}, "inert"),
         ({"platform": "subagent", "agent_context": "subagent"}, "inert"),
         ({"platform": "cli", "agent_context": "flush"}, "inert"),
@@ -596,6 +590,7 @@ def test_scope(plugin, kwargs, expected):
         {"platform": "api_server"},
         {"platform": "cli", "agent_context": "subagent", "parent_session_id": _SID},
         {"platform": "cli", "agent_context": "flush"},
+        {"platform": "cron", "agent_context": "cron"},
     ],
 )
 def test_an_inert_session_shows_nothing_sends_nothing_and_refuses_tools(
@@ -612,30 +607,27 @@ def test_an_inert_session_shows_nothing_sends_nothing_and_refuses_tools(
     assert server.seen == []
 
 
-def test_a_cron_session_has_tools_and_nothing_else(plugin, server, tmp_path):
-    provider = _start(_new(plugin), tmp_path / "hermes-a", platform="cron", agent_context="cron")
-    assert provider.system_prompt_block() == ""
-    assert provider.prefetch("anything") == ""
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
-    provider.on_session_end(_conversation(1))
-    assert json.loads(provider.handle_tool_call("recall", {"query": "x"}))
-    assert [r["path"] for r in server.seen] == ["/mcp"]
-
-
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 
-def test_tools_work_before_initialize(plugin, server):
+def test_before_initialize_the_schemas_are_served_and_a_call_is_refused(plugin, server):
     provider = _new(plugin)
     schemas = provider.get_tool_schemas()
     assert [s["name"] for s in schemas][:2] == ["recall", "recall_full_turns"]
     assert all(set(s) == {"name", "description", "parameters"} for s in schemas)
+    out = json.loads(provider.handle_tool_call("recall", {"query": "cache"}))
+    assert "local sessions only" in out["error"]
+    assert server.seen == []
+
+
+def test_a_tool_call_reaches_the_server_with_its_arguments(plugin, server, tmp_path):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
     out = provider.handle_tool_call("recall", {"query": "cache"})
-    assert json.loads(out) == {"query": "cache"}  # the fake echoes the arguments
+    assert json.loads(out) == {"query": "cache", "self_session": _SID}  # the fake echoes
     (call,) = server.posts("/mcp")
-    assert call["params"] == {"name": "recall", "arguments": {"query": "cache"}}
+    assert call["params"]["name"] == "recall"
 
 
 def test_a_tool_call_carries_the_session_id(plugin, server, tmp_path):

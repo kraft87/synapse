@@ -50,6 +50,7 @@ def _process_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """No ``--source`` label and a Hermes home of the test's own, so the daemon check
     never reads a real home."""
     monkeypatch.delenv(hs.SOURCE_ENV, raising=False)
+    monkeypatch.delenv(hs.AUTHOR_ENV, raising=False)
     home = tmp_path / "process-home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -404,6 +405,40 @@ def test_any_author_in_process_is_someone_else(plugin, server, tmp_path, author)
         "q", "a", session_id=_RESET_CHILD, messages=_conversation(2), turn_author=author
     )
     assert len(server.posts()) == 1 and provider.prefetch("x") == ""
+
+
+def test_a_bot_with_no_id_or_name_is_still_a_bot(plugin, server, tmp_path):
+    """gateway/run_turn_runner.py builds the author from ``ctx.source``, with None for
+    an empty id or name: the bot flag alone names someone else."""
+    home = tmp_path / "hermes-a"
+    _store(home)
+    provider = _start_gateway(_new(plugin), home)
+    provider.on_turn_start(2, "hi", model="m", author_id=None, author_name=None, author_is_bot=True)
+    assert provider.prefetch("x") == ""
+    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1))
+    assert server.posts() == []
+
+
+def test_a_dispatched_delivery_is_inert_before_its_first_turn(
+    plugin, server, tmp_path, monkeypatch
+):
+    """tools/bot_relay.py ``delivery_env`` sets HERMES_TURN_AUTHOR on the child that runs
+    a delivered message, and hermes_cli/cli_single_query.py builds the quiet one-shot's
+    agent before it consumes the variable: the board must not reach that agent's system
+    prompt, which Hermes builds before the provider hears the turn's author."""
+    monkeypatch.setenv(hs.AUTHOR_ENV, json.dumps(_BOT))
+    verdict = hs.from_keywords(_in_process(platform="cli"))
+    assert verdict.mode == hs.INERT and "another agent" in verdict.reason
+    provider = _new(plugin)
+    provider.initialize(_RESET_CHILD, hermes_home=str(tmp_path / "hermes-a"), **_in_process())
+    assert provider.system_prompt_block() == "" and provider.prefetch("x") == ""
+    assert "local sessions only" in json.loads(provider.handle_tool_call("recall", {}))["error"]
+    assert server.seen == []
+    # The daemon strips it from its own environment (gateway_runtime_start.py:41); a
+    # gateway session is judged by its receipt and each turn's author.
+    _store(tmp_path / "hermes-b")
+    assert hs.check_session(tmp_path / "hermes-b", _LOCAL, _gateway()).mode == hs.ACTIVE
+    assert hs.from_keywords(_gateway()).mode == hs.ACTIVE
 
 
 # ---------------------------------------------------------------------------

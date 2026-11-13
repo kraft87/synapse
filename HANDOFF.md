@@ -42,9 +42,19 @@ changed, what to do on each machine, what was proven, and what is still open.
   and is not uploaded. Hermes names a turn's author on `on_turn_start` (before the
   nudge) and in `sync_turn`'s `turn_author`. The daemon names one on every turn, the
   owner's own as the session's `user_id` and not a bot (`gateway/run_turn_runner.py`);
-  in-process, a human turn has none. A bot, another id, or any author in-process is
-  someone else: a Bot Mode delivery run as an in-process one-shot (`HERMES_TURN_AUTHOR`,
-  `hermes_cli/cli_single_query.py`) used to be uploaded as the owner's.
+  in-process, a human turn has none. A bot (the flag alone, with or without an id),
+  another id, or any author in-process is someone else: a Bot Mode delivery run as an
+  in-process one-shot (`HERMES_TURN_AUTHOR`, `hermes_cli/cli_single_query.py`) used to
+  be uploaded as the owner's.
+- **A dispatched delivery is inert from `initialize`.** An in-process run whose
+  environment still carries `HERMES_TURN_AUTHOR` gets no board: Hermes builds the system
+  prompt before it names the turn's author (`agent/turn_context.py`), so the author
+  check alone came too late for the first turn. The quiet one-shot (`-Q`) builds its
+  agent before it consumes the variable; the other one-shot path consumes it first.
+- **A tool call before `initialize` is refused.** It used to reach the server. Hermes
+  refuses such a call itself (`agent/memory_manager.py`, `caller_scope`), so nothing
+  that worked stops working. With cron gone, a tool call works only in an active
+  session.
 - **A failed turn is never uploaded.** Hermes's notice for a failed turn (an assistant
   row typed `display_kind: failed_turn`, or the bare notice) was uploaded as the
   assistant's reply. The failed turn is now dropped, its user message included. An
@@ -128,18 +138,14 @@ changed, what to do on each machine, what was proven, and what is still open.
   chat created on the trial model (`gateway/session_local.py`) as well as on Bot Chats.
 - The board already in a stored system prompt stays: Hermes restores it verbatim for a
   continuing session (renamed, branched, handed off). Only later rebuilds go without.
-  The first turn's prompt is built before `on_turn_start` names an author.
+  The first turn's prompt is built before `on_turn_start` names an author; only a
+  quiet dispatched one-shot is caught earlier, by its environment.
 - Whoever can sign in to the Hermes dashboard or Webapp is the owner here: Hermes maps
   every login to the owner's `uid:` subject.
 - A side agent built in the stdio TUI or Desktop backend's own process has no parent
   and no row, so it is active even when its parent is a Bot Chat.
 - A Bot Chat whose title was cleared (archived) and that carries no
   `follow_profile_config` reads as an owner chat; Hermes no longer delivers to it.
-- Four assertions in `tests/test_hermes_provider.py` pin the old rule and fail until
-  that file is updated: `test_scope[kwargs6-cron]` and `test_scope[kwargs7-cron]` (cron
-  is now "inert"), `test_a_cron_session_has_tools_and_nothing_else` (no tools for cron),
-  and `test_a_finished_turn_is_uploaded` (it passes a non-bot `turn_author` to an
-  in-process session, where Hermes only names relayed bots, so nothing is uploaded).
 
 ## 2026-11-12 — ingest: the transcript line rules live in one module
 

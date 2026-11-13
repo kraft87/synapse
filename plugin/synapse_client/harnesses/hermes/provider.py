@@ -388,9 +388,11 @@ class SynapseMemoryProvider(MemoryProvider):
         as ``{"id": <the session's user_id>, "is_bot": False}``
         (gateway/run_turn_runner.py, ``ctx.source``, the source of ``user_id`` too); a bot,
         another id, or any author where no user was bound is someone else."""
+        if is_bot:
+            return True
         if author_id is None and author_name is None:
             return False
-        return bool(is_bot) or self._owner_id is None or author_id != self._owner_id
+        return self._owner_id is None or author_id != self._owner_id
 
     def _authored(self) -> None:
         """A turn someone else wrote reached this agent: off for good, said once."""
@@ -517,20 +519,14 @@ class SynapseMemoryProvider(MemoryProvider):
             return []
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
-        """Call ``tool_name`` on the server with this session's id; always a JSON string."""
+        """Call ``tool_name`` on the server with this session's id; always a JSON string.
+        Only for an ACTIVE session still the owner's: an instance not initialized yet has
+        no session to judge, and Hermes itself refuses a tool call before ``initialize``
+        (agent/memory_manager.py ``handle_tool_call``, ``caller_scope``)."""
         try:
-            if self._mode == INERT:
-                return _error(_LOCAL_ONLY, tool_name)
-            if self._mode == ACTIVE and not self._still_owner():
-                return _error(_LOCAL_ONLY, tool_name)
             client = self._client
-            if client is None:
-                with self._lock:
-                    if self._client is None:
-                        settings = Settings.load()
-                        self._settings = settings
-                        self._client = Client(settings, f"synapse-client/{__version__} hermes")
-                    client = self._client
+            if self._mode != ACTIVE or client is None or not self._still_owner():
+                return _error(_LOCAL_ONLY, tool_name)
             text = tools.call(client, tool_name, args, session_id=self._session_id or None)
             return _json_result(text)
         except Exception as err:
