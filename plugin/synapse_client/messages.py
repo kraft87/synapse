@@ -3,7 +3,7 @@
 A harness that can hand over its chat messages uploads them as ``messages`` records: no
 server parser of its own. Its adapter builds the records from the harness's own shapes
 (harnesses/hermes/messages.py is one); this module cuts them into turns and says which
-are finished, and ``upload.TurnUploader`` sends those.
+are finished, and ``turn_upload.TurnUploader`` sends those.
 
 A record is a dict: ``role`` ("user", "assistant" or "tool"), ``content`` (text), and
 where they apply an assistant row's ``tool_calls`` (``{"name", "arguments"}`` each), a
@@ -17,7 +17,8 @@ and no tool calls: an assistant row that calls tools is followed by their result
 turn ending in one is still running (a harness's list may be read mid-turn). Only
 complete turns are uploaded, each with the complete turn before it as its context.
 Synthetic rows do not count towards a turn's key either, so one added after a finished
-turn neither reopens it nor makes it look new.
+turn neither reopens it nor makes it look new. The reply to one does: it lands on the
+turn before, which then has a new key, and ``stems`` gives the keys it had.
 """
 
 from __future__ import annotations
@@ -51,14 +52,33 @@ def _real(turn: Sequence[Record]) -> list[Record]:
     return [record for record in turn if not record.get("synthetic")]
 
 
+def _final(record: Record) -> bool:
+    """Whether ``record`` ends a turn: an assistant row with text and no tool calls."""
+    return (
+        record["role"] == "assistant" and bool(record["content"]) and not record.get("tool_calls")
+    )
+
+
 def complete(turn: Sequence[Record]) -> bool:
     """Whether ``turn`` has finished: its last record that is not synthetic is an
     assistant row with text and no tool calls."""
     real = _real(turn)
-    if not real:
-        return False
-    last = real[-1]
-    return last["role"] == "assistant" and bool(last["content"]) and not last.get("tool_calls")
+    return bool(real) and _final(real[-1])
+
+
+def stems(turn: Sequence[Record]) -> list[str]:
+    """The keys ``turn`` had each time it was complete before it went on. No real user
+    row opened what follows such a point (the harness wrote one in the user's place, or
+    the row was left out of the records), so it landed on the turn already finished."""
+    keys: list[str] = []
+    last: Record | None = None
+    for at, record in enumerate(turn):
+        if record.get("synthetic"):
+            continue
+        if last is not None and _final(last):
+            keys.append(turn_key(turn[:at]))
+        last = record
+    return keys
 
 
 def turn_key(turn: Sequence[Record]) -> str:

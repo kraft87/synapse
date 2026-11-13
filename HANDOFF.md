@@ -246,9 +246,10 @@ on cortex while other work was running: read the ratio, not the milliseconds.
   gets the marker and the server row, and no turn from before is looked back at. `/new`
   and `/resume` open another conversation, and nothing is carried to it from the one
   left.
-- **The provider meets a new id in three ways, and each is covered.**
+- **The provider meets a new id in three ways.**
   - Hermes moves the agent to it (`on_session_switch`). A switch that is neither a reset
-    nor a resume checks the id it leaves and the parent Hermes names. At Hermes bca51750
+    nor a resume checks the id it leaves (the one the provider is bound to, and the one
+    Hermes named last) and the parent Hermes names. At Hermes bca51750
     the callers that reach a provider are a compression and the TUI's rewind. The classic
     CLI's `/branch` and `/resume` make the call too, but its agent holds no memory
     manager there.
@@ -259,6 +260,13 @@ on cortex while other work was running: read the ratio, not the milliseconds.
     it waited on another holder of the session, and a row written only after the agent
     was built. So the row is read before the first upload under any id, once per id
     (`_follow`).
+- **A flush goes under the session Hermes named last.** `on_session_end` and
+  `on_pre_compress` carry no session id, and after the third way above the id the
+  provider was built for is not the agent's. The provider notes each id a hook names
+  (`initialize`, `on_session_switch`, `prefetch` as a turn starts, `sync_turn`) and a
+  flush goes under the last (`harnesses/hermes/live.py`). `sync_turn` runs on Hermes's
+  background worker, so one that runs late does not take the agent back to a session a
+  switch or a turn start has moved it away from.
 - **What a row says.** A row with a parent holds that parent's turns, unless its
   `model_config` names the parent as what it was reset or delegated from. A key counts
   only when it names the parent, which is how Hermes reads them
@@ -278,17 +286,30 @@ on cortex while other work was running: read the ratio, not the milliseconds.
 - **Asked once per session.** The answer is recorded as an empty file under
   `$HERMES_HOME/synapse/settled/`, named by a hash of the session id. So a branch that
   had its answer before its parent went private stays on the record, and
-  `synapse private off --forget` on a branch holds once the server has had its row. A
-  session with a recorded answer speaks for the ones above it, so the chain is asked
-  about only as far up as the first such session.
+  `synapse private off --forget` on a branch holds once the server has had its row. An
+  agent also makes a session private this way only once, so that holds when the file
+  could not be written. A session with a recorded answer speaks for the ones above it,
+  so the chain is asked about only as far up as the first such session.
 - **The server is told when the session is bound.** A branch of a session with a marker
   gets its own marker at `initialize`, and the server is told there, beside the
   session-start requests and inside their 5 seconds. The row used to be written at the
   branch's first upload, which undid an `off --forget` run before the first turn.
 - **The first turn back on the record goes up when it ends.** After `off --forget` on a
-  session that was carried, the turn that ends next is uploaded alone: the turn before
-  it was spoken off the record and does not go along as its context. It used to wait
-  for the turn after it, and was never sent when the session ended there.
+  session that was carried, the next turn the user begins is uploaded when it ends,
+  alone: the turn before it was spoken off the record and does not go along as its
+  context. It used to wait for the turn after it, and was never sent when the session
+  ended there. A reply Hermes began itself (a background-process notice stands in the
+  user's place) opens no turn: it lands on the turn before it and stays off the record
+  with it.
+- **Time off the record is not looked back at, under any id.** The agent that carried a
+  session never looks back at it, and not at an id the conversation goes on under
+  either: a compression that starts a new session after `off --forget` copies the tail
+  of the conversation, the private turns included, under an id that is on the record.
+- **What the uploader remembers is kept per session id** (`turn_upload.py`, split out
+  of `upload.py`): the turns sent, the look-back, the turns kept while the server does
+  not answer. Hermes names the session at every upload, and an upload for the session
+  left can run after a switch. Turns kept for one id never go up under another, and a
+  late upload for the id left does not use up the new one's look-back.
 - **When a write fails**, the uploader refuses the new session itself and says so as a
   WARNING in Hermes's log. No marker could be written: for as long as that agent lives
   (the next one for the session asks again). The server could not be told (a 5-second
@@ -328,7 +349,15 @@ on cortex while other work was running: read the ratio, not the milliseconds.
   goes up alone after time off the record, and a flush does not take a turn from before
   for it; a marker that cannot be written, and an id no marker can be named by, are held
   by the uploader, queued uploads included; every session the server is still to be told
-  about is told once it answers, and each failed try is a warning.
+  about is told once it answers, and each failed try is a warning; a session is made
+  private by a carry once; a log callback that asks the uploader something is called
+  with no lock held.
+- `tests/test_client_core_turn_upload.py` (new): turns kept for one session do not go
+  up under another, and each session has its own look-back; a session that was off the
+  record is not looked back at under any id it goes on with; a reply the user did not
+  ask for is not a new turn after time off the record, with a row in the user's place
+  or with none; a marker written by hand is not taken for the server's answer; a turn
+  is not kept once another thread's upload was told the session is private.
 - `tests/test_hermes_provider.py`: a compression or a branch from a private session
   uploads nothing under the new id, at a turn, before a compression or at exit; a
   private parent is enough, by marker or by server row; `/resume` and `/new` carry
@@ -345,27 +374,39 @@ on cortex while other work was running: read the ratio, not the milliseconds.
   id is read once, also when its answer could not be recorded. A switch or an upload
   whose check raises sends nothing. Turns compressed away while the server did not
   answer go up when it does.
-- Each of those rules was taken out of the code in turn (64 changes, one at a time);
-  the tests failed every time.
+- `tests/test_hermes_private_moves.py` (new): a flush goes under the session Hermes
+  named last, at a turn start or an upload, and a late upload does not take the agent
+  back; after `off --forget` a turn Hermes begins takes no turn from before along, and
+  a new session id is not looked back at, whether a switch or only the row says what it
+  goes on from; `off --forget` after a switch stands when the record could not be
+  written; turns kept for a session stay with it when another is resumed in place; a
+  switch goes by the id the provider is bound to, the id Hermes named last and the
+  parent it names.
+- Each of those rules was taken out of the code in turn (115 changes, one at a
+  time); the tests failed every time.
 - In a real Hermes checkout (bca51750): `tests/test_hermes_integration.py` marks a
   session private and makes the calls a compression makes on Hermes's own
   `MemoryManager`; the child id gets the marker and the row and nothing is uploaded
   under either id, in-process and in Hermes's plugin host. `tests/test_hermes_checkout_names.py`
   reads the call sites that announce a switch (compression and branch pass
   `reset=False`, resume passes `reason="resume"`, `/new` passes `reset=True`), the keys
-  by which Hermes marks a child as something other than a continuation, and that the TUI
-  writes a branch's row with the parent link and `_branched_from`.
-- Reviewed twice by a separate agent that tried to make private turns leave. The first
-  review found two ways; the second found ten defects, four of them ways under narrow
-  conditions. Each has a test here that fails without its fix.
+  by which Hermes marks a child as something other than a continuation, that the TUI
+  writes a branch's row with the parent link and `_branched_from`, and that Hermes
+  names the agent's session as a turn starts while the flush hooks carry none.
+- Reviewed three times by a separate agent that tried to make private turns leave. The
+  first review found two ways; the second found ten defects, four of them ways under
+  narrow conditions; the third found ten more, four of them ways: a flush after a move
+  Hermes did not announce, a reply Hermes began after `off --forget`, a compression to
+  a new id after `off --forget`, and turns kept for one session going up under
+  another. Each has a test here that fails without its fix.
 
 **Still open**
 
 - Turns kept for a session the server has not answered about are in memory only. They
   are not queued: another process's drain would send them without knowing the question
-  is open. They are lost if Hermes exits before the server answers, dropped at a switch
-  to a new id (which looks back ten turns of its own), and past 200 the oldest are given
-  up with a WARNING.
+  is open. They are lost if Hermes exits before the server answers, past 200 the oldest
+  are given up with a WARNING, and at a switch to a new id they stay with the id left:
+  they are not uploaded under the new one, which looks back ten turns of its own.
 - While the server is down, each upload for a session it has not answered about, or has
   not been told about, waits up to 5 seconds per request, on Hermes's background worker.
   One it has not been told about writes a WARNING line each turn.
@@ -375,7 +416,17 @@ on cortex while other work was running: read the ratio, not the milliseconds.
   private. `synapse private off --forget <id>` puts it back, and that holds.
 - `off --forget` puts a session back on the record whole, as it does everywhere: a later
   agent for a branch looks back ten turns, the copied ones included. The agent that
-  carried it does not look back.
+  carried it does not look back, under that id or one the conversation moves to. That
+  errs the other way too: after a later compression to a new id, the last turn spoken
+  on the record does not go as the context of the first turn under the new id.
+- After `off --forget`, a first turn the user began is taken for one from before when
+  Hermes went on from it (a reply to a notice landed on it) before its upload ran. It
+  is not uploaded.
+- A flush goes under the id Hermes named last. After a move Hermes did not announce, a
+  flush that runs before any hook names the new id goes under the id from before: the
+  turn's prompt gave no `prefetch` (Hermes skips it for a trivial prompt) and its
+  `sync_turn` is still queued. A return to an id the agent was moved away from is
+  seen only when `prefetch` or a switch names it.
 - `off --forget` in the moment between a branch's marker and the server getting its row
   is undone when the row is written. That moment is the session start (5 seconds at
   most) and, while the server cannot be told, every turn until it is; the WARNING lines
@@ -395,6 +446,156 @@ on cortex while other work was running: read the ratio, not the milliseconds.
 - A Hermes slash command or tool for private mode. The toggle is typed in a terminal.
 - From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
   uploaded and are lost at exit.
+
+## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
+
+**What changed**
+
+- **Before, the script was for an empty database.** It ran every schema file each time,
+  and a second run stopped at 001. An upgrade meant reading the stamp and piping the files
+  above it to `psql` by hand, one at a time.
+- **Now the script records what it applies.** A table, `schema_migrations`, holds one row
+  per schema file the database has had (`version` is the file's number, plus `filename`
+  and `applied_at`). A run applies the files that have no row, in order, and records each.
+  A second run does nothing. An upgrade is `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`
+  from a checkout of the new version.
+- **The script creates the table itself.** It is not a numbered schema file, so this
+  release has no new schema number, the stamp does not move, and no service waits on it.
+- **A database from before the ledger starts from its stamp.** The first run records
+  every file up to `synapse_meta.schema_version` without running it (`applied_at` is NULL
+  on those rows) and applies the rest. It refuses a database that has a schema and no
+  stamp, a stamp that is not a file's number, and a stamp above the newest file in the
+  checkout: in each case it cannot tell which files the database has had.
+- **A file can be marked manual**, with the header line `-- schema-apply: manual`. On a
+  database that holds episodes an upgrade does not run such a file: it leaves an optional
+  one alone and names it, and it stops before a required one with exit status 2.
+  `--only NNN` runs it. 067 (the pollers are stopped first) and 069 (no undo) carry the
+  marker. A database with no episodes runs them in turn, as first boot and CI do.
+- **Two new modes.** `--status` prints the stamp, what is applied and what is pending, and
+  changes nothing. `--only NNN` applies one file, and refuses to step over an earlier file
+  that an upgrade would apply.
+- **A file, its row and the stamp go through one `psql` session, in that order.** A file
+  that fails leaves no row, so the next run starts at it. The stamp is the highest number
+  in the ledger and never moves down.
+- **The boot check is unchanged: it reads the stamp, not the ledger.** A file piped to
+  `psql` by hand has no row, and a check that read the ledger would keep the services
+  down on a database that has the file.
+- **The script passes `-X`**, so a `~/.psqlrc` (`\set AUTOCOMMIT off`, for one) cannot
+  change how the files run.
+- **The file list is checked before anything runs**: three-digit numbers, one file per
+  number, in rising order. A number the ledger holds under another filename stops the run
+  (two branches used the same number).
+
+**On each machine**
+
+1. The release itself needs nothing: no migration, no setting, no client update. No
+   service reads the ledger.
+2. To start the ledger on an existing database, once, whenever you want:
+   `scripts/apply_schema.sh --status "$SYNAPSE_DB_URL"` shows what a run would do, then
+   `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`. On a database stamped 069 it records 001
+   to 069 and applies nothing. If an optional file below the stamp was never applied
+   there, delete its row afterwards and run the script again.
+3. From then on an upgrade is: pull, run the script, restart. A file applied some other
+   way needs its row inserted by hand (`docs/install.md` > Upgrading).
+
+**Rolling back**
+
+- Revert as usual. The table stays and nothing reads it; the older script ignores it.
+- `DROP TABLE schema_migrations` removes the ledger. The next run of the new script starts
+  it again from the stamp, which forgets any file below the stamp that was left alone.
+
+**Proven**
+
+- `tests/test_apply_schema_runner_db.py` runs the real script, its file list swapped for
+  eight stand-ins, on a scratch database: an empty database gets every file once, in
+  order, with a row for each; a second run applies nothing; a file with no row is the only
+  one applied; a file that fails leaves no row and the next run resumes at it; a
+  `~/.psqlrc` with `AUTOCOMMIT off` changes nothing; a database from before the ledger is
+  recorded from its stamp and gets only the files above it; `--status` creates nothing;
+  each refusal above changes nothing; an optional manual file is left alone and a required
+  one stops the run, on a database that holds episodes only; `--only` runs a manual file
+  and steps over nothing an upgrade would apply; the stamp never moves down.
+- Each of seven deliberate breaks of the script (no `-X`, the manual marker ignored, the
+  marker applied to a database with no episodes, no row written, the stamp moved down,
+  `--only` stepping over an optional file, a stamp above the newest file trusted) fails
+  that module.
+- `tests/test_schema.py`: the database CI provisions with the script has a row for every
+  schema file.
+- The real 68 files on PostgreSQL 17, through the first-boot hook of a new container: all
+  68 applied (68 rows, stamp 069), and a second run applied none. Then, with one episode
+  in it and the rows for 061, 067, 068 and 069 deleted: a run applied 061 and stopped
+  before 067 (exit 2); `--only 068` was refused; `--only 067` ran it; the next run applied
+  068 and left 069 alone; `--only 069` ran it.
+- On a database built by the previous script, where that script's second run fails at
+  001, `--status` changed nothing and the first run recorded 68 files and applied none.
+
+**Still open**: no live database has been moved onto the ledger yet. A fresh install still
+replays all 68 files; folding them into one baseline file is a separate change.
+
+## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
+
+**What changed**
+
+- **Incoming-webhook URLs are redacted.** A Discord or Slack webhook URL is the whole
+  credential: whoever holds it can post to the channel. `redact_secrets` matched
+  neither, so one pasted into a session was stored and served back by recall. Now
+  `discord.com/api/webhooks/<hook id>/<token>` (also `discordapp.com`, `ptb.`,
+  `canary.` and `/api/v<n>/`) keeps the host and the hook id and loses the token, and
+  `hooks.slack.com/{services,workflows,triggers}/<workspace>/...` keeps the workspace
+  id and loses the rest of the path. The marker is `[REDACTED:webhook]`. The scheme is
+  not needed. A placeholder (`<id>/<token>`, `$TOKEN`, Slack's all-`X` example) and a
+  URL with no token stay as they are.
+- **The webhook rule runs before the provider-token rules.** A webhook token can
+  contain what reads as a provider key. A provider rule that ran first would mark that
+  part and leave the characters before it.
+- **`scripts/redact_stored_secrets.py` had no prefilter entry for seven rule shapes.**
+  The script fetches only the rows its server-side prefilter matches. The six formats
+  added after the script was written (Logfire, Matrix, Voyage, Firecrawl, ElevenLabs,
+  Telegram) and `private_key=` assignments had no entry. A stored row holding only
+  such a value was never fetched, and the report counted its table as clean. Long rows
+  were mostly fetched anyway, because `token`, `basic` or `://` appears somewhere in
+  them; a short one (a fact, a note hook) was not. The prefilter now has an entry for
+  every rule, and for a webhook URL written without a scheme.
+- **A test keeps the rules and the prefilter in step.**
+  `tests/test_redact_stored_secrets_db.py` holds one sample per rule, checks in Postgres
+  that the prefilter matches each, and fails when a rule has no sample. It also runs
+  the script against a scratch table: a dry run writes nothing, `--apply` rewrites the
+  row a rule changes and no other, and the report prints no value. The script had no
+  test before.
+
+**On each machine**
+
+- **Server:** nothing to do. New ingests are redacted once the image is deployed.
+- **Rows already stored:** run the script once per database, dry run first
+  (`python scripts/redact_stored_secrets.py <DSN>`, then the same with `--apply`). It
+  is idempotent. As before, embeddings and earlier backups keep what they had.
+- **A webhook that was ever stored:** regenerate it. That makes every old copy
+  harmless, including the ones in backups.
+- **Clients:** nothing. No client file changed.
+
+**Proven**
+
+- The tests fail when the rule is broken: with the webhook rule removed (11 fail);
+  with it moved after the provider rules (the token-taken-whole test); with `/` taken
+  out of the Slack value (the three Slack shapes); with the placeholder check removed
+  (the two placeholder URLs).
+- A second pass over redacted text changes nothing, for every shape. An earlier draft
+  that kept Slack's later ids and marked only the last segment failed this: the second
+  pass took a long id for a token.
+- The prefilter on main misses 16 of the 52 samples: the six formats, the three
+  `private_key` spellings, and the seven webhook shapes without a scheme. The new one
+  misses none, and each of its 32 entries carries at least one sample: removing any
+  one entry makes the test fail.
+- The full suite (unit, db, db pooled), ruff and mypy pass on PostgreSQL 17. CI runs
+  PostgreSQL 18.
+
+**Still open**
+
+- Other URLs that are credentials have no rule: Teams and Office connectors, IFTTT
+  maker keys, Zapier catch hooks, Home Assistant webhook ids.
+- The placeholder check reads three `x` in a row as a placeholder, so about one real
+  Discord token in 500 would be left. The same check already guards
+  `scheme://user:pass@host`.
 
 ## 2026-11-12 — cli: `synapse update` lets the client it installed update the harnesses (plugin 0.24.9)
 

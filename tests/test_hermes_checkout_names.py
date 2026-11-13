@@ -86,6 +86,18 @@ _DRIVER = textwrap.dedent(
         "new_session": says("hermes_cli/cli_session_mixin.py",
                             'reset=True, reason="new_session")'),
     }
+    from agent.memory_provider import MemoryProvider
+    def takes(name):
+        return list(inspect.signature(getattr(MemoryProvider, name)).parameters)
+
+    named = {
+        "turn_start": says("agent/turn_context.py",
+                           "prefetch_all(_query, session_id=agent.session_id)"),
+        "prefetch": takes("prefetch"),
+        "sync_turn_names_one": "session_id" in takes("sync_turn"),
+        "on_session_end": takes("on_session_end"),
+        "on_pre_compress": takes("on_pre_compress"),
+    }
     forks = _non_continuation_child_sql("c.", "?")
     print("RESULT " + json.dumps({
         "fork_keys": sorted(set(re.findall(r"[$][.](_[a-z_]+)", forks))),
@@ -106,6 +118,7 @@ _DRIVER = textwrap.dedent(
         "columns": columns,
         "origins": origins,
         "switches": switches,
+        "named": named,
     }))
     """
 )
@@ -221,4 +234,20 @@ def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(
         "resume": 1,
         "resume_and_branch_keep": 1,
         "new_session": 1,
+    }
+
+
+def test_this_hermes_names_the_session_where_the_provider_reads_it(names: dict[str, Any]) -> None:
+    """The flush hooks carry no session id, so a flush goes under the id Hermes named
+    last (harnesses/hermes/live.py): at the start of each turn (``prefetch``, called
+    inline with the agent's session) and at ``sync_turn``. A Hermes that stopped naming
+    it as the turn starts would leave a flush, after a move it did not announce, under
+    the session left; one whose flush hooks came to carry an id should be read there
+    instead. By the call site's source text and the base class's signatures."""
+    assert names["named"] == {
+        "turn_start": 1,
+        "prefetch": ["self", "query", "session_id"],
+        "sync_turn_names_one": True,
+        "on_session_end": ["self", "messages"],
+        "on_pre_compress": ["self", "messages"],
     }

@@ -2,7 +2,7 @@
 # mypy: ignore-errors
 """skills_lane ledger writer — the dream->skills "writer contract" from schema/022.
 
-Run under the synapse venv (needs psycopg + voyageai):
+Run under the synapse venv (needs psycopg + the embedding backend):
     ~/services/synapse/.venv/bin/python ~/scripts/skill_ledger.py --selftest
 
 Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name, over
