@@ -170,7 +170,8 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse config [key [value]]`** — read or change this machine's settings.
 - **`synapse install claude|codex|hermes`** — the wiring step alone (Hermes: below).
 - **`synapse update`** — install the client version the server now serves, and update
-  this plugin and every other harness already wired.
+  this plugin and every other harness already wired. The harnesses are updated by the
+  client just installed, in a process of its own.
 - **`synapse status`** — one line per harness: wired, found and not wired, or not found.
 - **`synapse skill retire <name>`** — retire a skill everywhere (below).
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope

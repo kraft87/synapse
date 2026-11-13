@@ -20,6 +20,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -883,46 +884,33 @@ def test_ingest_reads_a_record_id_that_is_a_path_as_not_private(scratch, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# harness.py: the registry comes from the managed client's core
+# harness.py: the registry comes from the core beside the script
 # ---------------------------------------------------------------------------
 
 
-def _fake_core(root: Path, marker: str) -> Path:
-    pkg = root / "plugin" / "synapse_client"
-    (pkg / "harnesses").mkdir(parents=True)
-    (pkg / "__init__.py").write_text(f'__version__ = "{marker}"\n', encoding="utf-8")
-    (pkg / "harnesses" / "__init__.py").write_text(
-        f"def registry():\n    return [{marker!r}]\n", encoding="utf-8"
+def test_the_registry_is_the_one_of_the_core_config_imported(scratch, tmp_path):
+    """A process runs one client version: a managed client of another version on the
+    machine does not put a second ``synapse_client`` into this one. `synapse update` hands
+    its second half to that client's own CLI instead (test_synapse_cli.py)."""
+    home = Path(os.environ["SYNAPSE_HOME"])
+    other = home / "lib" / "9.9.9" / "plugin" / "synapse_client" / "harnesses"
+    other.mkdir(parents=True)
+    (other.parent / "__init__.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+    (other / "__init__.py").write_text("def registry():\n    return ['other']\n")
+    (home / "lib" / "CURRENT").write_text("9.9.9\n", encoding="utf-8")
+    # A managed client as the installer leaves one (the launcher, the Codex installer):
+    # the registry used to be taken from there when there was one.
+    (home / "bin").mkdir(parents=True)
+    shutil.copy(PLUGIN / "scripts" / "synapse_run.py", home / "bin" / "synapse_run.py")
+    (home / "lib" / "9.9.9" / "plugin-codex").mkdir()
+    shutil.copy(
+        PLUGIN.parent / "plugin-codex" / "install.py",
+        home / "lib" / "9.9.9" / "plugin-codex" / "install.py",
     )
-    return root / "plugin"
-
-
-@pytest.fixture()
-def saved_core() -> Iterator[None]:
-    saved = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "synapse_client"}
-    yield
-    for name in [n for n in sys.modules if n.split(".")[0] == "synapse_client"]:
-        del sys.modules[name]
-    sys.modules.update(saved)
-
-
-def test_the_registry_is_the_managed_clients_not_the_one_config_imported(
-    scratch, monkeypatch, tmp_path, saved_core
-):
-    """`synapse update` runs the old client's CLI: config.py imported that client's core.
-    The harnesses built after the installer ran must come from the new one."""
     harness = load_script("harness")
-    old = sys.modules["synapse_client"]
-    assert Path(old.__file__).parents[1] == PLUGIN
-    managed = _fake_core(tmp_path / "managed", "9.9.9-new")
-    monkeypatch.setattr(harness, "_core_parent", lambda: managed)
-    assert harness._core_registry() == ["9.9.9-new"]
-    assert sys.modules["synapse_client"].__version__ == "9.9.9-new"
-    assert harness.config.credentials is old.credentials  # loaded modules keep theirs
-
-
-def test_the_core_config_imported_stays_when_it_is_the_one_to_load(scratch, saved_core):
-    harness = load_script("harness")
+    assert harness.managed_root() == (home / "lib" / "9.9.9").resolve()
     loaded = sys.modules["synapse_client"]
-    harness._forget_other_core(str(PLUGIN))
+    assert [h.name for h in harness._core_registry()] == ["hermes"]
     assert sys.modules["synapse_client"] is loaded
+    assert Path(loaded.__file__).parents[1] == PLUGIN
+    assert not hasattr(harness, "_forget_other_core")

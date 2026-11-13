@@ -20,11 +20,11 @@ OAuth it would start a browser sign-in whose token outranks the device credentia
 
 `harnesses()` is the one list `synapse login`, `install`, `update` and `status` walk:
 Claude Code and Codex as small objects over the functions here, then the client core's
-registry (plugin/synapse_client/harnesses), which is where Hermes lives. The registry
-is imported when the list is built, from the managed client's current version when one
-is installed: `synapse update` builds it after the installer ran, so an adapter's copy
-of the core is the new one. config.py has imported the core of the plugin it sits in by
-then; a package loaded from anywhere else is forgotten first (``_forget_other_core``).
+registry (plugin/synapse_client/harnesses), which is where Hermes lives. The registry is
+the one of the core beside this script, which config.py imported: a process runs one
+client version. `synapse update` therefore hands its second half to the CLI of the client
+it just installed (synapse_cli.cmd_update), so an adapter's copy of the core is the new
+one.
 """
 
 from __future__ import annotations
@@ -41,6 +41,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
+# config.py put the plugin this script sits in on sys.path and imported its core.
+from synapse_client.settings import normalize_url  # noqa: F401  (the CLI calls it here)
+
 synapse_home = config.synapse_home
 
 MARKETPLACE_REPO = "kraft87/synapse"
@@ -54,26 +57,6 @@ DROPPED_OPTIONS = (
     "SYNAPSE_CONFIG_PATHS",
 )
 _CLI_TIMEOUT = 180  # `marketplace add` clones the repo
-
-# A base URL every shell and both harness config formats carry without quoting: a
-# scheme, a host[:port] and an optional plain path.
-_URL_RE = re.compile(
-    r"^https?://(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?(?:/[A-Za-z0-9._~\-/]*)?$"
-)
-
-
-def normalize_url(url: str) -> str:
-    """The base URL to store: no trailing slash, no endpoint suffix pasted along with it.
-    Raises ValueError when it isn't a plain http(s) URL."""
-    base = (url or "").strip().rstrip("/")
-    for suffix in ("/ingest", "/recall", "/mcp", "/skills", "/install"):
-        # a path segment only: a host that happens to be named "mcp" stays
-        if base.endswith(suffix) and "://" in base[: -len(suffix)]:
-            base = base[: -len(suffix)]
-    base = base.rstrip("/")
-    if not _URL_RE.match(base):
-        raise ValueError(f"not a plain http(s) base URL: {url!r}")
-    return base
 
 
 def detect() -> dict[str, bool]:
@@ -456,51 +439,12 @@ class _Codex:
         return codex_wired()
 
 
-def _core_parent() -> Path:
-    """The folder holding the synapse_client to load: the managed client's current
-    version when installed, else the plugin this script is in."""
-    try:
-        managed = managed_root()
-    except Exception:
-        managed = None
-    if managed is not None and (managed / "plugin" / "synapse_client").is_dir():
-        return managed / "plugin"
-    return Path(__file__).resolve().parents[1]
-
-
-def _forget_other_core(parent: str) -> None:
-    """Drop a ``synapse_client`` imported from anywhere but ``parent`` from sys.modules,
-    so the next import reads ``parent``'s. config.py imports the core of the plugin it
-    sits in at start; during `synapse update` that is the client being replaced, and an
-    adapter installed from it would copy the old core. Modules that already hold the old
-    package keep it."""
-    loaded = sys.modules.get("synapse_client")
-    where = getattr(loaded, "__file__", None)
-    if loaded is None or not where:
-        return
-    try:
-        if Path(where).resolve().parents[1] == Path(parent).resolve():
-            return
-    except OSError:
-        pass
-    for name in [
-        n for n in sys.modules if n == "synapse_client" or n.startswith("synapse_client.")
-    ]:
-        del sys.modules[name]
-
-
 def _core_registry() -> list:
-    """The client core's harnesses (``synapse_client.harnesses.registry``); [] when the
-    core cannot be loaded, which is said on stderr."""
-    parent = str(_core_parent())
-    if not sys.path or sys.path[0] != parent:
-        sys.path.insert(0, parent)
-    _forget_other_core(parent)
+    """The client core's harnesses (``synapse_client.harnesses.registry``), from the core
+    beside this script; [] when they cannot be loaded, which is said on stderr."""
     try:
         from synapse_client.harnesses import registry
-    except ImportError:
-        return []  # a client older than the registry
-    try:
+
         return list(registry())
     except Exception as e:
         print(f"synapse: the client core's harnesses could not be loaded: {e}", file=sys.stderr)
