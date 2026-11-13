@@ -671,6 +671,8 @@ def test_board_block_kill_switch(scratch, monkeypatch, capsys, server, value):
     else:
         text = _NOTICE_ENV_SHELL + "\n\n" + _BOARD + "\n\n" + _PREFS_TEXT
         assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+    # The payload names the folder, which only the board is scoped by.
+    assert (sys.stdin.tell() == 0) is (value == "0")
 
 
 def test_preferences_kill_switch(scratch, monkeypatch, capsys, server):

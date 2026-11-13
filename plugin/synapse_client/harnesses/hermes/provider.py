@@ -123,7 +123,7 @@ ACTIVE = "active"
 CRON = "cron"
 INERT = "inert"
 
-#: The session-start requests run side by side and share this budget, in seconds.
+#: How long a session start waits for the board and the preferences, in seconds.
 START_BUDGET = 5.0
 #: Per-request timeouts: a turn upload on Hermes's background worker (which counts a
 #: call past 30 s as stuck and skips the provider's next syncs), and the last uploads

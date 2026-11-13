@@ -121,7 +121,7 @@ still on some machine asks for it.
 
 | Synapse behaviour | Claude Code | Codex | Hermes |
 |---|---|---|---|
-| Board + preferences at session start | `SessionStart` hooks | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
+| Board + preferences at session start (one request) | `SessionStart` hook | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
 | Which sessions | every session | every session | local sessions only (below) |
 | Per-prompt recall nudge + timestamp | `UserPromptSubmit` hook | `UserPromptSubmit` hook | `prefetch()` (returns both; no recall is run) |
 | Upload a finished turn | `Stop` hook reads the session JSONL | `Stop` hook reads the rollout | `sync_turn(messages=...)` |
@@ -317,7 +317,7 @@ like every other harness, so there is no Hermes setup wizard step.
 | Method | Behaviour |
 |---|---|
 | `is_available()` | A URL and a token resolve. No network. |
-| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences side by side within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. No request is made for this here; the first upload makes it. Once per session (`carried.py`). |
+| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences (one request) within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. No request is made for this here; the first upload makes it. Once per session (`carried.py`). |
 | `system_prompt_block()` | The text fetched in `initialize()`, in an active session that the store still says is the owner's. Hermes caches it for the session, stores it with the session and restores it for a continuing one, and asks again after a compression. |
 | `prefetch(query)` | The timestamp line and the recall nudge, in an active session. No request is made. |
 | `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. |
@@ -385,9 +385,10 @@ session-id injection hook (`pre_tool_use.py`) and the skills-sync glue. Its
 `scripts/private_mode.py` is the core's toggle with Codex's settings (plugin 0.24.10).
 
 Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `config.py`
-resolves with `Settings.load` and sends through `Transport`; the board, preferences and
-prompt-nudge hooks print what `context` builds, with Claude Code's enrollment wording
-(`enroll.py`) passed in; the Stop hook uploads through `Transport` and its private check
+resolves with `Settings.load` and sends through `Transport`; the board hook (which prints
+the preferences too) and the prompt-nudge hook print what `context` builds, with Claude
+Code's enrollment wording (`enroll.py`) passed in; the Stop hook uploads through
+`Transport` and its private check
 is `private.is_private`, with `private.check_payload` run again inside the sender
 (`_post_records`), which the catch-up sweep and `synapse-import` share. Claude Code keeps
 its own Stop-hook shipper (byte cursor,
@@ -426,6 +427,11 @@ The core ports the hooks' behaviour and wording, with these differences:
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
 - **Session-start order** is notice, upload warning, board, preferences in every harness.
+  The board and the preferences are one request (`context.server_parts`:
+  `GET /context?parts=board,preferences`) and both are rendered by the server. A piece
+  switched off is not asked for. A server from before the `parts` parameter answers
+  with the board alone; its preferences are then read from `/preferences/top` and
+  rendered by the client, in what is left of the same timeout.
 - **Enrollment notices** take the login hint as an argument, and the restricted-device
   notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
   one, the other harnesses none.

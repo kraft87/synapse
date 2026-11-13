@@ -298,8 +298,8 @@ or Group any more. The reasons, the limits and the Hermes source behind them:
 [docs/client-harnesses.md](../docs/client-harnesses.md).
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
-with this machine's device token. At session start: `GET /context` and
-`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn, not
+with this machine's device token. At session start: one `GET /context` (the board and
+the preferences). Each tool call: one MCP `tools/call`. Each finished turn, not
 one that failed: a `POST /ingest` (format `messages`, client `hermes`) holding the
 session id, the project label and working directory, the model name, and per message its
 role, text, tool-call names and arguments (first 1000 characters), tool results (first

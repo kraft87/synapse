@@ -223,7 +223,8 @@ project included, so an unknown caller serves *nothing* rather than everything.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
-- **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
+- **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**, and the
+  preferences block `/context` returns with the board (the same query): project
   allowlist only. A preference has no tier and its merged text has no per-turn provenance,
   so a new preference is matched only against live preferences with the same readers: for
   every approved restricted device, both projects on its allowlist or both off it

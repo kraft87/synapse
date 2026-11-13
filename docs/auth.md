@@ -135,7 +135,7 @@ Human says nothing means personal; software says nothing means restricted.
 | `fetch(ids)` | `audience='work-safe'` only | same as recall | n/a |
 | `fetch_session` | n/a | same as recall, on the probe and both row reads | n/a |
 | `POST /timeline/recent` | n/a | same as the board | n/a |
-| `GET /preferences/top` | n/a | preferences from allowlisted projects only | n/a |
+| `GET /preferences/top`, and the preferences block of `GET /context` | n/a | preferences from allowlisted projects only | n/a |
 | `/config/*` | n/a | its own mirrored config only; proposals mined only from its own sessions | n/a |
 | `/skills/*`, `skill://` resources | n/a | only `project:<p>` skills for allowlisted projects (any case); no global skill; publish only there; no retire, scope change or review | n/a |
 
