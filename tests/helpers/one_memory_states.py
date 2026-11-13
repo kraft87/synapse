@@ -98,6 +98,10 @@ def to_069(conn, db_url: str, before: str | None) -> None:
     applied, and the stamp as it was ``before`` when that was higher."""
     wipe(conn)
     psql(db_url, SQL_067)
+    # 069 asks for 068. The suite's database had it applied when it was built; a test that
+    # went back to 066 moved only the stamp, and 067 has just brought it to 067.
+    if (stamp(conn) or "") < "068":
+        set_stamp(conn, "068")
     psql(db_url, SQL_069)
     if before is not None and before > (stamp(conn) or ""):
         set_stamp(conn, before)
