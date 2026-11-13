@@ -29,14 +29,16 @@ from synapse_client.private_toggle import Toggle
 PRIVATE_DIR = config.PRIVATE_DIR
 
 
-def _toggle() -> Toggle:
+def _toggle(program: str) -> Toggle:
     # The marker folder the Stop hook reads (ingest_hook._private_settings).
     settings = dataclasses.replace(config.SETTINGS, private_dir=Path(PRIVATE_DIR))
-    return Toggle(Client(settings, config.USER_AGENT), program="private_mode.py")
+    return Toggle(Client(settings, config.USER_AGENT), program=program)
 
 
-def main(argv: list[str]) -> int:
-    return _toggle().main(argv, sys.stdin)
+def main(argv: list[str], program: str = "private_mode.py") -> int:
+    """``program`` is the name this was run under (`synapse private` passes its own), for
+    the lines that name a command to run next."""
+    return _toggle(program).main(argv, sys.stdin)
 
 
 if __name__ == "__main__":

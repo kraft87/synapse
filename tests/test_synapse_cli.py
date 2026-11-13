@@ -1911,13 +1911,18 @@ def test_update_runs_the_servers_installer_then_updates_claude_and_rewires_codex
     assert "Claude Code: plugin updated" in out and "Codex: wired" in out
 
 
-def _installed_client(version: str) -> list[str]:
-    """A managed client at ``version``, as the installer leaves it; returns the command
-    that runs its CLI through the launcher."""
+def _installed_client(version: str, *, rewire: bool = True) -> list[str]:
+    """A managed client calling itself ``version``, as the installer leaves it; returns
+    the command that runs its CLI through the launcher. Without ``rewire`` its CLI is
+    one from before the ``update --rewire`` step."""
     root = _managed_client()
     manifest = root / "plugin" / ".claude-plugin" / "plugin.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+    cli = root / "plugin" / "scripts" / "synapse_cli.py"
+    cli.parent.mkdir(parents=True)
+    step = 'upd.add_argument("--rewire", action="store_true")\n' if rewire else ""
+    cli.write_text(f'upd = sub.add_parser("update")\n{step}', encoding="utf-8")
     runner = Path(os.environ["SYNAPSE_HOME"]).resolve() / "bin" / "synapse_run.py"
     return [sys.executable, str(runner), "plugin/scripts/synapse_cli.py"]
 
@@ -1938,14 +1943,51 @@ def test_update_hands_the_harnesses_to_the_cli_of_the_client_it_installed(cli, c
         [*command, "update", "--rewire"],
     ]
     assert seen["envs"][1]["SYNAPSE_HOME"] == os.environ["SYNAPSE_HOME"]
+    assert seen["envs"][1]["SYNAPSE_UPDATE_HANDED_OVER"] == "1"
     assert cli.wired == [] and capsys.readouterr().out == ""
 
 
-def test_the_new_clis_exit_code_is_the_updates(cli):
+@pytest.mark.parametrize("version", ["0.24.9rc1", "0.24.10a1", "dev", "0.1.0", ""])
+def test_the_step_is_read_from_the_installed_cli_not_from_its_version(cli, version):
+    """A pre-release or hand-labelled build has the step whatever it calls itself, and a
+    version number compared part by part would put `0.24.9rc1` before 0.24.9."""
+    _write_home({"url": _URL})
+    command = _installed_client(version)
+    seen = _fake_update(cli)
+    assert cli.run("update") == 0
+    assert [cmd for cmd, _ in seen["runs"]][1:] == [[*command, "update", "--rewire"]]
+
+
+def test_a_process_started_by_a_hand_over_never_hands_over_again(cli, capsys):
+    """Whatever it concludes about the installed client: a wrong conclusion is then one
+    more installer run, not a chain of processes each waiting on the next."""
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    _installed_client("0.24.8", rewire=False)
+    cli.mp.setenv("SYNAPSE_UPDATE_HANDED_OVER", "1")
+    seen = _fake_update(cli)
+    assert cli.run("update") == 0
+    assert [cmd for cmd, _ in seen["runs"]] == [[sys.executable, "-", _URL]]
+    assert "Claude Code: plugin updated" in capsys.readouterr().out
+
+
+def test_the_new_clis_exit_code_is_the_updates(cli, capsys):
     _write_home({"url": _URL})
     _installed_client("0.25.0")
     _fake_update(cli, rewire_returncode=3)
     assert cli.run("update") == 3
+    assert capsys.readouterr().err == (
+        "synapse: the client was installed, but its harness refresh did not finish "
+        "(exit 3). Run `synapse update` again.\n"
+    )
+
+
+def test_a_hand_over_ended_by_a_signal_is_a_failed_update(cli, capsys):
+    _write_home({"url": _URL})
+    _installed_client("0.25.0")
+    _fake_update(cli, rewire_returncode=-15)
+    assert cli.run("update") == 1
+    assert "did not finish (signal 15). Run `synapse update` again." in capsys.readouterr().err
 
 
 def test_update_rewire_refreshes_the_harnesses_and_fetches_nothing(cli, capsys):
@@ -1973,25 +2015,26 @@ def test_a_client_from_before_the_rewire_step_is_asked_for_a_whole_update(cli, c
     process still builds no harness from its own, newer, code."""
     _write_home({"url": _URL})
     cli.claude_update = "Claude Code: plugin updated"
-    command = _installed_client("0.24.8")
+    command = _installed_client("0.24.8", rewire=False)
     seen = _fake_update(cli, older_returncode=4)
     assert cli.run("update") == 4
     assert [cmd for cmd, _ in seen["runs"]] == [[sys.executable, "-", _URL], [*command, "update"]]
+    assert seen["envs"][1]["SYNAPSE_UPDATE_HANDED_OVER"] == "1"
     assert cli.wired == [] and capsys.readouterr().out == ""
 
 
-@pytest.mark.parametrize("manifest", [None, "{not json", "{}"])
-def test_update_refreshes_from_this_process_when_no_installed_client_can_be_run(
-    cli, capsys, manifest
-):
-    """No launcher, or a current version whose manifest cannot be read: nothing to hand
-    over to, so the harnesses are refreshed by the client this process runs."""
+@pytest.mark.parametrize("left", ["no client", "no cli", "unreadable cli"])
+def test_update_refreshes_from_this_process_when_no_installed_client_can_be_run(cli, capsys, left):
+    """No launcher, or a current version whose CLI is missing or cannot be read: nothing
+    to hand over to, so the harnesses are refreshed by the client this process runs."""
     _write_home({"url": _URL})
     cli.claude_update = "Claude Code: plugin updated"
-    if manifest is not None:
+    if left != "no client":
         _installed_client("0.24.9")
-        root = Path(os.environ["SYNAPSE_HOME"]) / "lib" / "0.19.6"
-        (root / "plugin" / ".claude-plugin" / "plugin.json").write_text(manifest)
+        installed = Path(os.environ["SYNAPSE_HOME"]) / "lib" / "0.19.6" / "plugin" / "scripts"
+        (installed / "synapse_cli.py").unlink()
+        if left == "unreadable cli":
+            (installed / "synapse_cli.py").write_bytes(b"\xff\xfe not utf-8 --rewire")
     seen = _fake_update(cli)
     assert cli.run("update") == 0
     assert [cmd for cmd, _ in seen["runs"]] == [[sys.executable, "-", _URL]]
@@ -2083,17 +2126,24 @@ def test_a_codex_rewire_failure_after_an_update_is_reported_not_fatal(cli, capsy
 
 
 @pytest.mark.parametrize(
-    ("command", "module"),
-    [("devices", "device_admin"), ("private", "private_mode"), ("import", "import_history")],
+    ("command", "module", "named"),
+    [
+        ("devices", "device_admin", {}),
+        # The toggle names a command to run next: it is told the one the user typed.
+        ("private", "private_mode", {"program": "synapse private"}),
+        ("import", "import_history", {}),
+    ],
 )
-def test_passthrough_commands_hand_their_arguments_to_the_tool(cli, monkeypatch, command, module):
-    calls: list[list[str]] = []
+def test_passthrough_commands_hand_their_arguments_to_the_tool(
+    cli, monkeypatch, command, module, named
+):
+    calls: list[tuple[list[str], dict]] = []
     fake = types.ModuleType(module)
-    fake.main = lambda argv: calls.append(argv)
+    fake.main = lambda argv, **kwargs: calls.append((argv, kwargs))
     monkeypatch.setitem(sys.modules, module, fake)
 
     assert cli.run(command, "list", "--json") == 0
-    assert calls == [["list", "--json"]]
+    assert calls == [(["list", "--json"], named)]
 
 
 def test_a_passthrough_tools_exit_code_is_the_commands(cli, monkeypatch):

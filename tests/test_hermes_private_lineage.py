@@ -1,0 +1,420 @@
+"""A session that holds a private session's turns is private too, whichever agent runs it.
+
+Private mode is kept per session id, and Hermes gives a conversation a new one when it
+is branched, or compressed with rotation on. The provider learns of the new id in two
+ways: the agent is moved to it (``on_session_switch``, tests/test_hermes_provider.py),
+or Hermes builds a new agent for it, as the TUI and Desktop do for every branch
+(tui_gateway/methods_session_branch.py ``_branch_live``: the child's row is written,
+then the agent is built) and the gateway daemon does after a restart. These are the
+tests of the second way: what the session store says a session holds turns of
+(lineage.continues), and what ``initialize`` does with it.
+
+The fixtures are the provider tests' own: the plugin as Hermes loads it, a fake server
+that keeps the rows of the private-session routes, a ``state.db`` with the columns the
+rule reads.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests import test_hermes_gateway_sessions as gs
+from tests import test_hermes_privacy_audiences as pa
+from tests.helpers.client_core import use_core
+
+use_core()
+from synapse_client.harnesses.hermes import carried  # noqa: E402
+from synapse_client.harnesses.hermes import lineage as hl  # noqa: E402
+from synapse_client.outbox import Outbox  # noqa: E402
+
+hs = gs.hs
+hermes_stub = gs.hermes_stub
+user = gs.user
+plugin = gs.plugin
+server = gs.server
+_process_env = pa._process_env
+_new = gs._new
+_conversation = gs._conversation
+_users = gs._users
+_store = gs._store
+
+pytestmark = gs.pytestmark
+
+_GRAND = "20261111_090000_0a0a0a"
+_PARENT = "20261112_101500_ab12cd"
+_CHILD = "20261112_120000_ffffff"
+_BRANCHED = {"_branched_from": _PARENT}
+
+
+# ---------------------------------------------------------------------------
+# What the store says
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("parent", "model_config", "expected"),
+    [
+        (None, None, None),  # a first session
+        ("", {"max_iterations": 90}, None),
+        ("p", None, "p"),  # an in-process compression writes the link alone
+        ("p", {"_compressed_from": "p"}, "p"),
+        ("p", {"_branched_from": "p"}, "p"),  # a copy of p's turns
+        ("p", {"_reset_from": "p"}, None),  # /new: another conversation
+        ("p", {"_delegate_from": "p"}, None),  # a subagent
+        # A continuation inherits its parent's model_config whole: these keys speak of
+        # a session further up, and the row goes on from p.
+        ("p", {"_reset_from": "g"}, "p"),
+        ("p", {"_branched_from": "g"}, "p"),
+        ("p", {"_delegate_from": "g", "_compressed_from": "p"}, "p"),
+        ("p", "not json", "p"),
+        ("p", "[1, 2]", "p"),
+        # The parent was deleted, and Hermes cleared the link: the copy is still there.
+        (None, {"_branched_from": "p"}, "p"),
+        (None, {"_compressed_from": "p"}, "p"),
+        (None, {"_compressed_from": "c", "_branched_from": "b"}, "c"),
+        (None, {"_reset_from": "p"}, None),
+        (None, {"_branched_from": 7}, None),
+        (None, "not json", None),
+        (7, {"_branched_from": "p"}, "p"),
+    ],
+)
+def test_the_session_whose_turns_a_row_holds(parent, model_config, expected):
+    config = json.dumps(model_config) if isinstance(model_config, dict) else model_config
+    assert hl.continues(parent, config) == expected
+
+
+def _child(
+    home: Path,
+    model_config: dict[str, Any] | None = _BRANCHED,
+    *,
+    parent: str = _PARENT,
+    child: str = _CHILD,
+) -> None:
+    """Two rows of the in-process TUI: ``parent``, and ``child`` linked to it."""
+    for sid in (parent, child):
+        _store(home, sid, source="tui", receipt=False, chat_id="")
+    _link(home, child, parent, model_config)
+
+
+def _link(home: Path, child: str, parent: str, model_config: dict[str, Any] | None) -> None:
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        conn.execute(
+            "UPDATE sessions SET parent_session_id=?, model_config=? WHERE id=?",
+            (parent, json.dumps(model_config) if model_config is not None else None, child),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_the_verdict_names_the_session_a_branch_holds_turns_of(tmp_path):
+    _child(tmp_path)
+    assert hs.check_session(tmp_path, _CHILD, gs._in_process()) == hs.Verdict(
+        hs.ACTIVE, continues=(_PARENT,)
+    )
+    assert hs.check_session(tmp_path, _PARENT, gs._in_process()) == hs.Verdict(hs.ACTIVE)
+    assert hs.recheck(tmp_path, _CHILD).continues == (_PARENT,)
+    _child(tmp_path, {"_reset_from": _PARENT})
+    assert hs.check_session(tmp_path, _CHILD, gs._in_process()) == hs.Verdict(hs.ACTIVE)
+
+
+def _three(home: Path, model_config: dict[str, Any] | None = None) -> None:
+    """``_CHILD`` branched from ``_PARENT``, which came from ``_GRAND`` (a branch of it,
+    unless ``model_config`` says otherwise)."""
+    _child(home)
+    _child(home, model_config or {"_branched_from": _GRAND}, parent=_GRAND, child=_PARENT)
+
+
+def test_the_verdict_names_every_session_up_the_chain_of_copies(tmp_path):
+    """A branch of a branch holds the turns of both."""
+    _three(tmp_path)
+    verdict = hs.check_session(tmp_path, _CHILD, gs._in_process())
+    assert verdict.continues == (_PARENT, _GRAND)
+
+
+def test_the_chain_ends_at_a_session_that_holds_none_of_its_parents_turns(tmp_path):
+    _three(tmp_path, {"_reset_from": _GRAND})
+    assert hs.check_session(tmp_path, _CHILD, gs._in_process()).continues == (_PARENT,)
+
+
+def test_rows_that_name_each_other_are_read_once(tmp_path):
+    _child(tmp_path)
+    _link(tmp_path, _PARENT, _CHILD, {"_branched_from": _CHILD})
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        assert hl.chain(conn, _PARENT, json.dumps(_BRANCHED)) == (_PARENT, _CHILD)
+    finally:
+        conn.close()
+
+
+def test_the_verdict_of_a_gateway_branch_names_its_parent_and_keeps_its_cwd(tmp_path):
+    _store(tmp_path)
+    pa._branch(tmp_path)
+    verdict = hs.check_session(tmp_path, pa._BRANCH, gs._gateway(pa._BRANCH))
+    assert (verdict.mode, verdict.continues, verdict.cwd) == (hs.ACTIVE, (gs._LOCAL,), gs._WORK)
+
+
+def test_a_session_that_is_off_names_none(tmp_path):
+    _child(tmp_path)
+    gs._retitle(tmp_path, _CHILD, "Bot Chat")
+    verdict = hs.check_session(tmp_path, _CHILD, gs._in_process())
+    assert verdict.mode == hs.INERT and verdict.continues == ()
+
+
+# ---------------------------------------------------------------------------
+# The record of what was settled
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_is_settled_once_it_is_recorded(tmp_path):
+    assert not carried.settled(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD)
+    assert carried.settled(tmp_path, _CHILD) and not carried.settled(tmp_path, _PARENT)
+    (record,) = (tmp_path / "synapse" / "settled").iterdir()
+    assert len(record.name) == 64 and record.read_bytes() == b""
+    assert record.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_chain_is_asked_about_as_far_as_its_first_settled_session(tmp_path):
+    chain = (_PARENT, _GRAND, "20261110_080000_0b0b0b")
+    assert carried.to_ask(tmp_path, chain) == list(chain)
+    carried.settle(tmp_path, _GRAND)
+    assert carried.to_ask(tmp_path, chain) == [_PARENT, _GRAND]
+    carried.settle(tmp_path, _PARENT)
+    assert carried.to_ask(tmp_path, chain) == [_PARENT]
+    assert carried.to_ask(tmp_path, ()) == [] and carried.to_ask(None, chain) == list(chain)
+
+
+@pytest.mark.parametrize("home", [None, ""])
+def test_without_a_home_nothing_is_settled(home):
+    carried.settle(home, _CHILD)
+    assert not carried.settled(home, _CHILD)
+
+
+def test_a_record_that_cannot_be_kept_leaves_the_session_unsettled(tmp_path):
+    (tmp_path / "synapse").write_text("a file where the folder goes", encoding="utf-8")
+    carried.settle(tmp_path, _CHILD)
+    assert not carried.settled(tmp_path, _CHILD)
+    carried.settle(tmp_path, "")
+    assert not carried.settled(tmp_path, "")
+
+
+# ---------------------------------------------------------------------------
+# A new agent for a session that holds another's turns
+# ---------------------------------------------------------------------------
+
+
+def _open(plugin: Any, home: Path, sid: str = _CHILD, **kwargs: Any) -> Any:
+    """A new agent for ``sid``, as the stdio TUI builds one."""
+    provider = _new(plugin)
+    provider.initialize(sid, hermes_home=str(home), **gs._in_process(**kwargs))
+    return provider
+
+
+def _marker(tmp_path: Path, session_id: str) -> Path:
+    marker = tmp_path / "private" / session_id
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    return marker
+
+
+def test_a_branch_of_a_private_session_is_private_from_its_first_turn(plugin, server, tmp_path):
+    """The TUI builds a new agent for a branch, with the parent's turns copied into it:
+    no ``on_session_switch`` says where it came from, only its row."""
+    home = tmp_path / "hermes-a"
+    _child(home)
+    _marker(tmp_path, _PARENT)
+    provider = _open(plugin, home, resumed=True, message_count=6)
+    assert (tmp_path / "private" / _CHILD).is_file()
+    assert server.puts() == [] and server.asked() == []  # binding a session asks nothing
+    assert not carried.settled(home, _CHILD)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    provider.on_session_end(_conversation(4))
+    assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
+    assert carried.settled(home, _CHILD)
+
+
+def test_a_branch_put_back_on_the_record_does_not_send_the_turns_it_started_with(
+    plugin, server, tmp_path
+):
+    """`private off --forget` on the branch while its agent lives. The turns it was made
+    with are the parent's, which is still private: they are not looked back at."""
+    home = tmp_path / "hermes-a"
+    _child(home)
+    _marker(tmp_path, _PARENT)
+    provider = _open(plugin, home, resumed=True)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
+
+    (tmp_path / "private" / _CHILD).unlink()
+    server.private_rows.discard(_CHILD)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    sent = {text for body in server.posts() for text in _users(body["records"])}
+    assert "question 5" in sent
+    assert not sent & {"question 1", "question 2", "question 3"}
+
+
+@pytest.mark.parametrize("resumed", [True, False])
+def test_a_branch_of_a_session_the_server_holds_private_is_private(
+    plugin, server, tmp_path, resumed
+):
+    """`private off` removed the parent's marker, or its twelve hours passed. The row on
+    the server still drops the parent's turns, and the branch holds copies of them."""
+    home = tmp_path / "hermes-a"
+    _child(home)
+    server.private_rows.add(_PARENT)
+    provider = _open(plugin, home, resumed=resumed)
+    assert not (tmp_path / "private" / _CHILD).exists() and server.asked() == []
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    assert server.asked() == [_PARENT] and server.puts() == [f"/private-sessions/{_CHILD}"]
+    assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(4))
+    assert server.posts() == [] and server.asked() == [_PARENT]
+
+    # `private off --forget` on the branch holds: the next agent does not ask again.
+    (tmp_path / "private" / _CHILD).unlink()
+    server.private_rows.discard(_CHILD)
+    again = _open(plugin, home, resumed=True)
+    again.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(5))
+    assert server.asked() == [_PARENT] and len(server.puts()) == 1
+    assert {body["session_id"] for body in server.posts()} == {_CHILD}
+
+
+def test_a_branch_of_a_branch_is_private_with_the_session_at_the_top(plugin, server, tmp_path):
+    """The session in between was carried while the server could not be reached and
+    never got its row, and its marker has gone: its own answer is not enough to go by."""
+    home = tmp_path / "hermes-a"
+    _three(home)
+    server.private_rows.add(_GRAND)
+    provider = _open(plugin, home, resumed=True)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    assert server.asked() == [_PARENT, _GRAND]
+    assert server.posts() == [] and server.puts() == [f"/private-sessions/{_CHILD}"]
+
+
+def test_a_settled_session_answers_for_the_ones_above_it(plugin, server, tmp_path):
+    """The branch in between was made before the first session went private, and was
+    asked about then: its branch is on the record as it is."""
+    home = tmp_path / "hermes-a"
+    _three(home)
+    carried.settle(home, _PARENT)
+    server.private_rows.add(_GRAND)
+    provider = _open(plugin, home)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    assert server.asked() == [_PARENT] and server.puts() == []
+    assert {body["session_id"] for body in server.posts()} == {_CHILD}
+
+
+def test_a_branch_made_before_its_parent_went_private_stays_on_the_record(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _child(home)
+    provider = _open(plugin, home)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    (first,) = server.posts()
+    assert first["session_id"] == _CHILD and server.asked() == [_PARENT]
+    assert _users(first["records"]) == ["question 1", "question 2"]
+    assert carried.settled(home, _CHILD) and server.puts() == []
+
+    _marker(tmp_path, _PARENT)
+    server.private_rows.add(_PARENT)
+    later = _open(plugin, home, resumed=True)
+    assert not (tmp_path / "private" / _CHILD).exists()
+    later.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(3))
+    assert len(server.posts()) == 2 and server.asked() == [_PARENT] and server.puts() == []
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [{"_reset_from": _PARENT}, {"_delegate_from": _PARENT}],
+)
+def test_another_conversation_is_not_private_because_the_one_before_was(
+    plugin, server, tmp_path, model_config
+):
+    home = tmp_path / "hermes-a"
+    _child(home, model_config)
+    _marker(tmp_path, _PARENT)
+    server.private_rows.add(_PARENT)
+    provider = _open(plugin, home)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(1))
+    (body,) = server.posts()
+    assert body["session_id"] == _CHILD and server.asked() == [] and server.puts() == []
+    assert not (tmp_path / "private" / _CHILD).exists()
+
+
+@pytest.mark.parametrize("model_config", [None, {"_compressed_from": _PARENT}])
+def test_a_compressed_continuation_is_private_with_the_session_it_goes_on_from(
+    plugin, server, tmp_path, model_config
+):
+    """The daemon restarted, or dropped the agent, after a compression moved the
+    conversation to a new id: the next agent is built for that id."""
+    home = tmp_path / "hermes-a"
+    _child(home, model_config)
+    server.private_rows.add(_PARENT)
+    provider = _open(plugin, home, resumed=True)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
+
+
+def test_while_the_server_does_not_answer_nothing_leaves_and_the_next_agent_asks_again(
+    plugin, server, tmp_path
+):
+    home = tmp_path / "hermes-a"
+    _child(home)
+    server.private_rows.add(_PARENT)
+    server.private_status = 503
+    provider = _open(plugin, home, resumed=True)
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(1))
+    provider.on_session_end(_conversation(1))
+    assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
+    assert not carried.settled(home, _CHILD) and len(server.asked()) >= 2
+
+    server.private_status = 200
+    asked = len(server.asked())
+    again = _open(plugin, home, resumed=True)
+    again.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(2))
+    assert len(server.asked()) == asked + 1 and server.posts() == []
+    assert (tmp_path / "private" / _CHILD).is_file() and carried.settled(home, _CHILD)
+
+
+def test_turns_finished_while_the_server_did_not_answer_go_up_when_it_does(
+    plugin, server, tmp_path
+):
+    home = tmp_path / "hermes-a"
+    _child(home)
+    server.private_status = 503
+    provider = _open(plugin, home, resumed=True)
+    for count in (12, 13, 14):
+        provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(count))
+    assert server.posts() == []
+    server.private_status = 200
+    provider.sync_turn("q", "a", session_id=_CHILD, messages=_conversation(15))
+    sent = {user for body in server.posts() for user in _users(body["records"])}
+    # Ten back from the first turn held (12), and every turn since; 2 is 3's context.
+    assert sent == {f"question {n}" for n in range(2, 16)}
+
+
+def test_a_gateway_branch_of_a_private_session_is_private(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _store(home)
+    pa._branch(home)
+    _marker(tmp_path, gs._LOCAL)
+    provider = gs._start_gateway(_new(plugin), home, pa._BRANCH, resumed=True)
+    assert (tmp_path / "private" / pa._BRANCH).is_file()
+    provider.sync_turn("q", "a", session_id=pa._BRANCH, messages=_conversation(2))
+    assert server.posts() == [] and server.puts() == [f"/private-sessions/{pa._BRANCH}"]
+
+
+def test_a_session_that_is_off_is_not_carried(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _child(home)
+    _marker(tmp_path, _PARENT)
+    _open(plugin, home, agent_context="subagent")
+    assert not (tmp_path / "private" / _CHILD).exists() and server.puts() == []

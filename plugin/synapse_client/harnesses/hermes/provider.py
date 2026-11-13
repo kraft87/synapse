@@ -64,6 +64,16 @@ server dedups on span id, so a restart that re-sends a turn costs a request, not
 duplicate. A private session sends nothing and remembers nothing, as the Claude Code
 hook does: the core's uploader checks, here and again when the outbox drains.
 
+Private mode is kept per session id, and a conversation gets a new one when it is
+branched, or compressed with rotation on. The new session holds turns of the one it came
+from, so it is off the record when that one is (upload.Uploader.carry_private): by that
+one's marker, or, with no marker, by what the server answers when asked at the session's
+first upload, until when nothing is uploaded for it. That is settled where the agent
+moves to the new id (``on_session_switch``) and where Hermes builds a new agent for it
+(``initialize``, from the session store: the TUI and Desktop build one for every
+branch), and once per session (carried.py). ``/new`` and ``/resume`` open another
+conversation, and nothing is carried to it.
+
 Compression
 -----------
 Recall leaves out the session's own turns, which the model still holds. When Hermes
@@ -104,6 +114,7 @@ from ...api import Client
 from ...outbox import Outbox, failure_warning
 from ...settings import Settings
 from ...upload import TurnUploader, Uploader
+from . import carried
 from . import messages as hm
 from . import sessions as hs
 
@@ -246,6 +257,9 @@ class SynapseMemoryProvider(MemoryProvider):
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
         lookback = LOOKBACK if kwargs.get("resumed") else None
+        earlier = carried.to_ask(home, verdict.continues)
+        if mode == ACTIVE and self._carry(uploader, home, earlier, session_id, None):
+            lookback = 0  # turns spoken off the record are not looked back at
         turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=lookback)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
@@ -295,6 +309,23 @@ class SynapseMemoryProvider(MemoryProvider):
                 board,
                 prefs,
             )
+        )
+
+    @staticmethod
+    def _carry(
+        uploader: Uploader, home: Any, earlier: list[Any], session_id: Any, timeout: float | None
+    ) -> bool:
+        """Whether ``session_id`` is off the record because a session of ``earlier``,
+        whose turns it holds, is (Uploader.carry_private). With no marker to say so the
+        server is asked at the session's first upload, and the answer is False for now.
+        Once per session of the home (carried.py); ``timeout`` None leaves telling the
+        server to that upload too, so that binding a session makes no request for this."""
+        sid = str(session_id or "")
+        ids = [str(one) for one in earlier if one]
+        if not sid or not ids or carried.settled(home, sid):
+            return False
+        return uploader.carry_private(
+            ids, sid, timeout=timeout, settled=lambda: carried.settle(home, sid)
         )
 
     def system_prompt_block(self) -> str:
@@ -387,7 +418,7 @@ class SynapseMemoryProvider(MemoryProvider):
                 goes_on
                 and kwargs.get("reason") != "resume"
                 and uploader is not None
-                and uploader.carry_private([old, str(parent_session_id or "")], new)
+                and self._carry(uploader, self._home, [old, parent_session_id], new, 5)
             )
             with self._lock:
                 if reset or goes_on:
