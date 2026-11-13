@@ -77,12 +77,14 @@ changed, what to do on each machine, what was proven, and what is still open.
 
 **Proven**
 
-- 153 new tests in six new files: `test_hermes_gateway_sessions.py` (the rule, over a
-  `state.db` built like Hermes's), `test_hermes_failed_turns.py`,
-  `test_hermes_inflight_upload.py` (a child process killed mid-request, sessions
-  sharing an outbox), `test_client_core_outbox_writeahead.py`,
+- New tests in seven new files: `test_hermes_gateway_sessions.py` (the rule, over a
+  `state.db` built like Hermes's), `test_hermes_privacy_audiences.py` (45: each
+  audience above, its shape built from what Hermes writes and cited),
+  `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` (a child process
+  killed mid-request, sessions sharing an outbox), `test_client_core_outbox_writeahead.py`,
   `test_client_core_outbox_private_dirs.py`, `test_hermes_install_selection.py`.
-  - Full suite: 3937 passed, 34 skipped, 2 xfailed.
+  - Non-db suite: 4141 passed, 36 skipped, 2 xfailed, and the four
+    `test_hermes_provider.py` failures listed under Open.
   - With `SYNAPSE_HERMES_CHECKOUT`, the integration test and
     `test_hermes_checkout_names.py` pass against Hermes `bca51750`. Ruff is clean.
 - Real `hermes chat` (Hermes `bca51750`, a scripted stub model, the production server):
@@ -101,6 +103,15 @@ changed, what to do on each machine, what was proven, and what is still open.
   - Sessions started with `--source tool` stayed inert: no board, no nudge, no upload,
     the reason logged. The model's `recall` there got the local-only JSON error and
     nothing reached the server.
+- After the privacy fixes, three more turns (tests 11 to 13):
+  - An ordinary `hermes chat` stays active: board and preferences in the system prompt,
+    the nudge on the message, `recall` returned real results, one row uploaded (245709).
+    (Test 11, before the turn-author fix, showed the daemon names the owner as author on
+    every turn: the session went off and uploaded nothing.)
+  - A session created over the control channel with `follow_profile_config` (Hermes's
+    own client, no title, the owner's receipt) stayed inert: no board, no nudge,
+    `recall` got the local-only error, nothing uploaded, reason "a chat that follows
+    its profile".
 
 **Open**
 
