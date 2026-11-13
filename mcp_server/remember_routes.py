@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -61,6 +63,16 @@ class _SchemaMissing(Exception):
     """schema/052 not applied on this deployment — reported as 503, never as success."""
 
 
+@dataclass(frozen=True, slots=True)
+class _IntentRow:
+    """What an already-claimed intent recorded, as the route reports it."""
+
+    status: str
+    note_id: int | None
+    episode_id: int | None
+    outcome: str | None
+
+
 def _claim(db_url: str, intent_id: str, hook: str | None) -> dict[str, Any] | None:
     """Reserve ``intent_id``. Returns None when this caller won the claim (proceed with the
     write), or the existing row when someone already claimed it (see the module docstring)."""
@@ -73,18 +85,18 @@ def _claim(db_url: str, intent_id: str, hook: str | None) -> dict[str, Any] | No
             ).fetchone()
             if row is not None:
                 return None
-            prior = conn.execute(
-                "SELECT status, note_id, episode_id, outcome FROM remember_intents WHERE intent_id = %s",
-                (intent_id,),
-            ).fetchone()
+            prior = (
+                conn.cursor(row_factory=class_row(_IntentRow))
+                .execute(
+                    "SELECT status, note_id, episode_id, outcome FROM remember_intents "
+                    "WHERE intent_id = %s",
+                    (intent_id,),
+                )
+                .fetchone()
+            )
             if prior is None:  # raced with a delete — treat as ours
                 return None
-            return {
-                "status": prior[0],
-                "note_id": prior[1],
-                "episode_id": prior[2],
-                "outcome": prior[3],
-            }
+            return asdict(prior)
         except psycopg.errors.UndefinedTable as e:
             raise _SchemaMissing from e
 

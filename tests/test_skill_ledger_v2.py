@@ -11,6 +11,7 @@ from __future__ import annotations
 from dream.skills.skill_ledger import (
     EVIDENCE_CAP,
     PROPOSE_SCORE,
+    _DeriveMatchRow,
     _passes_gate,
     _recurrence,
     _rollup,
@@ -190,13 +191,18 @@ def test_legacy_score_gate_still_applies_to_all_kinds():
 
 # --------------------------------------------------------- derive identity resolution
 class _FakeCur:
-    """Minimal cursor: _resolve_id only calls execute() + fetchall() on the derive path."""
+    """Minimal cursor: on the derive path _resolve_id asks its connection for a typed cursor,
+    then calls execute() + fetchall() on it (the fake is its own connection and typed cursor)."""
 
     def __init__(self, rows):
         self._rows = rows
+        self.connection = self
+
+    def cursor(self, **kw):
+        return self
 
     def execute(self, *args):
-        pass
+        return self
 
     def fetchall(self):
         return self._rows
@@ -204,7 +210,7 @@ class _FakeCur:
 
 def _row(cid, session, sigkey, cooling=False):
     ev = [{"session_id": session, "class": "judge", "signal": "gap_scan"}]
-    return (cid, ev, sigkey, cooling)
+    return _DeriveMatchRow(cid, ev, sigkey, cooling)
 
 
 def test_a_cooling_rejected_derive_reports_its_cooldown():

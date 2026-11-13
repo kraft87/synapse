@@ -27,10 +27,16 @@ _PRE_066 = "source_projects IS NOT NULL AND cardinality(source_projects) > 0 AND
 
 
 class _Recorder:
-    """Records every statement with its parameters; answers with no rows."""
+    """Records every statement with its parameters; answers with no rows.
+
+    It stands in for the connection too: every cursor asked of it is itself.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
+
+    def cursor(self, **_kw: Any) -> _Recorder:
+        return self
 
     def execute(self, sql: str, params: Any = None) -> _Recorder:
         self.calls.append((sql, params))

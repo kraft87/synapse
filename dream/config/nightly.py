@@ -36,9 +36,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from psycopg.types.json import Json
 
 from dream.config import identity_ready
@@ -213,19 +217,36 @@ SELECT id, summary, evidence, status, reject_reason,
  WHERE file_key = %s AND embedding IS NOT NULL"""
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateRow:
+    """One stored proposal of the learned file, with its cosine to the new correction."""
+
+    id: int
+    summary: str
+    evidence: list[dict[str, Any]]
+    status: str
+    reject_reason: str | None
+    age_days: Decimal
+    cos: float | None
+
+
 def _candidate_rows(cur, vec: list[float]) -> list[dict]:
-    cur.execute(_CANDIDATES, (L.vec_literal(vec), LEARNED_FILE))
+    rows = (
+        cur.connection.cursor(row_factory=class_row(_CandidateRow))
+        .execute(_CANDIDATES, (L.vec_literal(vec), LEARNED_FILE))
+        .fetchall()
+    )
     return [
         {
-            "id": r[0],
-            "summary": r[1],
-            "evidence": r[2] or [],
-            "status": r[3],
-            "reject_reason": r[4],
-            "age_days": float(r[5] or 0),
-            "cos": float(r[6]) if r[6] is not None else None,
+            "id": r.id,
+            "summary": r.summary,
+            "evidence": r.evidence or [],
+            "status": r.status,
+            "reject_reason": r.reject_reason,
+            "age_days": float(r.age_days or 0),
+            "cos": float(r.cos) if r.cos is not None else None,
         }
-        for r in cur.fetchall()
+        for r in rows
     ]
 
 
@@ -275,39 +296,62 @@ def _upsert_correction(cur, c: dict) -> tuple[int, str, int]:
     return cur.fetchone()[0], "observe", 1
 
 
+@dataclass(frozen=True, slots=True)
+class _UnanchoredRow:
+    """One proposal that has no embedding anchor yet."""
+
+    id: int
+    summary: str
+
+
 def ensure_embeddings(conn) -> int:
     """Embed the rows that have no anchor yet (everything written before schema 065, or by an
     older image) and store it; returns how many. One batch call."""
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, summary FROM config_lane.config_proposals "
-        "WHERE embedding IS NULL AND summary <> '' ORDER BY id"
+    rows = (
+        conn.cursor(row_factory=class_row(_UnanchoredRow))
+        .execute(
+            "SELECT id, summary FROM config_lane.config_proposals "
+            "WHERE embedding IS NULL AND summary <> '' ORDER BY id"
+        )
+        .fetchall()
     )
-    rows = cur.fetchall()
     if not rows:
         return 0
-    vecs = embed([r[1] for r in rows])
+    vecs = embed([r.summary for r in rows])
     if len(vecs) != len(rows):
         raise RuntimeError(f"embedder returned {len(vecs)} vectors for {len(rows)} rules")
-    for (rid, _), v in zip(rows, vecs, strict=True):
+    for r, v in zip(rows, vecs, strict=True):
         cur.execute(
             "UPDATE config_lane.config_proposals SET embedding=%s::halfvec WHERE id=%s",
-            (L.vec_literal(v), rid),
+            (L.vec_literal(v), r.id),
         )
     conn.commit()
     return len(rows)
 
 
 # --------------------------------------------------------------------------- coverage
+@dataclass(frozen=True, slots=True)
+class _RegistryFileRow:
+    """One distinct global rule file of the user's config registry."""
+
+    file_key: str
+    content: str
+
+
 def registry_digest(cur) -> tuple[str, str]:
     """(text, hash) of the user's own global rule files: config_registry rows with scope
     'global', one copy of each distinct content (every machine mirrors its own copy), capped
     at REGISTRY_CHARS. ('', '') when there are none."""
-    cur.execute(
-        "SELECT DISTINCT ON (content_hash) file_key, content FROM config_lane.config_registry "
-        "WHERE scope = 'global' AND content <> '' ORDER BY content_hash, surface_id, file_key"
+    rows = (
+        cur.connection.cursor(row_factory=class_row(_RegistryFileRow))
+        .execute(
+            "SELECT DISTINCT ON (content_hash) file_key, content FROM config_lane.config_registry "
+            "WHERE scope = 'global' AND content <> '' ORDER BY content_hash, surface_id, file_key"
+        )
+        .fetchall()
     )
-    files = sorted((r[0], r[1]) for r in cur.fetchall())
+    files = sorted((r.file_key, r.content) for r in rows)
     text = "\n\n".join(f"### {k}\n{v.strip()}" for k, v in files)[:REGISTRY_CHARS]
     return text, (hashlib.sha1(text.encode()).hexdigest()[:16] if text else "")
 
@@ -333,6 +377,18 @@ def coverage_check(rule: str, digest: str, registry_hash: str) -> dict | None:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _GateRow:
+    """One observe or proposed row of the learned file, as the gate reads it."""
+
+    id: int
+    summary: str
+    evidence: list[dict[str, Any]]
+    status: str
+    coverage: dict[str, Any] | None
+    recommendation: dict[str, Any] | None
+
+
 def regate(conn, cap: int = COVERAGE_CAP) -> dict:
     """The observe->proposed gate, run once per night after the scan: every observe row with
     PROPOSE_SESSIONS distinct sessions is checked against the user's rule files (one judge
@@ -343,48 +399,59 @@ def regate(conn, cap: int = COVERAGE_CAP) -> dict:
     with brief items (id, summary, evidence, recommendation, covered_by)."""
     cur = conn.cursor()
     digest, rhash = registry_digest(cur)
-    cur.execute(
-        "SELECT id, summary, evidence, status, coverage, recommendation "
-        "FROM config_lane.config_proposals WHERE file_key=%s AND status IN ('observe','proposed') "
-        "ORDER BY (status = 'observe') DESC, id",
-        (LEARNED_FILE,),
+    rows = (
+        conn.cursor(row_factory=class_row(_GateRow))
+        .execute(
+            "SELECT id, summary, evidence, status, coverage, recommendation "
+            "FROM config_lane.config_proposals "
+            "WHERE file_key=%s AND status IN ('observe','proposed') "
+            "ORDER BY (status = 'observe') DESC, id",
+            (LEARNED_FILE,),
+        )
+        .fetchall()
     )
     todo = []
-    for rid, summary, ev, status, cov, rec in cur.fetchall():
-        ev = ev or []
-        if status == "observe" and _distinct_sessions(ev) >= PROPOSE_SESSIONS:
-            todo.append((rid, summary, ev, status, cov, rec))
-        elif status == "proposed" and (
-            not isinstance(cov, dict) or cov.get("registry_hash") != rhash
+    for r in rows:
+        if r.status == "observe" and _distinct_sessions(r.evidence or []) >= PROPOSE_SESSIONS:
+            todo.append(r)
+        elif r.status == "proposed" and (
+            not isinstance(r.coverage, dict) or r.coverage.get("registry_hash") != rhash
         ):
-            todo.append((rid, summary, ev, status, cov, rec))
+            todo.append(r)
     out = {"proposed": [], "covered": [], "failed": 0, "deferred": max(0, len(todo) - cap)}
-    for rid, summary, ev, status, cov, rec in todo[:cap]:
+    for r in todo[:cap]:
+        cov = r.coverage
+        ev = r.evidence or []
         same = isinstance(cov, dict) and cov.get("registry_hash") == rhash
         verdict = cov if same and isinstance(cov.get("covered"), bool) else None
-        verdict = verdict or coverage_check(summary, digest, rhash)
+        verdict = verdict or coverage_check(r.summary, digest, rhash)
         if verdict is None:
             out["failed"] += 1
             continue
-        item = {"id": rid, "summary": summary, "evidence": ev, "recommendation": rec}
+        item = {
+            "id": r.id,
+            "summary": r.summary,
+            "evidence": ev,
+            "recommendation": r.recommendation,
+        }
         if verdict["covered"]:
             cur.execute(
                 "UPDATE config_lane.config_proposals SET status='rejected', reject_reason=%s, "
                 "coverage=%s, updated_at=now() WHERE id=%s",
-                (COVERED, Json(verdict), rid),
+                (COVERED, Json(verdict), r.id),
             )
             out["covered"].append({**item, "covered_by": verdict.get("by") or ""})
-        elif status == "observe":
+        elif r.status == "observe":
             cur.execute(
                 "UPDATE config_lane.config_proposals SET status='proposed', proposed_at=now(), "
                 "coverage=%s, updated_at=now() WHERE id=%s",
-                (Json(verdict), rid),
+                (Json(verdict), r.id),
             )
             out["proposed"].append(item)
         else:  # a proposed row, still not covered: remember what it was checked against
             cur.execute(
                 "UPDATE config_lane.config_proposals SET coverage=%s WHERE id=%s",
-                (Json(verdict), rid),
+                (Json(verdict), r.id),
             )
     conn.commit()
     return out

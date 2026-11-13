@@ -84,7 +84,7 @@ graph TD
 | MCP server | **standalone `fastmcp` 3.4.2**, HTTP (stateless), port 8765 | `/mcp` (tools + `skill://` resources), `/ingest` + `/recall` custom routes; **MultiAuth** (machine bearer + GitHub OAuth) |
 | Ingestion trigger | Claude Code `Stop` hook → HTTP push | **replaced Logfire polling** (now removed) |
 | Data models | Pydantic v2 | |
-| Postgres driver | psycopg3 (`dict_row`), thread-local in recall | |
+| Postgres driver | psycopg3, thread-local in recall | a row with more than one column is read by name: `dict_row`, or a frozen dataclass per result shape through `class_row` on a cursor of its own (`conn.cursor(row_factory=class_row(X))`), with fields named after the output columns |
 | JSON | orjson | |
 | Telemetry | Logfire **emit only** | all Logfire *read/poll* paths removed (#108); spans still emitted to the configured Logfire project |
 | Auth | `fastmcp` MultiAuth: `StaticTokenVerifier` (bearer) + `GitHubProvider` OAuth | machines send one bearer on every endpoint; claude.ai does GitHub OAuth on `/mcp`; **replaced the hand-rolled OAuth proxy** (#166) |

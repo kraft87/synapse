@@ -122,23 +122,27 @@ def _hop_rows(db_url: str, allowed_projects: list[str] | None) -> list[list[str]
     hops: list[list[str]] = []
 
     class _Rec:
-        def __init__(self, cur: Any) -> None:
-            self._cur = cur
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
             self._is_hop = False
+
+        def cursor(self, **kw: Any) -> _Rec:
+            self._cur = self._conn.cursor(**kw)
+            return self
 
         def execute(self, sql: str, params: Any = None) -> _Rec:
             self._is_hop = HOP_MARK in sql
             self._cur.execute(sql, params)
             return self
 
-        def fetchall(self) -> list[tuple[Any, ...]]:
+        def fetchall(self) -> list[Any]:
             rows = self._cur.fetchall()
             if self._is_hop:
-                hops.append([r[0] for r in rows])
+                hops.append([r.uuid for r in rows])
             return rows
 
-    with psycopg.connect(db_url) as c, c.cursor() as cur:
-        kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 12, allowed_projects)
+    with psycopg.connect(db_url) as c:
+        kg_pg.search_kg_postgres(_Rec(c), "q", onehot(0), "default", [], 12, allowed_projects)
     return hops
 
 

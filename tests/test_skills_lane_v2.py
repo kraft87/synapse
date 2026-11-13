@@ -13,6 +13,9 @@ Covers:
     dismissals from the turn after the skill loader's episode
   (the report that replaced the digest: tests/test_skills_review_queue.py)
   - migration 045 idempotency + the ghost skill_usage repair
+  - the typed-row reads (psycopg class_row) of the detectors, the nightly and the ledger:
+    every statement runs here against real rows, because a column that is not a field of
+    its row class only fails when rows are fetched
 """
 
 from __future__ import annotations
@@ -23,8 +26,13 @@ from pathlib import Path
 
 import pytest
 
+import dream.skills.nightly as NL
+import dream.skills.post_fire as PF
+import dream.skills.procedure_miner as PM
 import dream.skills.skill_db_source as DBSRC
 import dream.skills.skill_ledger as L
+import dream.skills.skill_measure as SM
+import dream.skills.struggle_arc as SA
 from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
 
 MIGRATION = Path(__file__).resolve().parent.parent / "schema" / "045_skills_v2_foundation.sql"
@@ -653,3 +661,258 @@ def test_proposal_routes_serve_v2_fields(lane, db_url):
     detail = _proposal_detail(db_url, r["id"])
     assert detail["proposed_patch"] == "- synthetic patch line"
     assert detail["evidence"][0]["quote"] == "synthetic deviation quote"
+
+
+# ------------------------------------------------------------- typed-row reads
+# Each statement below builds its rows with psycopg's class_row, which raises only when a row
+# is fetched (a column that is not a field of the row class). These tests run the functions
+# against real rows and assert on what comes back.
+
+
+@pytest.fixture()
+def seams(lane):
+    """`lane` plus the registry, skill_files and chunk rows the typed-row tests seed."""
+
+    def _clean():
+        lane.execute("DELETE FROM skills_lane.skill_registry WHERE name LIKE 'v2t-%'")  # + files
+        lane.execute("DELETE FROM chunks WHERE session_id LIKE 'v2t-%'")
+
+    _clean()
+    yield lane
+    _clean()
+
+
+def test_struggle_arc_reads_new_episodes_and_windows(seams, monkeypatch):
+    monkeypatch.delenv("STRUGGLE_INCLUDE_PROJECTS", raising=False)
+    _fire_session(
+        seams,
+        "v2t-arc-sess",
+        [
+            ("[user] try it\n[assistant] ok", "try it"),
+            ("[user] that didn't work\n" + "x" * 500, "that didn't work"),
+            ("[assistant] fixing it", None),
+        ],
+    )
+    for since in (None, datetime.now(UTC) - timedelta(days=2)):
+        got = [e for e in SA._fetch_new_episodes(seams, since) if e["session_id"] == "v2t-arc-sess"]
+        assert [e["sequence"] for e in got] == [1, 2, 3]
+        assert got[1]["human_turn"] == "that didn't work"
+        assert got[1]["content_head"] == ("[user] that didn't work\n" + "x" * 500)[:400]
+        assert got[2]["human_turn"] == ""  # a NULL human_turn reads as empty
+        assert all(isinstance(e["created_at"], datetime) for e in got)
+    window = SA._fetch_window(seams, "v2t-arc-sess", 2, 3)
+    assert [(w["sequence"], w["human_turn"]) for w in window] == [
+        (2, "that didn't work"),
+        (3, ""),
+    ]
+    assert window[1]["content"] == "[assistant] fixing it"
+
+
+def test_post_fire_reads_fires_episodes_and_skill_docs(seams):
+    t = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=2)
+    seams.execute(
+        "INSERT INTO skills_lane.skill_usage (skill, fired_at, session_id) "
+        "VALUES ('v2t-pf-skill', %s, 'v2t-pf-sess'), ('v2t-pf-skill', %s, NULL)",
+        (t, t + timedelta(minutes=5)),
+    )
+    fires = [f for f in PF._fetch_fires(seams, None) if f["skill"] == "v2t-pf-skill"]
+    assert [(f["session_id"], f["fired_at"]) for f in fires] == [
+        ("v2t-pf-sess", t),
+        (None, t + timedelta(minutes=5)),
+    ]
+    after = PF._fetch_fires(seams, t + timedelta(minutes=1))
+    assert [f["session_id"] for f in after if f["skill"] == "v2t-pf-skill"] == [None]
+
+    _fire_session(
+        seams,
+        "v2t-pf-sess",
+        [("[tool:Skill] {'skill': 'v2t-pf-skill'}", "do it"), ("[assistant] ok", None)],
+    )
+    eps = PF._fetch_session_episodes(seams, "v2t-pf-sess")
+    assert [(e["sequence"], e["human_turn"], e["content"]) for e in eps] == [
+        (1, "do it", "[tool:Skill] {'skill': 'v2t-pf-skill'}"),
+        (2, "", "[assistant] ok"),
+    ]
+    assert all(isinstance(e["created_at"], datetime) for e in eps)
+
+    seams.execute(
+        "INSERT INTO skills_lane.skill_registry (name, description, body) VALUES "
+        "('v2t-pf-skill', 'when it applies', 'the registry body'), ('v2t-pf-bare', NULL, NULL)"
+    )
+    seams.execute(
+        "INSERT INTO skills_lane.skill_files (skill_name, path, content, sha256, size) "
+        "VALUES ('v2t-pf-bare', 'SKILL.md', %s, 'x', 9)",
+        (b"# bundled",),
+    )
+    assert PF._load_skill_doc(seams, "v2t-pf-skill") == ("when it applies", "the registry body")
+    assert PF._load_skill_doc(seams, "v2t-pf-bare") == ("", "# bundled")  # the bundled SKILL.md
+    assert PF._load_skill_doc(seams, "v2t-pf-missing") == ("", "")
+
+
+def test_procedure_miner_corpus_is_the_episode_chunk_union(seams):
+    content = '[tool:Bash] ssh nas "docker ps"\n[result] ok\n[tool:Bash] bash ~/scripts/health.sh'
+    day = seams.execute(
+        "INSERT INTO episodes (session_id, sequence, platform, content, created_at) "
+        "VALUES ('v2t-pm-sess', 4, 'claude_code', %s, now() - interval '1 day') "
+        "RETURNING created_at::date::text",
+        (content,),
+    ).fetchone()[0]
+    seams.execute(
+        "INSERT INTO chunks (session_id, start_sequence, end_sequence, episode_ids, content, "
+        "created_at) VALUES ('v2t-pm-sess', 2, 6, '[]'::jsonb, %s, now() - interval '1 day')",
+        (content,),
+    )
+    rows = [r for r in PM._fetch_rows(seams, 35) if r.session_id == "v2t-pm-sess"]
+    # a chunk's position is its start_sequence
+    assert sorted((r.sequence, r.day, r.content) for r in rows) == [
+        (2, day, content),
+        (4, day, content),
+    ]
+    sess_fp_pos, sess_date, _ = PM._occurrences(rows)
+    assert sess_date["v2t-pm-sess"] == day
+    assert sess_fp_pos["v2t-pm-sess"]["ssh:nas>docker:ps"] == {2, 4}
+
+
+def test_session_views_skill_asks_and_fire_events_read_episodes(seams, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    _fire_session(
+        seams,
+        "v2t-views-sess",
+        [
+            (
+                "[user] set up the nas\n[tool:Bash] ssh nas uptime\n"
+                "[tool:Skill] {'skill': 'v2t-demo-skill'}",
+                "set up the nas",
+            ),
+            ("[assistant] done", None),
+            ("[user] make this into a skill\n", "make this into a skill"),
+        ],
+    )
+    first_day = seams.execute(
+        "SELECT min(created_at)::date::text FROM episodes WHERE session_id = 'v2t-views-sess'"
+    ).fetchone()[0]
+    views = [v for v in DBSRC.db_session_views(30, 1000) if v["session"] == "v2t-views-sess"]
+    assert len(views) == 1
+    assert views[0]["first_user"] == "set up the nas"
+    assert views[0]["user_turns"] == 2
+    assert views[0]["user_msgs"] == ["set up the nas", "make this into a skill"]
+    assert views[0]["tools"] == {"Bash": 1, "Skill": 1}
+    assert views[0]["bash_heads"] == ["ssh nas uptime"]
+    assert views[0]["fired"] == ["v2t-demo-skill"]
+    assert views[0]["date"] == first_day
+
+    since = datetime.now(UTC) - timedelta(days=3)
+    for asks in (
+        DBSRC.explicit_skill_requests(days=30),
+        DBSRC.explicit_skill_requests(last_scan_at=since),
+    ):
+        mine = [a for a in asks if a["session_id"] == "v2t-views-sess"]
+        assert [a["phrasing"] for a in mine] == ["make this into a skill"]
+        assert isinstance(mine[0]["ts"], datetime)
+    # the watermark form of fire_events (the nightly's): same fire, with the next turn read
+    events = [
+        e for e in DBSRC.fire_events(last_scan_at=since) if e["session_id"] == "v2t-views-sess"
+    ]
+    assert [(e["skill"], e["dismissed"]) for e in events] == [("v2t-demo-skill", False)]
+
+
+def _halfvec(i, cos=1.0, k=1500):
+    """A unit vector whose cosine to basis vector e_i is `cos` (the rest on e_k)."""
+    v = [0.0] * 2048
+    v[i] = cos
+    if cos < 1.0:
+        v[k] = (1.0 - cos * cos) ** 0.5
+    return L.vec_literal(v)
+
+
+def test_consolidate_pass_backfills_embeddings_and_nominates_overlaps(seams, monkeypatch):
+    def fake_embed(texts, input_type="document"):
+        # the backfilled description lands on a basis vector of its own: no overlap with the rest
+        return [[1.0 if j == 7 else 0.0 for j in range(2048)] for _ in texts]
+
+    monkeypatch.setattr(L, "embed", fake_embed)
+    for name, desc, emb in (
+        ("v2t-cons-a", "does a", _halfvec(0)),
+        ("v2t-cons-b", "does b", _halfvec(0, 0.95)),  # cosine 0.95 to a: a near-duplicate
+        ("v2t-cons-c", "does c", None),  # no embedding yet: backfilled
+        ("v2t-cons-d", None, None),  # no description: not embedded
+    ):
+        seams.execute(
+            "INSERT INTO skills_lane.skill_registry (name, description, description_embedding) "
+            "VALUES (%s, %s, %s::halfvec)",
+            (name, desc, emb),
+        )
+    seen: set[int] = set()
+    out = NL.consolidate_pass(seams, seen)
+    assert out["embedded"] >= 1 and out["overlap_pairs"] >= 1
+    embedded = dict(
+        seams.execute(
+            "SELECT name, description_embedding IS NOT NULL FROM skills_lane.skill_registry "
+            "WHERE name LIKE 'v2t-cons-%'"
+        ).fetchall()
+    )
+    assert embedded == {
+        "v2t-cons-a": True,
+        "v2t-cons-b": True,
+        "v2t-cons-c": True,
+        "v2t-cons-d": False,
+    }
+    kind, targets = seams.execute(
+        "SELECT kind, target_skills FROM skills_lane.skill_gap_candidates "
+        "WHERE name = 'v2t-cons-a+v2t-cons-b'"
+    ).fetchone()
+    assert (kind, targets) == ("consolidate", ["v2t-cons-a", "v2t-cons-b"])
+    assert len(seen) == out["overlap_pairs"]
+
+
+def test_ledger_counts_split_new_from_merged_and_count_the_proposed(seams):
+    since = datetime.now(UTC) - timedelta(hours=1)
+    before = NL._ledger_counts(seams, since)
+    quote = {"session_id": "v2t-lc-1", "class": "judge", "signal": "post_fire_deviation"}
+    _mc(seams, "retune", "v2t-lc-new", [{**quote, "quote": "synthetic quote"}], direction="fix")
+    _mc(seams, "retune", "v2t-lc-old", [{**quote, "signal": "under_trigger"}], direction="widen")
+    seams.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET created_at = now() - interval '5 days' "
+        "WHERE name = 'v2t-lc-old'"
+    )  # created before `since`, re-seen since: merged into, not new
+    after = NL._ledger_counts(seams, since)
+    assert after["candidates_new"] - before["candidates_new"] == 1
+    assert after["candidates_merged"] - before["candidates_merged"] == 1
+    assert after["to_proposed"] - before["to_proposed"] == 1  # only the quoted one went proposed
+
+
+def test_an_occupied_key_the_resolver_missed_reports_the_occupant(seams, monkeypatch):
+    ev = [{"session_id": "v2t-occ-1", "class": "judge", "signal": "post_fire_deviation"}]
+    first = _mc(seams, "retune", "v2t-occ-skill", ev, direction="fix")
+    # the resolver does not see the row (a concurrent writer landed it in between): the
+    # INSERT hits ON CONFLICT DO NOTHING and the lane reports the occupant, untouched
+    monkeypatch.setattr(L, "_resolve_id", lambda *a, **k: None)
+    again = _mc(seams, "retune", "v2t-occ-skill", ev, direction="fix")
+    assert again == {
+        "id": first["id"],
+        "status": "observe",
+        "score": first["score"],
+        "merged": False,
+    }
+
+
+def test_the_ledger_selftest_runs_against_the_database(seams, db_url, monkeypatch, capsys):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    L._selftest()
+    out = capsys.readouterr().out
+    assert "rows=1 (want 1 = merged despite name drift)  judge_sessions=2 (want 2)" in out
+    assert "cleaned up." in out
+
+
+def test_load_catalog_lists_active_skills_by_name(seams):
+    for name, desc, status in (
+        ("v2t-cat-b", None, "active"),  # no description reads as ''
+        ("v2t-cat-a", "does a", "active"),
+        ("v2t-cat-c", "retired one", "retired"),
+    ):
+        seams.execute(
+            "INSERT INTO skills_lane.skill_registry (name, description, status) VALUES (%s, %s, %s)",
+            (name, desc, status),
+        )
+    catalog = [c for c in SM.load_catalog(seams) if c[0].startswith("v2t-cat-")]
+    assert catalog == [("v2t-cat-a", "does a"), ("v2t-cat-b", "")]
