@@ -482,8 +482,8 @@ def test_066_applied_alone_past_069_leaves_no_trigger_and_no_function(conn, db_u
 
 #: Files that cannot be applied twice to any migrated database, 069 or not, for reasons of
 #: their own that name no group_id: 001 indexes a column a later file dropped, 004 alters the
-#: table 007 dropped, 023 adds a constraint with no guard. apply_schema.sh is for an empty
-#: database; an existing one takes the files above its stamp, one at a time.
+#: table 007 dropped, 023 adds a constraint with no guard. apply_schema.sh never does that:
+#: its ledger (schema_migrations) keeps it from applying a file a second time.
 NOT_REAPPLIABLE = {
     "001_initial.sql",
     "004_session_embeddings.sql",
