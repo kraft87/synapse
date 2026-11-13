@@ -281,8 +281,12 @@ def test_a_seed_counts_only_the_edges_a_restricted_caller_may_be_served(
     executed: list[str] = []
 
     class _Rec:
-        def __init__(self, cur):
-            self._cur = cur
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, **kw):
+            self._cur = self._conn.cursor(**kw)
+            return self
 
         def execute(self, sql, params=None):
             executed.append(sql)
@@ -294,8 +298,8 @@ def test_a_seed_counts_only_the_edges_a_restricted_caller_may_be_served(
 
     def _hops(allowed: list[str] | None) -> int:
         executed.clear()
-        with psycopg.connect(db_url) as c, c.cursor() as cur:
-            kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 5, allowed)
+        with psycopg.connect(db_url) as c:
+            kg_pg.search_kg_postgres(_Rec(c), "q", onehot(0), "default", [], 5, allowed)
         return sum("src_uuid = %s OR tgt_uuid = %s" in s for s in executed)
 
     assert _hops([WORK]) == (1 if is_seed else 0)
@@ -413,8 +417,12 @@ def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cu
     seen: list[tuple[str, Any]] = []
 
     class _Rec:
-        def __init__(self, cur):
-            self._cur = cur
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, **kw):
+            self._cur = self._conn.cursor(**kw)
+            return self
 
         def execute(self, sql, params=None):
             seen.append((sql, params))
@@ -429,7 +437,7 @@ def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cu
         with psycopg.connect(db_url, autocommit=True) as c, c.cursor() as cur:
             cur.execute("SET enable_seqscan = off")
             kg_pg.search_kg_postgres(
-                _Rec(cur),
+                _Rec(c),
                 "widget",
                 onehot(0),
                 "default",
@@ -455,8 +463,12 @@ def _bm25_leg(db_url: str, *, audience: bool, limit: int) -> tuple[list[str], st
     seen: list[tuple[str, Any]] = []
 
     class _Rec:
-        def __init__(self, cur):
-            self._cur = cur
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, **kw):
+            self._cur = self._conn.cursor(**kw)
+            return self
 
         def execute(self, sql, params=None):
             seen.append((sql, params))
@@ -470,7 +482,7 @@ def _bm25_leg(db_url: str, *, audience: bool, limit: int) -> tuple[list[str], st
         cur.execute("SET enable_seqscan = off")
         cur.execute("SET max_parallel_workers_per_gather = 0")
         kg_pg.search_kg_postgres(
-            _Rec(cur),
+            _Rec(c),
             "widget",
             onehot(0),
             "default",

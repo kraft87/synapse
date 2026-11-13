@@ -22,9 +22,11 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -38,6 +40,16 @@ logger = logging.getLogger(__name__)
 # Single-owner constant, mirroring kg_pg_write.OWNER / the recall leg.
 _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 _MAX_LIMIT = 50
+
+
+@dataclass(frozen=True, slots=True)
+class _PreferenceRow:
+    """One standing preference, as the route serves it."""
+
+    pref: str
+    polarity: str
+    assert_count: int
+    since: str
 
 
 def _top_preferences(
@@ -65,10 +77,8 @@ def _top_preferences(
     params.append(limit)
     with pg_pool.connection(db_url) as conn:
         try:
-            rows = conn.execute(sql, params).fetchall()
-            return [
-                {"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows
-            ]
+            cur = conn.cursor(row_factory=class_row(_PreferenceRow))
+            return [asdict(r) for r in cur.execute(sql, params).fetchall()]
         except psycopg.errors.UndefinedTable:
             return []
 

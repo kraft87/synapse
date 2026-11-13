@@ -93,13 +93,13 @@ class TestEntityReads:
         assert kg_tables.entity_uuid_by_normalized_name("voyage ai") == "e-old"
         assert kg_tables.entity_uuid_by_normalized_name("nonexistent") is None
 
-    def test_load_entities_scoped_tuples(self, kg_tables):
+    def test_load_entities_scoped_rows(self, kg_tables):
         rows = kg_tables.load_entities()
-        by_uuid = {u: (n, s) for u, n, s, _supertype, _normalized in rows}
+        by_uuid = {r.uuid: (r.name, r.summary) for r in rows}
         assert set(by_uuid) == {"e-syn", "e-fdb", "e-old"}
         assert by_uuid["e-syn"] == ("Synapse", "memory layer")
         assert by_uuid["e-old"] == ("  Voyage AI ", "")  # NULLs coalesced
-        stored = {u: normalized for u, _n, _s, _supertype, normalized in rows}
+        stored = {r.uuid: r.normalized_name for r in rows}
         assert stored["e-syn"] == "synapse"
         assert stored["e-old"] == ""  # no stored name: the index keys it by lower(trim(name))
 

@@ -43,7 +43,10 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
+
+from psycopg.rows import class_row
 
 from . import config, skill_ledger, skill_measure
 
@@ -255,44 +258,55 @@ def content_fingerprints(content: str) -> list[tuple[str, str | None]]:
 
 
 # ----------------------------------------------------------------- corpus (SQL seam)
-def _fetch_rows(conn, window_days: float) -> list[tuple[str, int, str, str]]:
-    """(session_id, position, date_iso, content) rows from the episode+chunk union.
+@dataclass(frozen=True, slots=True)
+class _CorpusRow:
+    """One episode or chunk of the corpus: its session, position, day (YYYY-MM-DD) and text."""
+
+    session_id: str
+    sequence: int
+    day: str
+    content: str
+
+
+def _fetch_rows(conn, window_days: float) -> list[_CorpusRow]:
+    """Episode+chunk union rows (a chunk's `sequence` is its start_sequence).
     Chunks are sliding windows OVER episodes — the union is deduped downstream by
     counting DISTINCT sessions / positions, never raw occurrences."""
     excl = list(dict.fromkeys(EXCLUDED_PROJECTS + tuple(config.EXCLUDE_PROJECTS)))
-    cur = conn.cursor()
-    rows: list[tuple[str, int, str, str]] = []
+    cur = conn.cursor(row_factory=class_row(_CorpusRow))
+    rows: list[_CorpusRow] = []
     cur.execute(
-        """SELECT session_id, sequence, created_at::date::text, content
+        """SELECT session_id, sequence, created_at::date::text AS day, content
              FROM episodes
             WHERE platform = 'claude_code'
               AND created_at > now() - (%s || ' days')::interval
               AND (project IS NULL OR project <> ALL(%s))""",
         (str(window_days), excl),
     )
-    rows += [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
+    rows += cur.fetchall()
     cur.execute(
-        """SELECT session_id, start_sequence, created_at::date::text, content
+        """SELECT session_id, start_sequence AS sequence, created_at::date::text AS day, content
              FROM chunks
             WHERE created_at > now() - (%s || ' days')::interval
               AND (project IS NULL OR project <> ALL(%s))""",
         (str(window_days), excl),
     )
-    rows += [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
+    rows += cur.fetchall()
     return rows
 
 
-def _occurrences(rows):
+def _occurrences(rows: list[_CorpusRow]):
     """rows -> (session->fp->positions, session->earliest date, fp->example atoms).
     Position = episode sequence (chunks use start_sequence — same coordinate space), so
     a chunk re-serving an episode's command collapses into the same (session, fp, pos)."""
     sess_fp_pos: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     sess_date: dict[str, str] = {}
     examples: dict[str, list[str]] = defaultdict(list)
-    for sid, pos, d, content in rows:
+    for r in rows:
+        sid, pos, d = r.session_id, r.sequence, r.day
         if d and (sid not in sess_date or d < sess_date[sid]):
             sess_date[sid] = d
-        for fp, atom in content_fingerprints(content):
+        for fp, atom in content_fingerprints(r.content):
             sess_fp_pos[sid][fp].add(pos)
             if atom and len(examples[fp]) < 2 and atom[:160] not in examples[fp]:
                 examples[fp].append(atom[:160])

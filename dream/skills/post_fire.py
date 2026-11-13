@@ -37,6 +37,11 @@ empty is counted as empty_window, apart from the judge's unassessable.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
+
+from psycopg.rows import class_row
+
 from . import skill_db_source as DB
 from . import skill_ledger as L
 from . import skill_measure as SM
@@ -181,8 +186,17 @@ def resolve_fire_position(
 
 
 # ------------------------------------------------------------------ DB fetches
+@dataclass(frozen=True, slots=True)
+class _FireRow:
+    """One recorded skill fire (skill_usage)."""
+
+    skill: str
+    session_id: str | None
+    fired_at: datetime
+
+
 def _fetch_fires(conn, since) -> list[dict]:
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_FireRow))
     if since is not None:
         cur.execute(
             "SELECT skill, session_id, fired_at FROM skills_lane.skill_usage "
@@ -194,8 +208,12 @@ def _fetch_fires(conn, since) -> list[dict]:
             "SELECT skill, session_id, fired_at FROM skills_lane.skill_usage ORDER BY fired_at"
         )
     return [
-        {"skill": s, "session_id": str(sid) if sid else None, "fired_at": ts}
-        for s, sid, ts in cur.fetchall()
+        {
+            "skill": r.skill,
+            "session_id": str(r.session_id) if r.session_id else None,
+            "fired_at": r.fired_at,
+        }
+        for r in cur.fetchall()
     ]
 
 
@@ -208,31 +226,57 @@ def _registered_skills(conn) -> set[str]:
     return {name for (name,) in cur.fetchall()}
 
 
+@dataclass(frozen=True, slots=True)
+class _EpisodeRow:
+    """One episode of a session, as the aftermath window reads it."""
+
+    sequence: int
+    created_at: datetime
+    human_turn: str | None
+    content: str
+
+
 def _fetch_session_episodes(conn, session_id: str) -> list[dict]:
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_EpisodeRow))
     cur.execute(
         "SELECT sequence, created_at, human_turn, content FROM episodes "
         "WHERE session_id = %s ORDER BY sequence",
         (session_id,),
     )
     return [
-        {"sequence": seq, "created_at": ts, "human_turn": human or "", "content": content or ""}
-        for seq, ts, human, content in cur.fetchall()
+        {
+            "sequence": r.sequence,
+            "created_at": r.created_at,
+            "human_turn": r.human_turn or "",
+            "content": r.content or "",
+        }
+        for r in cur.fetchall()
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillDocRow:
+    """A registry skill's trigger description and body (empty strings where unset)."""
+
+    description: str
+    body: str
 
 
 def _load_skill_doc(conn, name: str) -> tuple[str, str]:
     """(description, body) from the registry; falls back to the bundled SKILL.md in
     skill_files when the registry body is empty."""
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(description, ''), COALESCE(body, '') "
-        "FROM skills_lane.skill_registry WHERE name = %s",
-        (name,),
+    row = (
+        conn.cursor(row_factory=class_row(_SkillDocRow))
+        .execute(
+            "SELECT COALESCE(description, '') AS description, COALESCE(body, '') AS body "
+            "FROM skills_lane.skill_registry WHERE name = %s",
+            (name,),
+        )
+        .fetchone()
     )
-    row = cur.fetchone()
-    desc, body = (row[0], row[1]) if row else ("", "")
+    desc, body = (row.description, row.body) if row else ("", "")
     if not body:
+        cur = conn.cursor()
         cur.execute(
             "SELECT content FROM skills_lane.skill_files WHERE skill_name = %s AND path = 'SKILL.md'",
             (name,),

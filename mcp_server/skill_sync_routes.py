@@ -57,10 +57,10 @@ import hashlib
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from psycopg.rows import dict_row
+from psycopg.rows import class_row, dict_row
 from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -198,11 +198,24 @@ def whole_skill_hash(body: str, files) -> str:
     return h.hexdigest()
 
 
-def _file_shas(c, name: str) -> list[dict]:
-    return c.execute(
-        "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
-        (name,),
-    ).fetchall()
+@dataclass(frozen=True, slots=True)
+class _FileShaRow:
+    """One bundled file of a skill: its path and the hash of its content."""
+
+    path: str
+    sha256: str
+
+
+def _file_shas(c, name: str) -> list[_FileShaRow]:
+    """The skill's files, as the same rows whatever rows the caller's connection makes."""
+    return (
+        c.cursor(row_factory=class_row(_FileShaRow))
+        .execute(
+            "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
+            (name,),
+        )
+        .fetchall()
+    )
 
 
 def _held_names(held) -> list[str] | None:
@@ -242,7 +255,7 @@ def _list_skills(db_url: str, scope: str, access: SkillAccess = FULL_ACCESS, hel
                     "body": s["body"],
                     "description": s["description"],
                     "content_modified_at": _iso(s["content_modified_at"]),
-                    "files": _file_shas(c, s["name"]),
+                    "files": [asdict(f) for f in _file_shas(c, s["name"])],
                 }
                 for s in skills
             ],
@@ -282,7 +295,7 @@ def _past_hashes(c, name: str, files) -> list[str]:
 
 
 def _entry_hashes(c, name: str, body: str) -> tuple[str, list[str]]:
-    files = [(f["path"], f["sha256"]) for f in _file_shas(c, name)]
+    files = [(f.path, f.sha256) for f in _file_shas(c, name)]
     current = whole_skill_hash(body, files)
     past = [h for h in _past_hashes(c, name, files) if h != current]
     return current, [current, *past]
@@ -412,6 +425,23 @@ def _upsert_registry(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _RetirementRow:
+    """A registry row as the retirement check reads it."""
+
+    status: str
+    retired_at: datetime | None
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopeRow:
+    """A registry row as the publish's scope check reads it."""
+
+    scope: str
+    status: str
+
+
 def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
     """The retired_at that refuses the publish `p` (edited at `edited`), or None.
 
@@ -424,20 +454,24 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
     if not _retired_at_ready(c):
         return None
     name = p["name"]
-    row = c.execute(
-        "SELECT status, retired_at, COALESCE(body,'') FROM skills_lane.skill_registry "
-        "WHERE name=%s FOR UPDATE",
-        (name,),
-    ).fetchone()
-    if row is None or row[0] != "retired" or row[1] is None:
+    row = (
+        c.cursor(row_factory=class_row(_RetirementRow))
+        .execute(
+            "SELECT status, retired_at, COALESCE(body,'') AS body "
+            "FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
+            (name,),
+        )
+        .fetchone()
+    )
+    if row is None or row.status != "retired" or row.retired_at is None:
         return None
-    if edited is None or _utc(edited) <= row[1]:
-        return row[1]
-    retired = whole_skill_hash(row[2], [(f[0], f[1]) for f in _file_shas(c, name)])
+    if edited is None or _utc(edited) <= row.retired_at:
+        return row.retired_at
+    retired = whole_skill_hash(row.body, [(f.path, f.sha256) for f in _file_shas(c, name)])
     pushed = whole_skill_hash(
         p.get("body", ""), [(f["path"], f["sha256"]) for f in p.get("files", [])]
     )
-    return row[1] if pushed == retired else None
+    return row.retired_at if pushed == retired else None
 
 
 def _scope_holds(c, name: str, scope: str, access: SkillAccess) -> dict | str:
@@ -449,21 +483,25 @@ def _scope_holds(c, name: str, scope: str, access: SkillAccess) -> dict | str:
     skill re-scoped for trust would leak again). Moving a skill is /skills/rescope. The
     same scope in another case keeps the registry's spelling. A restricted caller may not
     take over a retired skill of a scope it is not served."""
-    row = c.execute(
-        "SELECT scope, status FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
-        (name,),
-    ).fetchone()
+    row = (
+        c.cursor(row_factory=class_row(_ScopeRow))
+        .execute(
+            "SELECT scope, status FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
+            (name,),
+        )
+        .fetchone()
+    )
     if row is None:
         return scope
-    if row[1] == "active":
-        if row[0].lower() != scope.lower():
+    if row.status == "active":
+        if row.scope.lower() != scope.lower():
             return {
                 "status": "scoped",
                 "name": name,
-                "scope": row[0] if access.serves(row[0]) else None,
+                "scope": row.scope if access.serves(row.scope) else None,
             }
-        return row[0]
-    if not access.serves(row[0]):
+        return row.scope
+    if not access.serves(row.scope):
         return {"status": "forbidden", "name": name}
     return scope
 
