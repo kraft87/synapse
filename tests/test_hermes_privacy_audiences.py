@@ -3,8 +3,9 @@
 Each shape below is built from what Hermes writes (checkout bca51750), cited per test:
 a Desktop Group Chat member, a Bot Chat the Desktop minted and then reset, a cron job,
 a turn another agent wrote, a gateway session whose row is gone, a side agent the
-gateway daemon builds, a process started with ``--source``, and a session renamed after
-its system prompt was built. ``tests/test_hermes_gateway_sessions.py`` has the store
+gateway daemon builds, a process started with ``--source``, a session renamed after
+its system prompt was built, and a chat others wrote into after its title is gone, its
+agent is rebuilt or it is branched. ``tests/test_hermes_gateway_sessions.py`` has the store
 fixture (the tables and receipt ``commit_local_session`` writes) and the owner's shapes.
 """
 
@@ -14,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -223,10 +225,10 @@ def test_an_owner_chat_continued_in_an_untitled_row_stays_active(tmp_path):
 def test_follow_profile_config_in_the_request_is_inert(tmp_path):
     # gateway/session_controls.py:508-514 sets it on a titled "Bot Chat" create;
     # session_bot.py:369-374 on the gateway's own Bot Chat. Neither is an owner's chat.
-    _store(tmp_path, request={"cwd": _WORK, "follow_profile_config": True})
-    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.INERT
-    _store(tmp_path, request={"cwd": _WORK, "room_plumbing": True})
-    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.INERT
+    for flag in ("follow_profile_config", "room_plumbing"):
+        home = tmp_path / flag  # a home each: the first verdict marks the chat for good
+        _store(home, request={"cwd": _WORK, flag: True})
+        assert hs.check_session(home, _LOCAL, _gateway()).mode == hs.INERT
     _store(tmp_path, request={"cwd": _WORK, "follow_profile_config": False})
     assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
 
@@ -259,9 +261,6 @@ def test_an_in_process_row_that_follows_its_profile_is_inert(tmp_path, model_con
     ``model_config``; tui_gateway/agent_factory.py:112-119 reads the first as the Bot
     Chat."""
     sid = "20261112_171000_ab12cd"
-    _row(tmp_path, sid, "", title=None, model_config=model_config, source="tui")
-    verdict = hs.check_session(tmp_path, sid, _in_process())
-    assert verdict.mode == hs.INERT and "follows its profile" in verdict.reason
     _row(
         tmp_path, sid, "", model_config={"model": "x", "follow_profile_config": False}, source="tui"
     )
@@ -272,6 +271,9 @@ def test_an_in_process_row_that_follows_its_profile_is_inert(tmp_path, model_con
     conn.commit()
     conn.close()
     assert hs.check_session(tmp_path, sid, _in_process()).mode == hs.ACTIVE
+    _row(tmp_path, sid, "", title=None, model_config=model_config, source="tui")
+    verdict = hs.check_session(tmp_path, sid, _in_process())
+    assert verdict.mode == hs.INERT and "follows its profile" in verdict.reason
 
 
 # ---------------------------------------------------------------------------
@@ -419,13 +421,12 @@ def test_a_bot_with_no_id_or_name_is_still_a_bot(plugin, server, tmp_path):
     assert server.posts() == []
 
 
-def test_a_dispatched_delivery_is_inert_before_its_first_turn(
-    plugin, server, tmp_path, monkeypatch
-):
-    """tools/bot_relay.py ``delivery_env`` sets HERMES_TURN_AUTHOR on the child that runs
-    a delivered message, and hermes_cli/cli_single_query.py builds the quiet one-shot's
-    agent before it consumes the variable: the board must not reach that agent's system
-    prompt, which Hermes builds before the provider hears the turn's author."""
+def test_a_process_that_carries_a_turn_author_is_inert(plugin, server, tmp_path, monkeypatch):
+    """A backstop. tools/bot_relay.py ``delivery_env`` sets HERMES_TURN_AUTHOR on the
+    child that runs a delivered message. No Hermes path builds an agent in such a child
+    today: ``hermes chat`` and the one-shots run their turn in the daemon
+    (hermes_cli/cli_agent_setup_mixin.py), whose environment has the variable stripped.
+    A process that did build one would get nothing, from before its first prompt."""
     monkeypatch.setenv(hs.AUTHOR_ENV, json.dumps(_BOT))
     verdict = hs.from_keywords(_in_process(platform="cli"))
     assert verdict.mode == hs.INERT and "another agent" in verdict.reason
@@ -588,3 +589,190 @@ def test_the_block_is_withheld_once_the_session_is_renamed(plugin, server, tmp_p
     assert provider.system_prompt_block() == ""
     gs._retitle(home, _LOCAL, "Cache design")
     assert provider.system_prompt_block() == ""  # off for good
+
+
+# ---------------------------------------------------------------------------
+# A chat others wrote into stays off: its branches, and the marks
+# ---------------------------------------------------------------------------
+
+_BRANCH = gs._OTHER
+_FOREIGN_TURN = {"author_id": "bot:research", "author_name": "research", "author_is_bot": True}
+
+
+def _branch(
+    home: Path, parent: str = _LOCAL, child: str = _BRANCH, *, title: str = "Research notes"
+) -> None:
+    """hermes_state_mutation_branch.py ``branch_in_transaction``: a new chat whose id is
+    its session's, the parent's policy under a ``branch:`` request id, a copy of the
+    parent's turns, ``parent_session_id``, and a title of its own."""
+    _store(home, child, source="gui", request_id="branch:" + "4d" * 16, title=title)
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        conn.execute(
+            "UPDATE sessions SET parent_session_id=?, model_config=? WHERE id=?",
+            (parent, json.dumps({"_branched_from": parent}), child),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _old_bot_chat(home: Path, **fields: Any) -> None:
+    """A Bot Chat from before Hermes flagged them: its title is all that says so."""
+    _store(home, **{"source": "gui", "request_id": _DESKTOP_REQUEST, "title": "Bot Chat", **fields})
+
+
+def test_a_branch_of_a_bot_chat_under_its_own_title_is_inert(tmp_path):
+    _old_bot_chat(tmp_path)
+    _branch(tmp_path)
+    kwargs = _gateway(_BRANCH, platform="desktop")
+    verdict = hs.check_session(tmp_path, _BRANCH, kwargs)
+    assert verdict.mode == hs.INERT and "Bot Chat" in verdict.reason
+    assert hs.recheck(tmp_path, _BRANCH, gateway=True).mode == hs.INERT
+    owner = tmp_path / "owner"
+    _store(owner, title="Cache design")
+    _branch(owner)
+    assert hs.check_session(owner, _BRANCH, kwargs).mode == hs.ACTIVE
+
+
+def test_a_branch_is_held_to_every_row_of_its_parents_chat(tmp_path):
+    # Branched from the untitled row a reset left; the chat's first row has the title.
+    _client_bot_chat(tmp_path, {"title": "Bot Chat", "hidden": True})
+    _branch(tmp_path, parent=_RESET_CHILD)
+    verdict = hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH))
+    assert verdict.mode == hs.INERT and "Bot Chat" in verdict.reason
+
+
+def test_a_branch_is_held_to_its_parents_receipt(tmp_path):
+    # The gateway's own Bot Chat, archived: no title left, the ``bot-chat:`` id still is.
+    _store(tmp_path, request_id="bot-chat:/home/kyle/.hermes")
+    _branch(tmp_path)
+    verdict = hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH))
+    assert verdict.mode == hs.INERT and "Bot Chat" in verdict.reason
+    # A parent's receipt is read for that alone: one that is merely missing says nothing.
+    owner = tmp_path / "owner"
+    _store(owner, receipt=False)
+    _branch(owner)
+    assert hs.check_session(owner, _BRANCH, _gateway(_BRANCH)).mode == hs.ACTIVE
+
+
+def test_a_bot_chat_that_loses_its_title_stays_off(tmp_path):
+    """Archive and rename take the title away (hermes_state_titles.py); the peers' turns
+    stay in the chat, and the lookback would upload them as the owner's."""
+    _old_bot_chat(tmp_path)
+    assert "Bot Chat" in hs.check_session(tmp_path, _LOCAL, _gateway()).reason
+    gs._retitle(tmp_path, _LOCAL, "Old notes")
+    for verdict in (
+        hs.check_session(tmp_path, _LOCAL, _gateway()),
+        hs.check_session(tmp_path, _LOCAL, _in_process()),
+        hs.recheck(tmp_path, _LOCAL, gateway=True),
+        hs.recheck(tmp_path, _LOCAL),
+    ):
+        assert verdict.mode == hs.INERT and "marked" in verdict.reason
+    # So does a continuation of the chat, and a branch made after the rename.
+    _row(tmp_path, _RESET_CHILD, _LOCAL, model_config={"_reset_from": _LOCAL})
+    assert hs.check_session(tmp_path, _RESET_CHILD, _gateway()).mode == hs.INERT
+    _branch(tmp_path)
+    assert hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).mode == hs.INERT
+
+
+def test_a_chat_never_seen_as_a_bot_chat_has_no_mark(tmp_path):
+    """The limit of the marks: a title gone before the provider first judged the chat
+    leaves nothing to go on."""
+    _old_bot_chat(tmp_path, title="Old notes")
+    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
+    assert not (tmp_path / "synapse").exists()
+
+
+def test_a_mark_is_an_owner_only_file_that_names_its_chat(tmp_path):
+    session = "20261112_135415_30e776"
+    hs.mark(tmp_path, [_LOCAL, "", None, session, _LOCAL], "why")
+    folder = tmp_path / "synapse" / "inert"
+    files = sorted(folder.iterdir())
+    assert len(files) == 2
+    for path in (folder, folder.parent):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    for path in files:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert len(path.name) == 64 and not set(path.name) - set("0123456789abcdef")
+    assert sorted(path.read_text() for path in files) == sorted(
+        f"{key}\nwhy\n" for key in (_LOCAL, session)
+    )
+    assert hs.marked(tmp_path, [_BRANCH, _LOCAL]) and hs.marked(tmp_path, [session])
+    assert not hs.marked(tmp_path, [_BRANCH, "", None])
+    hs.mark(tmp_path, [_LOCAL], "said again")  # the first reason is kept
+    assert sorted(path.read_text() for path in folder.iterdir())[1].endswith("why\n")
+
+
+def test_marking_never_raises(tmp_path):
+    hs.mark(None, [_LOCAL], "why")
+    hs.mark(tmp_path / "no" / "such" / "home", [_LOCAL], "why")
+    (tmp_path / "synapse").write_text("a file where the folder goes")
+    hs.mark(tmp_path, [_LOCAL], "why")
+    assert not hs.marked(tmp_path, [_LOCAL]) and not hs.marked(None, [_LOCAL])
+
+
+def test_an_agent_rebuilt_after_a_foreign_turn_stays_off(plugin, server, tmp_path):
+    """Off "for good" has to outlast the instance: the gateway builds a new agent for
+    the same session (a restart, an evicted cache), and a resumed session uploads up to
+    ten earlier turns, the foreign one among them, as the owner's."""
+    home = tmp_path / "hermes-a"
+    _store(home)
+    _store(home, _BRANCH)
+    provider = _start_gateway(_new(plugin), home)
+    provider.on_turn_start(1, "hi", model="m", **_FOREIGN_TURN)
+    assert provider.prefetch("x") == ""
+    rebuilt = _start_gateway(_new(plugin), home, resumed=True, message_count=2)
+    _assert_nothing_served(rebuilt, server)
+    assert "marked" in hs.check_session(home, _LOCAL, _gateway()).reason
+    # Another chat of the same home is the owner's as before.
+    other = _start_gateway(_new(plugin), home, _BRANCH)
+    assert "BOARD-TEXT" in other.system_prompt_block()
+
+
+def test_an_in_process_session_rebuilt_after_a_foreign_turn_stays_off(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"  # the installed plugin's home; no state.db in it
+    provider = _new(plugin)
+    provider.initialize(_RESET_CHILD, hermes_home=str(home), **_in_process())
+    provider.sync_turn(
+        "q", "a", session_id=_RESET_CHILD, messages=_conversation(1), turn_author=_BOT
+    )
+    assert server.posts() == []
+    rebuilt = _new(plugin)
+    rebuilt.initialize(_RESET_CHILD, hermes_home=str(home), **_in_process(resumed=True))
+    _assert_nothing_served(rebuilt, server)
+
+
+def test_a_title_the_keywords_carried_marks_the_session(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    provider = _new(plugin)
+    provider.initialize(
+        _RESET_CHILD, hermes_home=str(home), **_in_process(session_title="Bot Chat")
+    )
+    renamed = _new(plugin)
+    renamed.initialize(_RESET_CHILD, hermes_home=str(home), **_in_process(session_title="Notes"))
+    _assert_nothing_served(renamed, server)
+
+
+def test_a_foreign_turn_in_a_branch_leaves_its_parent_on(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _store(home, title="Cache design")
+    _branch(home)
+    branch = _start_gateway(_new(plugin), home, _BRANCH)
+    branch.on_turn_start(1, "hi", model="m", **_FOREIGN_TURN)
+    assert hs.check_session(home, _BRANCH, _gateway(_BRANCH)).mode == hs.INERT
+    assert hs.check_session(home, _LOCAL, _gateway()).mode == hs.ACTIVE
+    # A branch of the marked branch carries its turns: off.
+    third = "local-" + "7a" * 32
+    _branch(home, parent=_BRANCH, child=third, title="More notes")
+    assert "marked" in hs.check_session(home, third, _gateway(third)).reason
+
+
+def test_a_bot_chat_resumed_onto_the_owners_route_does_not_mark_that_chat(tmp_path):
+    """The mark names the chat the evidence is about: the Bot Chat, not the owner's
+    chat whose route ran it for a while."""
+    _store(tmp_path)
+    _store(tmp_path, _BRANCH, request_id="bot-chat:/home/kyle/.hermes:2")
+    assert "Bot Chat" in hs.check_session(tmp_path, _BRANCH, _gateway()).reason
+    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
+    assert hs.marked(tmp_path, [_BRANCH]) and not hs.marked(tmp_path, [_LOCAL])

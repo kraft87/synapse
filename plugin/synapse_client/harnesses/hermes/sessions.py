@@ -33,14 +33,16 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
   ACTIVE, as before, that process belonging to the person who started it, unless the
   process says otherwise: ``HERMES_SESSION_SOURCE`` (``hermes chat --source``,
   hermes_cli/main.py; "kanban" for a Kanban worker, hermes_cli/kanban_db_dispatch.py)
-  naming a source outside ROW_SOURCES is INERT; so is a run whose environment still
+  naming a source outside ROW_SOURCES is INERT; so is a process whose environment
   carries ``HERMES_TURN_AUTHOR``, which a bot-to-bot dispatcher sets on the child that
-  runs a delivered message (tools/bot_relay.py ``delivery_env``). The quiet one-shot
-  builds its agent before it consumes that variable (hermes_cli/cli_single_query.py
-  ``_run_quiet_single_query``); the other one-shot path consumes it first, and there
-  the turn's own author is the only sign (the provider's ``_foreign``). And so is any
-  agent the gateway daemon
-  itself builds without a chat: a ``/background`` or ``/btw`` side agent
+  runs a delivered message (tools/bot_relay.py ``delivery_env``). That check is a
+  backstop no Hermes path reaches today: ``hermes chat`` and both one-shot paths run
+  their turn in the gateway daemon (hermes_cli/cli_agent_setup_mixin.py), whose
+  environment has the variable stripped (hermes_cli/gateway_runtime_start.py). There a
+  dispatched run is known only by its turn's author (the provider's ``_foreign``),
+  which Hermes reports after it has built the first turn's system prompt. And so is
+  any agent the gateway daemon itself builds without a chat: a ``/background`` or
+  ``/btw`` side agent
   (gateway/session_tui_side.py ``_side_agent``) carries no identity and no parent, so
   nothing says whose session it serves. The daemon is recognised the way Hermes
   recognises itself (tools/process_registry.py ``_is_supervised_gateway_process``): its
@@ -113,6 +115,17 @@ rows again before the system prompt block, each nudge, upload and tool call. An 
 binding cannot be added to a local session later: gateway/session_api.py
 ``bind_api_steps`` refuses a session whose row or live origin is not the API server's.
 
+The sessions a session descends from (``parent_session_id``) are read too. A branch is
+a new chat with its own title and a ``branch:`` request id, holding a copy of its
+parent's turns (hermes_state_mutation_branch.py ``branch_in_transaction``). A parent
+row, any row of a parent's chat, or a parent chat's receipt that names a Bot Chat, a
+Group Chat member or a chat that follows its profile makes the session INERT.
+
+A title can also go away (archive, rename), and Hermes builds a new agent for a session
+when it likes. So a session judged a Bot Chat, a Group Chat member or a chat that
+follows its profile is marked, with the chat that says so (marks.py), and a mark on a
+session, its chats or any session it descends from makes it INERT for good.
+
 The working directory of a gateway session is the client's: the receipt's request
 ``cwd``, only when the client sent one. The policy's own ``cwd`` falls back to the
 daemon's (gateway/session_policy.py ``resolve_agent_cwd``) and is never used.
@@ -127,6 +140,8 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from .marks import mark, marked
 
 ACTIVE = "active"
 #: A mode no session gets any more: a cron job is INERT. Kept so older imports resolve.
@@ -164,18 +179,32 @@ _DAEMON_KIND = "hermes-gateway"
 _IS_BOT_CHAT = "the Bot Chat, which other agents and API peers write into"
 _IS_GROUP = "a Group Chat member, which other agents write into"
 _FOLLOWS_PROFILE = "a chat that follows its profile (the Bot Chat or a Group Chat member)"
+_MARKED = "a chat other agents or people have written into (marked when that was seen)"
+#: How many parents up a session's lineage is read.
+LINEAGE_LIMIT = 64
 
 
 class Verdict(NamedTuple):
-    """``mode`` (ACTIVE or INERT), why it is INERT, and a gateway session's cwd."""
+    """``mode`` (ACTIVE or INERT), why it is INERT, a gateway session's cwd, and whether
+    the reason is that others write into the chat (``foreign``; such a chat is marked)."""
 
     mode: str
     reason: str = ""
     cwd: str | None = None
+    foreign: bool = False
 
 
 class StoreError(Exception):
     """The session store is there but could not be read."""
+
+
+class _Parent(NamedTuple):
+    """A row a session descends from."""
+
+    id: str
+    title: Any
+    model_config: Any
+    chat: str
 
 
 def _word(value: Any) -> str:
@@ -200,9 +229,9 @@ def group_chat(title: Any) -> bool:
 
 def _title_verdict(title: Any) -> Verdict | None:
     if bot_chat(title):
-        return Verdict(INERT, _IS_BOT_CHAT)
+        return Verdict(INERT, _IS_BOT_CHAT, foreign=True)
     if group_chat(title):
-        return Verdict(INERT, _IS_GROUP)
+        return Verdict(INERT, _IS_GROUP, foreign=True)
     return None
 
 
@@ -311,7 +340,7 @@ def _receipt_verdict(receipt: Any, chat_id: str, route: Any) -> Verdict:
         return Verdict(INERT, "a creation record for another session")
     request_id = receipt.get("request_id")
     if not isinstance(request_id, str) or request_id.startswith(_BOT_CHAT_REQUEST):
-        return Verdict(INERT, _IS_BOT_CHAT)
+        return Verdict(INERT, _IS_BOT_CHAT, foreign=True)
     policy = receipt.get("policy")
     source = policy.get("source") if isinstance(policy, dict) else None
     if source not in OWNER_SOURCES:
@@ -323,7 +352,7 @@ def _receipt_verdict(receipt: Any, chat_id: str, route: Any) -> Verdict:
     if not isinstance(request, dict):
         return Verdict(INERT, "a creation record that could not be read")
     if any(request.get(flag) is True for flag in _FOLLOWS):
-        return Verdict(INERT, _FOLLOWS_PROFILE)
+        return Verdict(INERT, _FOLLOWS_PROFILE, foreign=True)
     titled = _title_verdict(request.get("title"))
     if titled is not None:
         return titled
@@ -341,7 +370,7 @@ def _row_verdict(title: Any, model_config: Any) -> Verdict | None:
     except ValueError:
         config = None  # Hermes reads an unparseable model_config as empty too
     if isinstance(config, dict) and any(config.get(flag) for flag in _FOLLOWS):
-        return Verdict(INERT, _FOLLOWS_PROFILE)
+        return Verdict(INERT, _FOLLOWS_PROFILE, foreign=True)
     return None
 
 
@@ -359,55 +388,128 @@ def _chat_rows_verdict(conn: sqlite3.Connection, chats: list[str]) -> Verdict | 
     return None
 
 
+def _lineage(conn: sqlite3.Connection, parent: Any) -> list[_Parent]:
+    """The session's parents, nearest first: a branch, and a reset or compressed
+    continuation, name the session they came from (hermes_state_mutation_branch.py
+    ``branch_in_transaction``, hermes_state_compression.py
+    ``_publish_child_session_row``)."""
+    found: list[_Parent] = []
+    seen: set[str] = set()
+    query = "SELECT title, model_config, chat_id, parent_session_id FROM sessions WHERE id=?"
+    while isinstance(parent, str) and parent and parent not in seen:
+        if len(found) >= LINEAGE_LIMIT:
+            break
+        seen.add(parent)
+        row = conn.execute(query, (parent,)).fetchone()
+        if row is None:
+            break
+        found.append(_Parent(parent, row[0], row[1], str(row[2] or "")))
+        parent = row[3]
+    return found
+
+
+def _parents_verdict(conn: sqlite3.Connection, parents: list[_Parent]) -> Verdict | None:
+    """What the sessions a session descends from rule out: a parent row, any row of a
+    parent's chat, or a parent chat's receipt that names a chat others write into. A
+    parent's receipt is read for that alone; the session's own says who created it."""
+    for parent in parents:
+        found = _row_verdict(parent.title, parent.model_config)
+        if found is not None:
+            return found
+    chats = list(dict.fromkeys(parent.chat for parent in parents if parent.chat))
+    found = _chat_rows_verdict(conn, chats)
+    if found is not None:
+        return found
+    for chat in chats:
+        receipt = _meta(conn, _POLICY_KEY + chat)
+        if isinstance(receipt, dict):
+            found = _receipt_verdict(receipt, chat, None)
+            if found.foreign:
+                return found
+    return None
+
+
+def _judge(
+    conn: sqlite3.Connection,
+    session_id: str,
+    kwargs: Mapping[str, Any],
+    row: Any,
+    chats: list[str],
+    parents: list[_Parent],
+) -> tuple[Verdict, str]:
+    """What the rows and receipts say of a session: its own row, every row of its
+    chats, the sessions it descends from, and each chat's creation receipt. With a
+    ``foreign`` verdict comes the chat it was read from: the session's own, or the one
+    its route answers on."""
+    gateway = gateway_session(kwargs)
+    own = str(row[2] or "") if row is not None else ""
+    for key in [session_id, *chats]:
+        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (_API_KEY + key,)).fetchone():
+            return Verdict(INERT, "an API server conversation"), ""
+    if row is not None:
+        found = _row_verdict(row[0], row[3])
+        if found is not None:
+            return found, own
+        if row[1] == "tool":
+            return Verdict(INERT, "created as 'tool', not one of the owner's own chats"), ""
+        if row[1] not in ROW_SOURCES:
+            return Verdict(INERT, f"a session stored as {row[1]!r}, not a local chat"), ""
+        if own and _LOCAL_CHAT.fullmatch(own) is None:
+            return Verdict(INERT, "a session of a chat that is not a local one"), ""
+    for chat in chats:
+        found = _chat_rows_verdict(conn, [chat])
+        if found is not None:
+            return found, chat
+    found = _parents_verdict(conn, parents)
+    if found is not None:
+        return found, own
+    verdict = Verdict(ACTIVE)
+    for index, chat in enumerate(chats):
+        route = kwargs.get("gateway_session_key") if gateway and index == 0 else None
+        found = _receipt_verdict(_meta(conn, _POLICY_KEY + chat), chat, route)
+        if found.mode != ACTIVE:
+            return found, chat
+        if gateway and index == 0:
+            verdict = found
+    return verdict, ""
+
+
 def _verdict(
     conn: sqlite3.Connection,
     session_id: str,
     kwargs: Mapping[str, Any],
     *,
     need_row: bool = False,
+    home: Any = None,
 ) -> Verdict:
-    """The store's verdict for a session; INERT without its row when ``need_row``.
-    RAISES sqlite3.Error or ValueError."""
-    gateway = gateway_session(kwargs)
+    """The store's verdict for a session; INERT without its row when ``need_row``. A
+    session found to be one others write into is marked under ``home`` with the chat
+    that says so, and a mark on the session, its chats or any session it descends from
+    makes it INERT. RAISES sqlite3.Error or ValueError."""
     row = conn.execute(
-        "SELECT title, source, chat_id, model_config FROM sessions WHERE id=?", (session_id,)
+        "SELECT title, source, chat_id, model_config, parent_session_id FROM sessions WHERE id=?",
+        (session_id,),
     ).fetchone()
     if row is None and need_row:
         return Verdict(INERT, "a gateway session the store no longer has")
-    chats = [str(kwargs.get("chat_id"))] if gateway else []
+    chats = [str(kwargs.get("chat_id"))] if gateway_session(kwargs) else []
     row_chat = str(row[2] or "") if row is not None else ""
     if row_chat and row_chat not in chats:
         chats.append(row_chat)
-    for key in [session_id, *chats]:
-        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (_API_KEY + key,)).fetchone():
-            return Verdict(INERT, "an API server conversation")
-    if row is not None:
-        found = _row_verdict(row[0], row[3])
-        if found is not None:
-            return found
-        if row[1] == "tool":
-            return Verdict(INERT, "created as 'tool', not one of the owner's own chats")
-        if row[1] not in ROW_SOURCES:
-            return Verdict(INERT, f"a session stored as {row[1]!r}, not a local chat")
-        if row_chat and _LOCAL_CHAT.fullmatch(row_chat) is None:
-            return Verdict(INERT, "a session of a chat that is not a local one")
-    found = _chat_rows_verdict(conn, chats)
-    if found is not None:
-        return found
-    verdict = Verdict(ACTIVE)
-    for index, chat in enumerate(chats):
-        route = kwargs.get("gateway_session_key") if gateway and index == 0 else None
-        found = _receipt_verdict(_meta(conn, _POLICY_KEY + chat), chat, route)
-        if found.mode != ACTIVE:
-            return found
-        if gateway and index == 0:
-            verdict = found
-    return verdict
+    parents = _lineage(conn, row[4]) if row is not None else []
+    found, chat = _judge(conn, session_id, kwargs, row, chats, parents)
+    if found.foreign:
+        mark(home, [session_id, chat], found.reason)
+    elif found.mode == ACTIVE:
+        lineage = [key for parent in parents for key in (parent.id, parent.chat)]
+        if marked(home, [session_id, *chats, *lineage]):
+            return Verdict(INERT, _MARKED, foreign=True)
+    return found
 
 
 def check_session(home: Any, session_id: str, kwargs: Mapping[str, Any]) -> Verdict:
     """The verdict for a session the keywords allow, checked against the session store
-    of ``home``. Never raises."""
+    and the marks of ``home``. Never raises."""
     gateway = gateway_session(kwargs)
     if not gateway and gateway_daemon(home):
         return Verdict(INERT, "an agent the gateway daemon built without a chat (a side task)")
@@ -420,27 +522,46 @@ def check_session(home: Any, session_id: str, kwargs: Mapping[str, Any]) -> Verd
     except StoreError as err:
         return Verdict(INERT, f"the session store could not be read ({err})")
     if conn is None:
-        return Verdict(INERT, "no session store (state.db)") if gateway else Verdict(ACTIVE)
+        if gateway:
+            return Verdict(INERT, "no session store (state.db)")
+        return _unstored(home, session_id)
     try:
-        return _verdict(conn, session_id, kwargs, need_row=gateway)
+        return _verdict(conn, session_id, kwargs, need_row=gateway, home=home)
     except (sqlite3.Error, ValueError) as err:
         return Verdict(INERT, f"the session store could not be read ({type(err).__name__})")
     finally:
         conn.close()
 
 
-def recheck(home: Any, session_id: str, *, gateway: bool = False) -> Verdict:
-    """The store's verdict for ``session_id`` now, without the keywords (what the rows of
-    its chat and the chat's receipt say). Without a store or a row: ACTIVE for an
-    in-process session, INERT for a ``gateway`` one. RAISES StoreError when the store is
-    there but could not be read."""
+def _unstored(home: Any, session_id: str) -> Verdict:
+    """An in-process session with no store to read: its mark is all there is."""
+    return Verdict(INERT, _MARKED, foreign=True) if marked(home, [session_id]) else Verdict(ACTIVE)
+
+
+def recheck(
+    home: Any,
+    session_id: str,
+    *,
+    gateway: bool = False,
+    chat_id: str | None = None,
+    route: str | None = None,
+) -> Verdict:
+    """The store's verdict for ``session_id`` now: what its rows, its chat's rows and
+    receipt, its parents and the marks say. A ``gateway`` session passes the ``chat_id``
+    and ``route`` it was built for, so the chat it answers on is read again as well as
+    the chat of the row it runs. Without a store or a row: ACTIVE for an in-process
+    session (unless marked), INERT for a ``gateway`` one. RAISES StoreError when the
+    store is there but could not be read."""
     if not home or not session_id:
         return Verdict(INERT, "no session to check") if gateway else Verdict(ACTIVE)
     conn = _connect(str(home))
     if conn is None:
-        return Verdict(INERT, "no session store (state.db)") if gateway else Verdict(ACTIVE)
+        if gateway:
+            return Verdict(INERT, "no session store (state.db)")
+        return _unstored(home, session_id)
+    kwargs = {"chat_id": chat_id, "gateway_session_key": route} if gateway and chat_id else {}
     try:
-        return _verdict(conn, session_id, {}, need_row=gateway)
+        return _verdict(conn, session_id, kwargs, need_row=gateway, home=home)
     except (sqlite3.Error, ValueError) as err:
         raise StoreError(type(err).__name__) from err
     finally:

@@ -2,8 +2,9 @@
 
 ``harnesses/hermes/messages.py`` copies Hermes's failed-turn notices and their
 ``display_kind``; ``harnesses/hermes/sessions.py`` copies the shape of a gateway local
-session (its chat id, its route, the state keys of its creation receipt) and the
-surfaces Hermes stores as an owner's own chat. A Hermes that renames any of them would
+session (its chat id, its route, the state keys of its creation receipt), the
+surfaces Hermes stores as an owner's own chat, and the session store's columns it
+reads. A Hermes that renames any of them would
 turn a failed turn back into an uploaded reply, or the owner's ``hermes chat`` back into
 an inert session, without a unit test noticing: these checks ask the checkout itself.
 
@@ -36,15 +37,20 @@ pytestmark = pytest.mark.skipif(
 
 _DRIVER = textwrap.dedent(
     """
-    import json, os
+    import json, os, sqlite3
 
     from agent import turn_failure_copy as failures
     from gateway.config import Platform
     from gateway.session import SessionSource, build_session_key
     from gateway.session_policy import STORED_AS_LOCAL, SURFACES
     from hermes_state_keys import local_identity
+    from hermes_state_common import SCHEMA_SQL
     from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX
 
+    store = sqlite3.connect(":memory:")
+    store.executescript(SCHEMA_SQL)
+    columns = {table: [row[1] for row in store.execute("PRAGMA table_info(%s)" % table)]
+               for table in ("sessions", "state_meta")}
     notices = [failures.FAILED_TURN_NOTICE, failures.PARTIAL_FAILED_TURN_NOTICE,
                failures.AUTOMATION_INTERRUPTED_NOTICE]
     owner = "uid:%d" % os.getuid()
@@ -60,6 +66,7 @@ _DRIVER = textwrap.dedent(
         "api_prefix": API_BINDING_PREFIX,
         "surfaces": sorted(SURFACES),
         "stored_as_local": sorted(STORED_AS_LOCAL),
+        "columns": columns,
     }))
     """
 )
@@ -117,3 +124,11 @@ def test_this_hermes_local_session_has_the_shape_the_rule_knows(names: dict[str,
     assert (names["policy_prefix"], names["api_prefix"]) == (hs._POLICY_KEY, hs._API_KEY)
     assert hs.OWNER_SOURCES <= set(names["surfaces"])
     assert set(names["stored_as_local"]) - {"tool"} <= hs.OWNER_SOURCES
+
+
+def test_this_hermes_store_has_the_columns_the_rule_reads(names: dict[str, Any]) -> None:
+    """A column the rule selects and the store lacks reads as "the session store could
+    not be read": every session INERT, the owner's own included."""
+    sessions = {"id", "title", "source", "chat_id", "model_config", "parent_session_id"}
+    assert sessions <= set(names["columns"]["sessions"])
+    assert {"key", "value"} <= set(names["columns"]["state_meta"])

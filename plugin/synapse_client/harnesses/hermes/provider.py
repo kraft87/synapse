@@ -172,6 +172,9 @@ class SynapseMemoryProvider(MemoryProvider):
     #: The ``user_id`` the gateway bound the session to: the owner's own turns carry it
     #: as their author. None in-process, where a human turn has no author.
     _owner_id: str | None = None
+    #: The chat and route the gateway built the session for; read again at each recheck.
+    _chat_id: str | None = None
+    _route: str | None = None
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -228,6 +231,9 @@ class SynapseMemoryProvider(MemoryProvider):
         home = kwargs.get("hermes_home")
         if verdict.mode == ACTIVE:
             verdict = hs.check_session(home, str(session_id or ""), kwargs)
+        elif verdict.foreign:
+            # The keywords carried the title, so the store check, which marks, never ran.
+            hs.mark(home, [session_id, kwargs.get("chat_id")], verdict.reason)
         mode = verdict.mode
         settings = Settings.load()
         client = Client(settings, f"synapse-client/{__version__} hermes")
@@ -235,8 +241,11 @@ class SynapseMemoryProvider(MemoryProvider):
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
-        user_id = kwargs.get("user_id")
-        self._owner_id = user_id if self._gateway and isinstance(user_id, str) else None
+        user_id, chat_id, route = (
+            kwargs.get(key) if self._gateway and isinstance(kwargs.get(key), str) else None
+            for key in ("user_id", "chat_id", "gateway_session_key")
+        )
+        self._owner_id, self._chat_id, self._route = user_id, chat_id, route
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
@@ -330,7 +339,9 @@ class SynapseMemoryProvider(MemoryProvider):
             return False
         sid = str(session_id or self._session_id)
         try:
-            verdict = hs.recheck(self._home, sid, gateway=self._gateway)
+            verdict = hs.recheck(
+                self._home, sid, gateway=self._gateway, chat_id=self._chat_id, route=self._route
+            )
         except Exception:
             self._say_once("synapse: the session store could not be read; skipped this call")
             return False
@@ -421,11 +432,14 @@ class SynapseMemoryProvider(MemoryProvider):
         return self._owner_id is None or author_id != self._owner_id
 
     def _authored(self) -> None:
-        """A turn someone else wrote reached this agent: off for good, said once."""
+        """A turn someone else wrote reached this agent: off for good, said once, and the
+        session and its chat are marked so an agent built for them later is off too."""
+        reason = "a turn another agent or person wrote"
         with self._lock:
             self._mode = INERT
             sid = self._session_id
-        self._say_once(f"synapse: off for session {sid}: a turn another agent or person wrote")
+        hs.mark(self._home, [sid, self._chat_id], reason)
+        self._say_once(f"synapse: off for session {sid}: {reason}")
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         try:

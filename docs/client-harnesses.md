@@ -140,34 +140,60 @@ passes and, for a session they allow, Hermes's own record of who created it
   memory through the agent, nor have their messages stored as the owner's. The reason is
   logged once.
 
-The session's rows in `state.db` (its title, stored source and chat, and every row of
-that chat) are read again before the system prompt block, each nudge, upload and tool
-call, since a session can be renamed "Bot Chat" or switched to another (`/resume`,
-compression) without a new provider; one that no longer passes turns the instance inert
-for good, and so does a gateway session whose row is gone. A turn another agent or
-person wrote is not uploaded and turns the instance inert for good. Hermes names a
-turn's author on `on_turn_start` and in `sync_turn`'s `turn_author`: the daemon names
-one on every turn, the owner's own as the session's `user_id` (`uid:<this OS user>`, not
-a bot); in-process, a human turn has none. An author that is a bot, or not the session's
-user, is someone else. Hermes builds the system prompt before it names the first turn's
-author, so an in-process run whose environment still carries `HERMES_TURN_AUTHOR` (a
-bot-to-bot delivery run as a quiet one-shot) is inert from `initialize`. A gateway
-session's project comes from the `cwd` its client sent, never the daemon's.
+The session's rows in `state.db` are read again before the system prompt block, each
+nudge, upload and tool call: its title, stored source and chat, every row of that chat
+and of the chat its route answers on, and the sessions it was branched or continued from
+(`parent_session_id`: a parent row, any row of a parent's chat, or a parent chat's
+receipt that says Bot Chat, Group Chat member or `follow_profile_config`). A session can
+be renamed "Bot Chat" or switched to another (`/resume`, compression) without a new
+provider; one that no longer passes turns the instance inert for good, and so does a
+gateway session whose row is gone. A turn another agent or person wrote is not uploaded
+and turns the instance inert for good. Hermes names a turn's author on `on_turn_start`
+and in `sync_turn`'s `turn_author`: the daemon names one on every turn, the owner's own
+as the session's `user_id` (`uid:<this OS user>`, not a bot); in-process, a human turn
+has none. An author that is a bot, or not the session's user, is someone else. The
+owner's id means only that nobody stamped the turn. A gateway session's project comes
+from the `cwd` its client sent, never the daemon's.
+
+**Marks.** A session judged a Bot Chat, a Group Chat member or a chat that follows its
+profile, or handed a turn someone else wrote, is marked together with that chat: one
+owner-only file each under `<hermes_home>/synapse/inert/`, named by the SHA-256 of the
+id and holding the id and the reason. A marked session, every session of a marked chat,
+and every session branched or continued from one stay inert after the title is removed
+(archive, rename) and after Hermes builds a new agent for the session. Marks are only
+added, and a mark on a branch never marks its parent. Deleting the file turns that chat
+back on.
 
 What this does not cover:
 
 - The board already in a system prompt stays there. Hermes stores the prompt and
   restores it verbatim for a continuing session, so a session renamed "Bot Chat",
   branched or handed off after its first turn keeps the board it was built with; only
-  later rebuilds go without it.
+  later rebuilds go without it. Two moves take such a prompt, with the transcript, to a
+  messaging chat: the owner's own `/handoff`, and on Matrix `/resume <id or title>
+  --cross-room` from anyone allowed to message the bot (other platforms need a
+  configured admin). The provider cannot stop either.
+- Hermes builds the first turn's prompt before it names that turn's author. A
+  bot-to-bot delivery run as a one-shot through the daemon would get the board on that
+  one turn; no Hermes path starts such a run today. A process whose own environment
+  carries `HERMES_TURN_AUTHOR` is inert from `initialize`, a backstop nothing reaches.
 - Hermes treats whoever can sign in to its dashboard or Webapp as the machine's owner
   (`gateway/owner_identity.py`): their sessions carry the owner's `uid:` subject, so they
-  are the owner's here too.
+  are the owner's here too. That covers a remote Desktop, a phone and a standalone
+  dashboard.
 - The welcome-trial mark (`follow_adopted`) is not read: Hermes puts it on an ordinary
   chat created on the trial model as well as on Bot Chats, which are caught by title.
+- A chat that stopped looking like a Bot Chat before the provider first judged it has
+  no mark: an older Bot Chat archived or renamed before then reads as an owner's chat.
 - A side agent built in the stdio TUI or Desktop backend's own process (not the daemon)
   carries no parent and no row, so it is active even when the session that started it
-  is not (a Bot Chat open there, say).
+  is not (a Bot Chat open there, say). In that same process a model switch on a draft
+  builds the prompt before the session has a row.
+- Automation turns in an owner's chat (wake, goals, notifications) run with the nudge
+  and the tools: Hermes gives them the owner as author.
+- Wrongly inert: a session from before Hermes's creation receipts resumed through the
+  daemon, the owner's own `/background` and `/btw` there, every daemon session on
+  Windows, and an agent built while `state.db` could not be read.
 - An automation turn inside an owner's chat (a cron delivery or notice, which Hermes
   marks with a `display_kind`) is skipped as synthetic, so the assistant's reply to it
   is uploaded with the previous real turn.
@@ -181,7 +207,8 @@ the chat identity is `_GATEWAY_IDENTITY_PARAMS` in `agent/agent_init_params.py`)
 receipt), `gateway/control_socket.py` and `gateway/owner_identity.py` (the `uid:` subject,
 minted for a peer of the same OS user and for every dashboard login),
 `gateway/session_policy.py` (`follow_profile_config`), `gateway/session_bot.py` and
-`hermes_state_local_lineage.py` (the Bot Chat and its reset), the Desktop's
+`hermes_state_local_lineage.py` (the Bot Chat and its reset),
+`hermes_state_mutation_branch.py` (a branch and its `parent_session_id`), the Desktop's
 `plugins/hermes-bots/group-turns.ts` and `canonical-chat.ts` (Group Chat members and the
 Bot Chat it mints), `gateway/session_tui_side.py` and `gateway/status.py` (side agents and
 the daemon's pid record), `run_agent.py` (`turn_author`), `gateway/platforms/api_server.py`

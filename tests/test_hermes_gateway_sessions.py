@@ -107,7 +107,8 @@ def _store(
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, "
             "created_source TEXT, user_id TEXT, chat_id TEXT, chat_type TEXT, "
-            "session_key TEXT, cwd TEXT, title TEXT, model_config TEXT)"
+            "session_key TEXT, cwd TEXT, title TEXT, model_config TEXT, "
+            "parent_session_id TEXT)"
         )
         conn.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT)")
         chat = sid if chat_id is None else chat_id
@@ -326,10 +327,10 @@ def test_an_in_process_session_is_checked_but_needs_no_store(tmp_path):
     _store(tmp_path, sid, source="tool", receipt=False, chat_id="")
     assert hs.check_session(tmp_path, sid, _in_process()).mode == hs.INERT
     # A gateway session resumed in-process is held to its receipt.
-    _store(tmp_path, _LOCAL, request_id="bot-chat:/home/kyle/.hermes")
-    assert hs.check_session(tmp_path, _LOCAL, _in_process()).mode == hs.INERT
     _store(tmp_path, _LOCAL)
     assert hs.check_session(tmp_path, _LOCAL, _in_process()) == hs.Verdict(hs.ACTIVE)
+    _store(tmp_path, _LOCAL, request_id="bot-chat:/home/kyle/.hermes")
+    assert hs.check_session(tmp_path, _LOCAL, _in_process()).mode == hs.INERT
 
 
 _TELEGRAM = "20261112_090000_aa11bb"
@@ -372,6 +373,26 @@ def test_a_session_of_another_local_chat_needs_its_own_receipt(tmp_path):
     conn.commit()
     conn.close()
     assert "no creation record" in hs.check_session(tmp_path, _OTHER, _gateway()).reason
+
+
+def test_recheck_reads_the_chat_the_agent_was_built_for(tmp_path):
+    """The route's chat is read again as well as the chat of the row the agent runs: at
+    ``initialize`` both were, and a switch can leave them different."""
+    _store(tmp_path)
+    _store(tmp_path, _OTHER)
+    route = f"agent:main:local:dm:{_LOCAL}"
+    built_for = {"gateway": True, "chat_id": _LOCAL, "route": route}
+    assert hs.recheck(tmp_path, _OTHER, **built_for) == hs.Verdict(hs.ACTIVE, "", _WORK)
+    assert hs.recheck(tmp_path, _OTHER, gateway=True) == hs.Verdict(hs.ACTIVE)
+    other_route = {**built_for, "route": f"agent:main:local:dm:{_OTHER}"}
+    assert "another session" in hs.recheck(tmp_path, _OTHER, **other_route).reason
+    _store(tmp_path, "20261112_170501_9b8c7d", chat_id=_LOCAL, title="Bot Chat", receipt=False)
+    assert hs.recheck(tmp_path, _OTHER, gateway=True) == hs.Verdict(hs.ACTIVE)
+    # In-process there is no route: a chat id is not passed on.
+    assert hs.recheck(tmp_path, _OTHER, chat_id=_LOCAL, route=route) == hs.Verdict(hs.ACTIVE)
+    assert "Bot Chat" in hs.recheck(tmp_path, _OTHER, **built_for).reason
+    # The session answered on a Bot Chat's route: it is marked, and off wherever it runs.
+    assert hs.recheck(tmp_path, _OTHER, gateway=True).mode == hs.INERT
 
 
 def test_recheck_reads_the_row_without_the_keywords(tmp_path):

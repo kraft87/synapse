@@ -25,9 +25,10 @@ changed, what to do on each machine, what was proven, and what is still open.
   - Everything else stays inert: messaging platforms, the API server, hosted rooms,
     peer agents, the Bot Chat, Desktop Group Chat members, subagents, sessions someone
     else created, and any shape not listed. The reason is logged once.
-  - The session's rows are read again before the system prompt block and each nudge,
-    upload and tool call. A session that stops passing, or a gateway session whose row
-    is gone, turns the instance inert for good.
+  - The session's rows, and those of the chat its route answers on, are read again
+    before the system prompt block and each nudge, upload and tool call. A session that
+    stops passing, or a gateway session whose row is gone, turns the instance inert for
+    good.
   - The project comes from the `cwd` the client sent, never from the daemon's.
 - **In-process sessions** (no chat identity) are active unless the process is the
   gateway daemon (its `gateway.lock` or `gateway.pid` record holds this pid: a
@@ -43,14 +44,29 @@ changed, what to do on each machine, what was proven, and what is still open.
   nudge) and in `sync_turn`'s `turn_author`. The daemon names one on every turn, the
   owner's own as the session's `user_id` and not a bot (`gateway/run_turn_runner.py`);
   in-process, a human turn has none. A bot (the flag alone, with or without an id),
-  another id, or any author in-process is someone else: a Bot Mode delivery run as an
-  in-process one-shot (`HERMES_TURN_AUTHOR`, `hermes_cli/cli_single_query.py`) used to
-  be uploaded as the owner's.
-- **A dispatched delivery is inert from `initialize`.** An in-process run whose
-  environment still carries `HERMES_TURN_AUTHOR` gets no board: Hermes builds the system
-  prompt before it names the turn's author (`agent/turn_context.py`), so the author
-  check alone came too late for the first turn. The quiet one-shot (`-Q`) builds its
-  agent before it consumes the variable; the other one-shot path consumes it first.
+  another id, or any author in-process is someone else. The owner's id as author means
+  only that nobody stamped the turn: an unstamped delivery into a Bot Chat is stopped
+  by the chat's own marks, not by this rule.
+- **A chat others wrote into stays off after its title is gone, its agent is rebuilt or
+  it is branched.**
+  - The first time a session is judged a Bot Chat, a Group Chat member or a chat that
+    follows its profile, or is handed a turn someone else wrote, the session and that
+    chat are marked: one owner-only file each under `<hermes_home>/synapse/inert/`,
+    named by the SHA-256 of the id and holding the id and the reason.
+  - A mark makes that session, every session of that chat, and every session branched
+    or continued from them inert for good. Before, "for good" lasted only as long as
+    the provider instance: a rebuilt agent started active again and, resumed, uploaded
+    up to ten earlier turns as the owner's, the foreign ones among them. A Bot Chat
+    archived or renamed read as an owner's chat.
+  - A session is held to the sessions it descends from (`parent_session_id`): a parent
+    row, any row of a parent's chat, or a parent chat's receipt that says Bot Chat,
+    Group Chat member or `follow_profile_config`. A branch of a Bot Chat under a title
+    of its own used to pass.
+  - Marks are only added, and a mark on a branch never marks its parent. Deleting the
+    file turns that chat back on.
+- **A process whose environment carries `HERMES_TURN_AUTHOR` is inert from
+  `initialize`.** A backstop only: no Hermes path builds an agent in such a process
+  today (see Open).
 - **A tool call before `initialize` is refused.** It used to reach the server. Hermes
   refuses such a call itself (`agent/memory_manager.py`, `caller_scope`), so nothing
   that worked stops working. With cron gone, a tool call works only in an active
@@ -88,15 +104,19 @@ changed, what to do on each machine, what was proven, and what is still open.
 **Proven**
 
 - New tests in seven new files: `test_hermes_gateway_sessions.py` (the rule, over a
-  `state.db` built like Hermes's), `test_hermes_privacy_audiences.py` (45: each
+  `state.db` built like Hermes's), `test_hermes_privacy_audiences.py` (59: each
   audience above, its shape built from what Hermes writes and cited),
   `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` (a child process
   killed mid-request, sessions sharing an outbox), `test_client_core_outbox_writeahead.py`,
   `test_client_core_outbox_private_dirs.py`, `test_hermes_install_selection.py`.
-  - Non-db suite: 4141 passed, 36 skipped, 2 xfailed, and the four
-    `test_hermes_provider.py` failures listed under Open.
+  - Non-db suite: 4424 passed, 37 skipped, 2 xfailed.
   - With `SYNAPSE_HERMES_CHECKOUT`, the integration test and
-    `test_hermes_checkout_names.py` pass against Hermes `bca51750`. Ruff is clean.
+    `test_hermes_checkout_names.py` pass against Hermes `bca51750`, the columns the
+    rule reads from its store among the names checked. Ruff is clean.
+  - The rule as merged, run over a copy of the `state.db` those real runs left (30
+    sessions): the 25 owner sessions active, the three `--source tool` ones inert, the
+    Bot Chat and the `follow_profile_config` session inert and marked. That store has
+    no branch, so the parent check ran on built stores only.
 - Real `hermes chat` (Hermes `bca51750`, a scripted stub model, the production server):
   ten messages, nine complete turns and one failed; seven turns uploaded.
   - The board and preferences reached the system prompt and the nudge reached each
@@ -128,7 +148,10 @@ changed, what to do on each machine, what was proven, and what is still open.
 - Messaging-gateway and API-server sessions still get nothing: they need a way to say
   whose chat it is.
 - Not driven live in this change: `hermes --tui` over the daemon (it reaches the
-  provider as `hermes chat` does), Desktop and ACP.
+  provider as `hermes chat` does), Desktop, the Webapp and ACP. Whether a Desktop or
+  Webapp submit stamps a turn author was not determined; if one does, those chats turn
+  inert at their first turn.
+- The marks, the parent check and a rebuilt agent are covered by unit tests only.
 - Hermes keeps the nudge in its stored transcript (`api_content`). The upload strips
   it; the transcript is Hermes's.
 - An automation turn in an owner's chat (a cron delivery or notice, a `display_kind`
@@ -138,14 +161,35 @@ changed, what to do on each machine, what was proven, and what is still open.
   chat created on the trial model (`gateway/session_local.py`) as well as on Bot Chats.
 - The board already in a stored system prompt stays: Hermes restores it verbatim for a
   continuing session (renamed, branched, handed off). Only later rebuilds go without.
-  The first turn's prompt is built before `on_turn_start` names an author; only a
-  quiet dispatched one-shot is caught earlier, by its environment.
+  Two moves then take it, with the whole transcript, to a messaging chat: the owner's
+  own `/handoff`, and on Matrix `/resume <id or title> --cross-room` from anyone allowed
+  to message the bot (other platforms need a configured admin for it). Read in Hermes's
+  source, not run; not reported upstream yet. The provider cannot stop either.
+- The first turn's prompt is built before `on_turn_start` names an author. A bot-to-bot
+  delivery run as a one-shot through the daemon would get the board on that one turn
+  before the session turns off. Nothing in Hermes `bca51750` starts such a run:
+  `hermes chat` and both one-shot paths run in the daemon, whose environment has
+  `HERMES_TURN_AUTHOR` stripped, so the environment check never fires there.
 - Whoever can sign in to the Hermes dashboard or Webapp is the owner here: Hermes maps
-  every login to the owner's `uid:` subject.
+  every login to the owner's `uid:` subject. That covers a remote Desktop, a phone and
+  a standalone dashboard.
 - A side agent built in the stdio TUI or Desktop backend's own process has no parent
   and no row, so it is active even when its parent is a Bot Chat.
-- A Bot Chat whose title was cleared (archived) and that carries no
-  `follow_profile_config` reads as an owner chat; Hermes no longer delivers to it.
+- A chat that stopped looking like a Bot Chat before this provider first judged it has
+  no mark. An older Bot Chat (no `follow_profile_config`, a random request id) that was
+  archived or renamed before this version ran reads as an owner's chat, and resuming it
+  uploads up to ten earlier turns.
+- In the stdio TUI or Desktop backend a model switch on a draft builds the prompt
+  before the session has a row, so a draft that becomes a Bot Chat or Group Chat member
+  can keep the board in its first prompt.
+- Automation turns in an owner's chat (wake, goals, notifications) run with the nudge
+  and the tools: Hermes gives them the owner as author.
+- Wrongly inert, known:
+  - a session from before Hermes's creation receipts, resumed through the daemon (its
+    chat id is the old row id, not `local-<hex>`);
+  - the owner's own `/background` and `/btw` in the daemon;
+  - every daemon session on Windows (the owner subject there is a SID);
+  - an agent built while `state.db` could not be read, until Hermes rebuilds it.
 
 ## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.6)
 
