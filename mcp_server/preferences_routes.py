@@ -8,6 +8,11 @@ FastMCP's auth middleware by design), PG work in a threadpool, fail-soft JSON.
 Route (GET):
   /preferences/top?limit=8  -> {"status": "ok", "items": [{pref, polarity, assert_count, since}]}
 
+The block itself is rendered HERE (``top_block``) and served with the board by
+``GET /context?parts=board,preferences`` (mcp_server/board.py), so a session start is one
+request and every harness shows the same lines. ``/preferences/top`` stays for the
+clients released before that, which render the items themselves.
+
 Ranked by (assert_count DESC, last_asserted DESC): the strongest, most-recently-reasserted
 preferences first. Across every project for the owner — a standing preference ("never use
 tables") shapes every session, not just its originating project's.
@@ -21,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import psycopg
@@ -38,6 +43,10 @@ logger = logging.getLogger(__name__)
 # Single-owner constant, mirroring kg_pg_write.OWNER / the recall leg.
 _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 _MAX_LIMIT = 50
+#: Preferences in the session-start block: few enough to apply to every turn.
+BLOCK_LINES = 7
+_HEADER = "[Synapse preferences]"
+_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
 
 
 def _top_preferences(
@@ -71,6 +80,29 @@ def _top_preferences(
             ]
         except psycopg.errors.UndefinedTable:
             return []
+
+
+def render_block(items: Iterable[Mapping[str, Any]]) -> str:
+    """The session-start block for ``items`` (``_top_preferences`` rows): the header and
+    one ``  - (<likes|dislikes|rule>) <pref>`` line each, at most ``BLOCK_LINES``; ""
+    when there is no line to show. The text a client before ``/context?parts=`` renders
+    from ``/preferences/top`` (synapse_client.context.preferences_block), line for
+    line."""
+    lines = [_HEADER]
+    for item in list(items)[:BLOCK_LINES]:
+        pref = item.get("pref")
+        if not pref:
+            continue
+        polarity = item.get("polarity")
+        lines.append(f"  - ({_MARK.get(polarity, polarity or '')}) {pref}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def top_block(db_url: str, trust: SurfaceTrust) -> str:
+    """``render_block`` for the top preferences a caller with ``trust`` is served: the
+    same scoping as ``/preferences/top`` (``_top_preferences``). Raises what the query
+    raises."""
+    return render_block(_top_preferences(db_url, BLOCK_LINES, trust.project_filter))
 
 
 def register(

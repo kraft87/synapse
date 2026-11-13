@@ -341,6 +341,17 @@ def test_context_sends_the_project_only_when_there_is_one(srv):
     assert srv.seen[-1]["headers"]["authorization"] == f"Bearer {_TOKEN}"
 
 
+def test_context_names_the_parts_it_wants(srv):
+    srv.routes["/context"] = lambda h: h.reply(200, {"status": "ok", "preferences": "block"})
+    client = _client(srv.url)
+    assert client.context("synapse", parts=("board", "preferences"))["preferences"] == "block"
+    assert srv.seen[-1]["query"] == {"project": "synapse", "parts": "board,preferences"}
+    client.context(parts=["preferences"])
+    assert srv.seen[-1]["query"] == {"parts": "preferences"}
+    client.context("synapse", parts=())  # none named: the parameter is left out
+    assert srv.seen[-1]["query"] == {"project": "synapse"}
+
+
 def test_context_raises_on_401(srv):
     srv.routes["/context"] = lambda h: h.reply(401, {"detail": "no"})
     with pytest.raises(urllib.error.HTTPError):

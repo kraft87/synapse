@@ -5,17 +5,20 @@ hook's JSON, a provider's return value) and the few words that are its own: how 
 signs in from it (``login_hint``), where an environment token lives for it, and the
 names its model sees the memory tools under.
 
-The session-start block is assembled from pieces, each exposed on its own:
+The session-start block is assembled from pieces:
 
 - ``notice_part``: the credential notice (credentials.override_notice), local;
 - the upload warning, passed in by the caller (outbox.failure_warning), local;
-- ``board_part``: the server-rendered board, or the reason this machine is served none;
-- ``preferences_part``: the top preferences.
+- ``server_parts``: what the server renders, from ONE request: the board (or the reason
+  this machine is served none) and the preferences block.
 
-Every ``*_part``, ``session_block`` and ``prompt_nudge`` is FAIL-OPEN: an unreachable
-server or a malformed reply yields "" for that piece, never an exception, because a
-broken board must not break a session start. ``board_parts`` and the ``*_block``
-renderers are plain functions that raise on bad input; the parts catch around them.
+``session_block`` is all of it in order. A harness with a deadline of its own calls
+``server_parts`` on a thread and assembles the pieces that came back in time.
+
+``notice_part``, ``server_parts``, ``session_block`` and ``prompt_nudge`` are FAIL-OPEN:
+an unreachable server or a malformed reply yields "" for that piece, never an
+exception, because a broken board must not break a session start. The ``*_block``
+renderers are plain functions that raise on bad input.
 """
 
 from __future__ import annotations
@@ -70,9 +73,12 @@ def _sentence(hint: str) -> str:
 
 
 def preferences_block(items: Iterable[Mapping[str, Any]]) -> str:
-    """The preferences block for the server's top items: a header and up to seven
-    ``  - (<likes|dislikes|rule>) <pref>`` lines, items without a ``pref`` skipped; ""
-    when no line remains. Raises on items that are not mappings."""
+    """The preferences block for the items of ``/preferences/top``: a header and up to
+    seven ``  - (<likes|dislikes|rule>) <pref>`` lines, items without a ``pref``
+    skipped; "" when no line remains. Raises on items that are not mappings.
+
+    Only for a server from before ``/context`` carried the block, which renders the same
+    lines itself (mcp_server/preferences_routes.render_block)."""
     lines = ["[Synapse preferences]"]
     for item in list(items)[:_PREFS_MAX_LINES]:
         pref = item.get("pref")
@@ -119,45 +125,6 @@ def restricted_block(login_hint: str = DEFAULT_LOGIN_HINT, *, paste_aside: str =
 
 
 # ---------------------------------------------------------------------------
-# The board
-# ---------------------------------------------------------------------------
-
-
-def board_parts(
-    client: Client,
-    project: str | None,
-    settings: Settings,
-    timeout: float = 10,
-    *,
-    login_hint: str = DEFAULT_LOGIN_HINT,
-    not_enrolled: str | None = None,
-    restricted: str | None = None,
-) -> list[str]:
-    """The board for ``project``, plus the enrollment explainer when one applies.
-
-    A 401 for an unenrolled machine becomes ``not_enrolled_block``; any other HTTP error
-    status yields nothing. A 200 that says ``restricted`` to an unenrolled machine gets
-    ``restricted_block`` ahead of the board text. ``not_enrolled`` and ``restricted``,
-    when given, are those explainers already worded by the harness, used as they are in
-    place of the ones rendered from ``login_hint``. RAISES what the client raises for an
-    unreachable server or a malformed reply (``board_part`` catches)."""
-    parts: list[str] = []
-    try:
-        reply = client.context(project, timeout=timeout)
-    except urllib.error.HTTPError as err:
-        if err.code == 401 and not settings.enrolled:
-            parts.append(not_enrolled_block(login_hint) if not_enrolled is None else not_enrolled)
-        return parts
-    ok = reply.get("status") == "ok"
-    if ok and reply.get("trust") == "restricted" and not settings.enrolled:
-        parts.append(restricted_block(login_hint) if restricted is None else restricted)
-    text = reply.get("text") if ok else None
-    if text:
-        parts.append(str(text))
-    return parts
-
-
-# ---------------------------------------------------------------------------
 # The pieces, each fail-open
 # ---------------------------------------------------------------------------
 
@@ -185,7 +152,35 @@ def notice_part(
         return ""
 
 
-def board_part(
+def _board(
+    reply: Mapping[str, Any], settings: Settings, login_hint: str, restricted: str | None
+) -> str:
+    """The board part of a ``/context`` reply: its text, with ``restricted_block`` ahead
+    of it when the reply says ``restricted`` to an unenrolled machine."""
+    if reply.get("status") != "ok":
+        return ""
+    parts = []
+    if reply.get("trust") == "restricted" and not settings.enrolled:
+        parts.append(restricted_block(login_hint) if restricted is None else restricted)
+    if reply.get("text"):
+        parts.append(str(reply["text"]))
+    return "\n\n".join(parts)
+
+
+def _preferences(client: Client, reply: Mapping[str, Any], left: float) -> str:
+    """The preferences block of a ``/context`` reply. A server from before the block
+    came with the board leaves it out: its top preferences are then read from
+    ``/preferences/top`` and rendered here, in the ``left`` seconds of the caller's
+    timeout (kept for one release). Raises what that request raises."""
+    if "preferences" in reply:
+        text = reply["preferences"]
+        return text if isinstance(text, str) else ""
+    if left <= 0:
+        return ""
+    return preferences_block(client.preferences(limit=_PREFS_MAX_LINES, timeout=left))
+
+
+def server_parts(
     client: Client,
     project: str | None,
     settings: Settings,
@@ -194,36 +189,47 @@ def board_part(
     login_hint: str = DEFAULT_LOGIN_HINT,
     not_enrolled: str | None = None,
     restricted: str | None = None,
-) -> str:
-    """``board_parts`` joined by blank lines (``login_hint``, ``not_enrolled`` and
-    ``restricted`` as there); "" when ``SYNAPSE_BOARD`` is "0" or anything fails. Never
-    raises."""
-    if settings.flag("SYNAPSE_BOARD", "1") == "0":
-        return ""
-    try:
-        parts = board_parts(
-            client,
-            project,
-            settings,
-            timeout,
-            login_hint=login_hint,
-            not_enrolled=not_enrolled,
-            restricted=restricted,
-        )
-        return "\n\n".join(parts)
-    except Exception:
-        return ""
+) -> tuple[str, str]:
+    """What the server renders for a session start, from ONE request: the board part
+    and the preferences block.
 
+    The board part is the board for ``project``, or the reason this machine is served
+    none: a 401 for an unenrolled machine becomes ``not_enrolled_block``, and a reply
+    that says ``restricted`` to an unenrolled machine gets ``restricted_block`` ahead of
+    the board. ``not_enrolled`` and ``restricted``, when given, are those explainers
+    already worded by the harness, used in place of the ones rendered from
+    ``login_hint``.
 
-def preferences_part(client: Client, settings: Settings, *, timeout: float = 10) -> str:
-    """``preferences_block`` for the server's top eight items; "" when
-    ``SYNAPSE_PREFS_BLOCK`` is "0" or anything fails. Never raises."""
-    if settings.flag("SYNAPSE_PREFS_BLOCK", "1") == "0":
-        return ""
+    A piece switched off (``SYNAPSE_BOARD``, ``SYNAPSE_PREFS_BLOCK``: "0") is not asked
+    for and is ""; with the board off no project is sent, and with both off there is no
+    request. ``timeout`` bounds each socket
+    wait, and the whole call when a second request is needed (``_preferences``). Never
+    raises: an unreachable server, an error status or a malformed reply is "" for both
+    pieces."""
     try:
-        return preferences_block(client.preferences(limit=8, timeout=timeout))
+        want_board = settings.flag("SYNAPSE_BOARD", "1") != "0"
+        want_prefs = settings.flag("SYNAPSE_PREFS_BLOCK", "1") != "0"
+        parts = [name for name, on in (("board", want_board), ("preferences", want_prefs)) if on]
+        if not parts:
+            return "", ""
+        started = time.monotonic()
+        try:
+            # The project is the board's: the preferences are not scoped by one.
+            reply = client.context(project if want_board else None, timeout=timeout, parts=parts)
+        except urllib.error.HTTPError as err:
+            if want_board and err.code == 401 and not settings.enrolled:
+                return not_enrolled_block(login_hint) if not_enrolled is None else not_enrolled, ""
+            return "", ""
+        board = _board(reply, settings, login_hint, restricted) if want_board else ""
     except Exception:
-        return ""
+        return "", ""
+    prefs = ""
+    if want_prefs:
+        try:
+            prefs = _preferences(client, reply, timeout - (time.monotonic() - started))
+        except Exception:
+            pass
+    return board, prefs
 
 
 def assemble(parts: Iterable[str | None]) -> str:
@@ -245,14 +251,15 @@ def session_block(
     """Everything a session starts with, in order: the credential notice, the upload
     warning, the board, the preferences. "" when there is nothing to say.
 
-    ``timeout`` bounds each of the two requests. The local lines lead, so they show even
-    with the server down. Never raises."""
+    One request (``server_parts``, ``timeout`` as there). The local lines lead, so they
+    show even with the server down. Never raises."""
+    board, prefs = server_parts(client, project, settings, timeout=timeout, login_hint=login_hint)
     return assemble(
         (
             notice_part(settings, env_location=env_location, hint=notice_hint),
             upload_warning,
-            board_part(client, project, settings, timeout=timeout, login_hint=login_hint),
-            preferences_part(client, settings, timeout=timeout),
+            board,
+            prefs,
         )
     )
 

@@ -459,8 +459,7 @@ def session_start(env, monkeypatch) -> ModuleType:
     sys.modules.pop("common", None)
     mod = _load("codex_session_start_retry_test", _SESSION_START)
     sys.modules.pop("common", None)
-    monkeypatch.setattr(mod, "_prefs_text", lambda: None)
-    monkeypatch.setattr(mod, "_board_text", lambda project: None)
+    monkeypatch.setattr(mod, "_served", lambda project: ("", ""))
     monkeypatch.setattr(mod, "_sync_skills", lambda cwd=None: None)
     return mod
 
@@ -482,7 +481,7 @@ def test_session_start_prints_warning_for_user_and_model(hook, session_start, mo
 
     spawned: list[str] = []
     monkeypatch.setattr(session_start, "_spawn_catchup", spawned.append)
-    monkeypatch.setattr(session_start, "_board_text", lambda project: "[board]")
+    monkeypatch.setattr(session_start, "_served", lambda project: ("[board]", ""))
     out = json.loads(
         _run_session_start(session_start, monkeypatch, capsys, {"transcript_path": path})
     )
@@ -517,7 +516,7 @@ def test_session_start_is_silent_when_healthy(hook, session_start, monkeypatch, 
     _stop(hook, path)
     monkeypatch.setattr(session_start, "_spawn_catchup", lambda skip: None)
     assert _run_session_start(session_start, monkeypatch, capsys, {}) == ""
-    monkeypatch.setattr(session_start, "_board_text", lambda project: "[board]")
+    monkeypatch.setattr(session_start, "_served", lambda project: ("[board]", ""))
     out = json.loads(_run_session_start(session_start, monkeypatch, capsys, {}))
     assert "systemMessage" not in out
     assert out["hookSpecificOutput"]["additionalContext"] == "[board]"

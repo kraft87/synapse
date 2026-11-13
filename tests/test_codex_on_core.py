@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -372,15 +373,20 @@ def test_install_writes_the_branch_point_blocks_byte_for_byte(layout, tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# session_start.py: the core's session block, fetched side by side under a deadline
+# session_start.py: the core's session block, from one request under a deadline
 # ---------------------------------------------------------------------------
 
 _SESSION_START = _CODEX / "hooks" / "session_start.py"
 _STALE = "tkSTALEenvXq81Lm"
 _WARNING = "[Synapse] uploads have been failing since yesterday (connection refused)."
-_BOARD = {"status": "ok", "text": "[Synapse board]\n- a note"}
-_PREFS = {"items": [{"pref": "short answers", "polarity": "like"}]}
 _PREFS_TEXT = "[Synapse preferences]\n  - (likes) short answers"
+_BOARD_TEXT = "[Synapse board]\n- a note"
+#: What /context answers when asked for both parts.
+_SERVED = {"status": "ok", "text": _BOARD_TEXT, "preferences": _PREFS_TEXT}
+#: A server from before /context carried the preferences block: its reply has no
+#: ``preferences``, and the items come from /preferences/top.
+_OLD_BOARD = {"status": "ok", "text": _BOARD_TEXT}
+_OLD_PREFS = {"items": [{"pref": "short answers", "polarity": "like"}]}
 
 
 def _enroll(home: Path, server_url: str) -> None:
@@ -408,13 +414,21 @@ def _printed(capsys) -> dict[str, Any] | None:
     return json.loads(out) if out.strip() else None
 
 
+def _asked(server) -> list[tuple[str, dict[str, str]]]:
+    """Each request the server saw: its path and its query."""
+    out = []
+    for req in server.seen:
+        split = urllib.parse.urlsplit(req["path"])
+        out.append((split.path, dict(urllib.parse.parse_qsl(split.query))))
+    return out
+
+
 def test_session_start_order_is_notice_warning_board_preferences(
     scratch, monkeypatch, tmp_path, server, capsys
 ):
     _enroll(scratch, server.url)
     monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)  # overridden: the notice leads
-    server.answer("/context", _BOARD)
-    server.answer("/preferences/top", _PREFS)
+    server.answer("/context", _SERVED)
     hook = _start(monkeypatch, tmp_path, warning=_WARNING)
     hook.main()
     out = _printed(capsys)
@@ -427,13 +441,16 @@ def test_session_start_order_is_notice_warning_board_preferences(
         "systemMessage": _WARNING,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": "\n\n".join((notice, _WARNING, _BOARD["text"], _PREFS_TEXT)),
+            "additionalContext": "\n\n".join((notice, _WARNING, _BOARD_TEXT, _PREFS_TEXT)),
         },
     }
-    assert sorted(r["path"].split("?")[0] for r in server.seen) == ["/context", "/preferences/top"]
-    for req in server.seen:
-        assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
-        assert req["headers"]["user-agent"] == _user_agent()
+    # One request for both: the server renders the preferences block.
+    assert _asked(server) == [
+        ("/context", {"project": tmp_path.name, "parts": "board,preferences"})
+    ]
+    (req,) = server.seen
+    assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
+    assert req["headers"]["user-agent"] == _user_agent()
 
 
 def test_session_start_explains_a_machine_that_is_not_enrolled(
@@ -441,19 +458,19 @@ def test_session_start_explains_a_machine_that_is_not_enrolled(
 ):
     monkeypatch.setenv("SYNAPSE_URL", server.url)
     server.answer("/context", {"detail": "unauthorized"}, status=401)
-    server.answer("/preferences/top", {"detail": "unauthorized"}, status=401)
     hook = _start(monkeypatch, tmp_path)
     hook.main()
     text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
     assert text == hook.context.not_enrolled_block(hook.context.DEFAULT_LOGIN_HINT)
     assert text.startswith("[Synapse — this machine is not enrolled]")
     assert "Run `synapse login` in a terminal and approve the sign-in" in text
+    assert len(server.seen) == 1  # told no once: nothing else is asked
 
 
 def test_session_start_explains_a_restricted_caller(scratch, monkeypatch, tmp_path, server, capsys):
     monkeypatch.setenv("SYNAPSE_URL", server.url)
-    server.answer("/context", {"status": "ok", "trust": "restricted", "text": "[empty board]"})
-    server.answer("/preferences/top", {"items": []})
+    reply = {"status": "ok", "trust": "restricted", "text": "[empty board]", "preferences": ""}
+    server.answer("/context", reply)
     hook = _start(monkeypatch, tmp_path)
     hook.main()
     text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
@@ -463,21 +480,34 @@ def test_session_start_explains_a_restricted_caller(scratch, monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("switch", ["SYNAPSE_BOARD", "SYNAPSE_PREFS_BLOCK"])
-def test_session_start_kill_switches_skip_the_request(
+def test_session_start_does_not_ask_for_a_piece_switched_off(
     scratch, monkeypatch, tmp_path, server, capsys, switch
 ):
     monkeypatch.setenv("SYNAPSE_URL", server.url)
-    server.answer("/context", _BOARD)
-    server.answer("/preferences/top", _PREFS)
+    server.answer("/context", _SERVED)
     hook = _start(monkeypatch, tmp_path)
     monkeypatch.setenv(switch, "0")  # read when the hook runs, as before
     hook.main()
     text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
-    paths = [r["path"].split("?")[0] for r in server.seen]
     if switch == "SYNAPSE_BOARD":
-        assert (text, paths) == (_PREFS_TEXT, ["/preferences/top"])
+        # No board, so no project either: the preferences are not a project's.
+        assert (text, _asked(server)) == (_PREFS_TEXT, [("/context", {"parts": "preferences"})])
     else:
-        assert (text, paths) == (_BOARD["text"], ["/context"])
+        asked = [("/context", {"project": tmp_path.name, "parts": "board"})]
+        assert (text, _asked(server)) == (_BOARD_TEXT, asked)
+
+
+def test_session_start_with_both_switched_off_makes_no_request(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _SERVED)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    monkeypatch.setenv("SYNAPSE_BOARD", "0")
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
+    hook.main()
+    assert _printed(capsys)["hookSpecificOutput"]["additionalContext"] == _WARNING
+    assert server.seen == []
 
 
 @pytest.mark.parametrize("value", ["0", "1"])
@@ -502,35 +532,21 @@ def test_session_start_envelope_without_a_warning_has_no_system_message(
     scratch, monkeypatch, tmp_path, server, capsys
 ):
     monkeypatch.setenv("SYNAPSE_URL", server.url)
-    server.answer("/context", _BOARD)
-    server.answer("/preferences/top", {"items": []})
+    server.answer("/context", {**_SERVED, "preferences": ""})
     hook = _start(monkeypatch, tmp_path)
     hook.main()
     assert _printed(capsys) == {
-        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": _BOARD["text"]}
+        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": _BOARD_TEXT}
     }
-
-
-def test_session_start_prints_what_arrived_when_one_request_fails(
-    scratch, monkeypatch, tmp_path, server, capsys
-):
-    monkeypatch.setenv("SYNAPSE_URL", server.url)
-    server.answer("/context", _BOARD)
-    server.answer("/preferences/top", {"detail": "boom"}, status=500)
-    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
-    hook.main()
-    out = _printed(capsys)
-    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD['text']}"
 
 
 def test_session_start_stops_waiting_at_its_deadline(
     scratch, monkeypatch, tmp_path, server, capsys
 ):
-    """The preferences request hangs past the deadline; the board answered in time and
-    is printed, and the hook does not wait out the hung request."""
+    """The request hangs past the deadline: the hook does not wait it out, and prints
+    what it has without the server."""
     monkeypatch.setenv("SYNAPSE_URL", server.url)
-    server.answer("/context", _BOARD)
-    server.answer("/preferences/top", _PREFS, delay=30)
+    server.answer("/context", _SERVED, delay=30)
     hook = _start(monkeypatch, tmp_path, warning=_WARNING)
     monkeypatch.setattr(hook, "_FETCH_TIMEOUT", 30.0)  # only the deadline can stop it
     monkeypatch.setattr(hook, "_DEADLINE_S", 1.0)
@@ -539,7 +555,57 @@ def test_session_start_stops_waiting_at_its_deadline(
     hook.main()
     assert time.monotonic() - began < 3
     out = _printed(capsys)
-    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD['text']}"
+    assert out["hookSpecificOutput"]["additionalContext"] == _WARNING
+
+
+# A server from before /context carried the preferences block (kept for one release)
+
+
+def test_session_start_asks_an_older_server_for_its_top_preferences(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _OLD_BOARD)
+    server.answer("/preferences/top", _OLD_PREFS)
+    hook = _start(monkeypatch, tmp_path)
+    hook.main()
+    text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
+    assert text == f"{_BOARD_TEXT}\n\n{_PREFS_TEXT}"  # rendered here, to the same lines
+    assert _asked(server) == [
+        ("/context", {"project": tmp_path.name, "parts": "board,preferences"}),
+        ("/preferences/top", {"limit": "7"}),
+    ]
+
+
+def test_session_start_prints_an_older_servers_board_when_its_preferences_fail(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _OLD_BOARD)
+    server.answer("/preferences/top", {"detail": "boom"}, status=500)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    hook.main()
+    out = _printed(capsys)
+    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD_TEXT}"
+
+
+def test_session_start_gives_an_older_servers_second_request_what_is_left(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    """The two requests share one bound (10 s, under the hook's 15 s deadline), so
+    preferences that hang cost the session the preferences, never the board."""
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _OLD_BOARD)
+    server.answer("/preferences/top", _OLD_PREFS, delay=30)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    monkeypatch.setattr(hook, "_FETCH_TIMEOUT", 1.0)
+    monkeypatch.setattr(hook, "_DEADLINE_S", 10.0)  # not what ends the wait here
+    monkeypatch.setattr(hook, "_STARTED", time.monotonic())
+    began = time.monotonic()
+    hook.main()
+    assert time.monotonic() - began < 4
+    out = _printed(capsys)
+    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD_TEXT}"
 
 
 def test_session_start_skills_sync_shares_the_deadline(scratch, monkeypatch, tmp_path):
@@ -569,10 +635,9 @@ hook.main()
 
 
 def test_a_hung_server_does_not_hold_the_hook_process(scratch, tmp_path, server):
-    """Both requests hang: the process prints and exits at the deadline, without waiting
-    for the request threads (they are daemons)."""
-    server.answer("/context", _BOARD, delay=60)
-    server.answer("/preferences/top", _PREFS, delay=60)
+    """The request hangs: the process prints and exits at the deadline, without waiting
+    for the request thread (it is a daemon)."""
+    server.answer("/context", _SERVED, delay=60)
     env = {**os.environ, "SYNAPSE_URL": server.url}
     began = time.monotonic()
     proc = subprocess.run(

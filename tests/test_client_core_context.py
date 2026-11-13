@@ -2,10 +2,12 @@
 (plugin/synapse_client/context.py, private.py).
 
 The wording is the hooks' wording, byte for byte: each renderer is compared with the
-hook it ports (recall_nudge.py, preferences_block.py, board_block.py, enroll.py and
+hook it ports (recall_nudge.py, board_block.py, enroll.py and
 ingest_hook._is_private), loaded by path over a scratch home with its server call
 replaced. The one intended difference, the Claude-only paste hint in the restricted
-block, is spelled out where it is compared.
+block, is spelled out where it is compared. The preferences block is the server's
+(mcp_server/preferences_routes.render_block), and the core's copy for an older server
+is compared with that.
 """
 
 from __future__ import annotations
@@ -56,20 +58,24 @@ def _http_error(code: int) -> urllib.error.HTTPError:
 
 class _FakeClient:
     """Answers context() and preferences() from canned values; raises an exception
-    value instead of returning it."""
+    value instead of returning it. ``board`` is the whole ``/context`` reply: with a
+    ``preferences`` key it is a server that renders the block, without one a server
+    from before that, whose items are ``prefs``."""
 
     def __init__(self, board: Any = None, prefs: Any = None) -> None:
         self.board, self.prefs = board, prefs
-        self.calls: list[tuple[str, Any]] = []
+        self.calls: list[tuple[Any, ...]] = []
+        self.timeouts: list[float] = []
 
-    def context(self, project=None, timeout=10):
-        self.calls.append(("context", project))
+    def context(self, project=None, timeout=10, *, parts=()):
+        self.calls.append(("context", project, tuple(parts)))
         if isinstance(self.board, BaseException):
             raise self.board
         return self.board
 
-    def preferences(self, limit=8, timeout=10):
+    def preferences(self, limit=7, timeout=10):
         self.calls.append(("preferences", limit))
+        self.timeouts.append(timeout)
         if isinstance(self.prefs, BaseException):
             raise self.prefs
         return self.prefs
@@ -146,7 +152,7 @@ def test_prompt_nudge_honours_config_json_flags(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# preferences_block == preferences_block.py
+# preferences_block == the block the server renders
 # ---------------------------------------------------------------------------
 
 _PREF_CASES = {
@@ -171,14 +177,30 @@ _PREF_CASES = {
 }
 
 
+def test_the_preferences_block_wording():
+    assert context.preferences_block(_PREF_CASES["typical"]) == (
+        "[Synapse preferences]\n"
+        "  - (likes) Terse answers\n"
+        "  - (dislikes) Emoji\n"
+        "  - (rule) Full-time roles only"
+    )
+    assert context.preferences_block(_PREF_CASES["more-than-seven"]).count("\n") == 7
+    assert context.preferences_block(_PREF_CASES["unknown-and-missing-polarity"]) == (
+        "[Synapse preferences]\n  - (neutral) a\n  - () b\n  - () c"
+    )
+    assert context.preferences_block(_PREF_CASES["nothing-renders"]) == ""
+    assert context.preferences_block([]) == ""
+
+
 @pytest.mark.parametrize("case", sorted(_PREF_CASES))
-def test_preferences_block_is_byte_identical_to_the_hook(scratch, monkeypatch, capsys, case):
+def test_preferences_block_is_byte_identical_to_the_servers(case):
+    """A client on a server from before ``/context`` carried the block renders the items
+    itself: the same text, so the block does not change with the server's version."""
+    from mcp_server.preferences_routes import BLOCK_LINES, render_block
+
     items = _PREF_CASES[case]
-    hook = load_script("preferences_block")
-    seen = fake_urlopen(monkeypatch, {"items": items})
-    hook.main()
-    assert context.preferences_block(items) == _hook_context(capsys)
-    assert [requested(req) for req in seen] == [("/preferences/top", {"limit": "8"})]
+    assert context.preferences_block(items) == render_block(items)
+    assert BLOCK_LINES == context._PREFS_MAX_LINES
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +243,7 @@ def test_the_default_hint_is_harness_neutral():
 
 
 # ---------------------------------------------------------------------------
-# board_parts == what board_block.py prints
+# The board part == what board_block.py prints for the board
 # ---------------------------------------------------------------------------
 
 _BOARD_CASES = {
@@ -235,48 +257,172 @@ _BOARD_CASES = {
     "403": (403, False),
     "500": (500, False),
 }
+_BOARD_ONLY = {"SYNAPSE_PREFS_BLOCK": "0"}
 
 
 @pytest.mark.parametrize("case", sorted(_BOARD_CASES))
-def test_board_parts_match_the_hook(scratch, monkeypatch, capsys, tmp_path, case):
+def test_the_board_part_matches_the_hook(scratch, monkeypatch, capsys, tmp_path, case):
     reply, enrolled = _BOARD_CASES[case]
     answer = _http_error(reply) if isinstance(reply, int) else reply
     if enrolled:  # the hook reads enrollment from the device record, as it does at start
         (scratch / ".synapse").mkdir(parents=True, exist_ok=True)
         record = {"device": {"surface_id": "dev-1"}}
         (scratch / ".synapse" / "config.json").write_text(json.dumps(record))
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")  # the board alone
 
     hook = load_script("board_block")
     seen = fake_urlopen(monkeypatch, answer)
     monkeypatch.setattr(hook, "_project_label", lambda: "proj")
     hook.main()
-    assert [requested(req) for req in seen] == [("/context", {"project": "proj"})]
+    assert [requested(req) for req in seen] == [("/context", {"project": "proj", "parts": "board"})]
     # The hook prints the parts joined by blank lines (no credential notice applies here).
     expected = _hook_context(capsys).replace(_PASTE_HINT, "")
 
     client = _FakeClient(board=answer)
-    settings = _settings(tmp_path, enrolled=enrolled)
-    got = context.board_parts(client, "proj", settings, login_hint=_CLAUDE_HINT)
+    settings = _settings(tmp_path, enrolled=enrolled, env=_BOARD_ONLY)
+    got, prefs = context.server_parts(client, "proj", settings, login_hint=_CLAUDE_HINT)
     # The hook's restricted block names its own hint; compare the rest of the wording.
-    got = [
-        p.replace(f"configured: {_CLAUDE_HINT}.", f"configured: {_CLAUDE_RESTRICTED_HINT}.")
-        for p in got
-    ]
-    assert "\n\n".join(got) == expected
-    assert client.calls == [("context", "proj")]
+    got = got.replace(f"configured: {_CLAUDE_HINT}.", f"configured: {_CLAUDE_RESTRICTED_HINT}.")
+    assert (got, prefs) == (expected, "")
+    assert client.calls == [("context", "proj", ("board",))]
 
 
-def test_board_parts_raise_what_is_not_an_http_status(tmp_path):
-    client = _FakeClient(board=urllib.error.URLError("refused"))
-    with pytest.raises(urllib.error.URLError):
-        context.board_parts(client, None, _settings(tmp_path))
+# ---------------------------------------------------------------------------
+# server_parts: one request for the board and the preferences
+# ---------------------------------------------------------------------------
+
+_PREFS = [{"pref": "Terse", "polarity": "like"}]
+_PREFS_TEXT = "[Synapse preferences]\n  - (likes) Terse"
+_BOTH = ("board", "preferences")
+
+
+def _reply(text: str = "BOARD", **more: Any) -> dict[str, Any]:
+    """A ``/context`` reply. Pass ``preferences=`` for a server that renders the block."""
+    return {"status": "ok", "text": text, **more}
+
+
+def test_the_board_and_the_preferences_are_one_request(tmp_path):
+    client = _FakeClient(board=_reply(preferences=_PREFS_TEXT))
+    assert context.server_parts(client, "p", _settings(tmp_path)) == ("BOARD", _PREFS_TEXT)
+    assert client.calls == [("context", "p", _BOTH)]
+
+
+def test_the_servers_block_is_shown_as_it_came(tmp_path):
+    """The server renders the block: the client adds no header and drops no line."""
+    served = "[Synapse preferences]\n" + "\n".join(f"  - (rule) r{i}" for i in range(9))
+    client = _FakeClient(board=_reply(preferences=served))
+    assert context.server_parts(client, None, _settings(tmp_path))[1] == served
+
+
+@pytest.mark.parametrize("served", ["", None, ["x"], {"text": "x"}, 7])
+def test_a_reply_with_no_block_to_show_says_nothing(tmp_path, served):
+    client = _FakeClient(board=_reply(preferences=served), prefs=_PREFS)
+    assert context.server_parts(client, None, _settings(tmp_path)) == ("BOARD", "")
+    assert client.calls == [("context", None, _BOTH)]  # the server answered: no second request
+
+
+def test_a_server_from_before_the_block_is_asked_for_its_top_preferences(tmp_path):
+    client = _FakeClient(board=_reply(), prefs=_PREFS)
+    assert context.server_parts(client, "p", _settings(tmp_path)) == ("BOARD", _PREFS_TEXT)
+    assert client.calls == [("context", "p", _BOTH), ("preferences", 7)]
+
+
+def test_a_board_that_was_not_asked_for_is_not_shown(tmp_path):
+    """A server from before ``parts`` answers with the board whatever is asked."""
+    client = _FakeClient(board=_reply(trust="restricted"), prefs=_PREFS)
+    settings = _settings(tmp_path, env={"SYNAPSE_BOARD": "0"})
+    assert context.server_parts(client, "p", settings) == ("", _PREFS_TEXT)
+    assert client.calls == [("context", None, ("preferences",)), ("preferences", 7)]
+
+
+def test_the_second_request_has_what_is_left_of_the_timeout(tmp_path, monkeypatch):
+    clock = iter([100.0, 104.0, 200.0, 212.0])
+    monkeypatch.setattr(context, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    client = _FakeClient(board=_reply(), prefs=_PREFS)
+    assert context.server_parts(client, None, _settings(tmp_path), timeout=10)[1] == _PREFS_TEXT
+    assert client.timeouts == [6.0]
+    # Nothing left: the board is shown and the preferences are not asked for.
+    assert context.server_parts(client, None, _settings(tmp_path), timeout=10) == ("BOARD", "")
+    assert client.timeouts == [6.0]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [urllib.error.URLError("refused"), TimeoutError(), ValueError("bad json"), _http_error(500)],
+)
+def test_a_second_request_that_fails_keeps_the_board(tmp_path, failure):
+    client = _FakeClient(board=_reply(), prefs=failure)
+    assert context.server_parts(client, None, _settings(tmp_path)) == ("BOARD", "")
+
+
+def test_a_malformed_preference_item_fails_open(tmp_path):
+    client = _FakeClient(board=_reply("B"), prefs=[{"pref": "x", "polarity": ["?"]}])
+    assert context.session_block(client, None, _settings(tmp_path)) == "B"
+
+
+@pytest.mark.parametrize(
+    "reply", [None, [], "text", {"status": "ok", "text": ["B"], "preferences": _PREFS_TEXT}]
+)
+def test_a_reply_that_is_not_the_routes_never_raises(tmp_path, reply):
+    board, prefs = context.server_parts(_FakeClient(board=reply), None, _settings(tmp_path))
+    assert isinstance(board, str) and isinstance(prefs, str)
+
+
+@pytest.mark.parametrize(
+    ("flags", "asked", "expected"),
+    [
+        ({"SYNAPSE_BOARD": "0"}, ("preferences",), ("", _PREFS_TEXT)),
+        ({"SYNAPSE_PREFS_BLOCK": "0"}, ("board",), ("BOARD", "")),
+        ({"SYNAPSE_BOARD": "0", "SYNAPSE_PREFS_BLOCK": "0"}, None, ("", "")),
+    ],
+    ids=["no-board", "no-preferences", "neither"],
+)
+def test_a_piece_switched_off_is_not_asked_for(tmp_path, flags, asked, expected):
+    client = _FakeClient(board=_reply(preferences=_PREFS_TEXT), prefs=_PREFS)
+    s = _settings(tmp_path, env=flags)
+    assert context.server_parts(client, "p", s) == expected
+    # The project is the board's: it is not sent when the board is not asked for.
+    project = "p" if asked and "board" in asked else None
+    assert client.calls == ([("context", project, asked)] if asked else [])
+    block = context.session_block(client, "p", s)
+    assert block == context.assemble(expected)
+
+
+@pytest.mark.parametrize(
+    ("reply", "enrolled", "expected"),
+    [
+        (401, False, "NOT ENROLLED"),
+        ({"status": "ok", "text": "B", "trust": "restricted"}, False, "RESTRICTED\n\nB"),
+        (401, True, ""),
+        ({"status": "ok", "text": "B", "trust": "restricted"}, True, "B"),
+        ({"status": "ok", "text": "B", "trust": "full"}, False, "B"),
+    ],
+    ids=["401", "restricted", "401-enrolled", "restricted-enrolled", "full"],
+)
+def test_a_harness_may_word_the_explainers_itself(tmp_path, reply, enrolled, expected):
+    """``not_enrolled`` and ``restricted`` replace the explainers rendered from the hint,
+    used exactly as given, under the same conditions; the hint is then not used."""
+    board = _http_error(reply) if isinstance(reply, int) else reply
+    settings = _settings(tmp_path, enrolled=enrolled)
+    words = {"not_enrolled": "NOT ENROLLED", "restricted": "RESTRICTED"}
+    got = context.server_parts(_FakeClient(board=board, prefs=[]), None, settings, **words)
+    assert got == (expected, "")
+    hinted = context.server_parts(
+        _FakeClient(board=board, prefs=[]), None, settings, login_hint="x", **words
+    )
+    assert hinted == got
+
+
+def test_an_explainer_is_part_of_the_board(tmp_path):
+    """With the board switched off, a machine is not told why it is served none."""
+    settings = _settings(tmp_path, env={"SYNAPSE_BOARD": "0"})
+    for board in (_http_error(401), _reply(trust="restricted", preferences="")):
+        assert context.server_parts(_FakeClient(board=board), None, settings) == ("", "")
 
 
 # ---------------------------------------------------------------------------
 # session_block: order, switches, fail-open
 # ---------------------------------------------------------------------------
-
-_PREFS = [{"pref": "Terse", "polarity": "like"}]
 
 
 def _noted_settings(tmp_path: Path, **env: str) -> Settings:
@@ -297,26 +443,22 @@ def _noted_settings(tmp_path: Path, **env: str) -> Settings:
 
 def test_session_block_order_is_notice_warning_board_preferences(tmp_path):
     s = _noted_settings(tmp_path)
-    client = _FakeClient(board={"status": "ok", "text": "BOARD"}, prefs=_PREFS)
+    client = _FakeClient(board=_reply(preferences=_PREFS_TEXT))
     block = context.session_block(
         client, "p", s, upload_warning="UPLOADS FAILING", env_location="~/.x/.env"
     )
     parts = block.split("\n\n")
     assert parts[0].startswith("[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored")
     assert parts[0].endswith("Remove it from ~/.x/.env.")
-    assert parts[1:] == ["UPLOADS FAILING", "BOARD", "[Synapse preferences]\n  - (likes) Terse"]
+    assert parts[1:] == ["UPLOADS FAILING", "BOARD", _PREFS_TEXT]
     assert "tkSTALE" not in block and "tkDEVICE" not in block
+    assert client.calls == [("context", "p", _BOTH)]
 
 
 def test_the_pieces_compose_into_the_block(tmp_path):
     s = _noted_settings(tmp_path)
-    client = _FakeClient(board={"status": "ok", "text": "BOARD"}, prefs=_PREFS)
-    pieces = [
-        context.notice_part(s),
-        "W",
-        context.board_part(client, "p", s),
-        context.preferences_part(client, s),
-    ]
+    client = _FakeClient(board=_reply(preferences=_PREFS_TEXT))
+    pieces = [context.notice_part(s), "W", *context.server_parts(client, "p", s)]
     assert context.assemble(pieces) == context.session_block(client, "p", s, upload_warning="W")
 
 
@@ -329,24 +471,6 @@ def test_notice_part_passes_the_harness_wording_through(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("flags", "expected"),
-    [
-        ({"SYNAPSE_BOARD": "0"}, ["[Synapse preferences]\n  - (likes) Terse"]),
-        ({"SYNAPSE_PREFS_BLOCK": "0"}, ["BOARD"]),
-        ({"SYNAPSE_BOARD": "0", "SYNAPSE_PREFS_BLOCK": "0"}, []),
-    ],
-)
-def test_session_block_honours_the_switches(tmp_path, flags, expected):
-    client = _FakeClient(board={"status": "ok", "text": "BOARD"}, prefs=_PREFS)
-    s = _settings(tmp_path, env=flags)
-    block = context.session_block(client, None, s)
-    assert (block.split("\n\n") if block else []) == expected
-    called = {name for name, _ in client.calls}
-    assert ("context" in called) == ("SYNAPSE_BOARD" not in flags)
-    assert ("preferences" in called) == ("SYNAPSE_PREFS_BLOCK" not in flags)
-
-
-@pytest.mark.parametrize(
     "failure",
     [urllib.error.URLError("refused"), TimeoutError(), ValueError("bad json"), AttributeError()],
 )
@@ -356,46 +480,18 @@ def test_each_piece_fails_open(tmp_path, failure):
     block = context.session_block(client, "p", s, upload_warning="W")
     parts = block.split("\n\n")
     assert len(parts) == 2 and parts[1] == "W"  # the local lines survive
-
-
-def test_a_malformed_preference_item_fails_open(tmp_path):
-    client = _FakeClient(
-        board={"status": "ok", "text": "B"}, prefs=[{"pref": "x", "polarity": ["?"]}]
-    )
-    assert context.session_block(client, None, _settings(tmp_path)) == "B"
+    assert client.calls == [("context", "p", _BOTH)]  # no answer: no second request
 
 
 def test_an_unenrolled_401_explains_itself_with_the_harness_hint(tmp_path):
     client = _FakeClient(board=_http_error(401), prefs=_http_error(401))
     block = context.session_block(client, None, _settings(tmp_path), login_hint="run `hermes x`")
     assert block == context.not_enrolled_block("run `hermes x`")
-
-
-@pytest.mark.parametrize(
-    ("reply", "enrolled", "expected"),
-    [
-        (401, False, "NOT ENROLLED"),
-        ({"status": "ok", "text": "B", "trust": "restricted"}, False, "RESTRICTED\n\nB"),
-        (401, True, ""),
-        ({"status": "ok", "text": "B", "trust": "restricted"}, True, "B"),
-        ({"status": "ok", "text": "B", "trust": "full"}, False, "B"),
-    ],
-    ids=["401", "restricted", "401-enrolled", "restricted-enrolled", "full"],
-)
-def test_a_harness_may_word_the_explainers_itself(tmp_path, reply, enrolled, expected):
-    """``not_enrolled`` and ``restricted`` replace the explainers rendered from the hint,
-    used exactly as given, under the same conditions; the hint is then not used."""
-    board = _http_error(reply) if isinstance(reply, int) else reply
-    settings = _settings(tmp_path, enrolled=enrolled)
-    words = {"not_enrolled": "NOT ENROLLED", "restricted": "RESTRICTED"}
-    got = context.board_part(_FakeClient(board=board), None, settings, login_hint="x", **words)
-    assert got == expected
-    parts = context.board_parts(_FakeClient(board=board), None, settings, **words)
-    assert "\n\n".join(parts) == expected
+    assert client.calls == [("context", None, _BOTH)]
 
 
 def test_nothing_to_say_is_empty(tmp_path):
-    client = _FakeClient(board={"status": "ok", "text": ""}, prefs=[])
+    client = _FakeClient(board=_reply("", preferences=""))
     assert context.session_block(client, None, _settings(tmp_path)) == ""
 
 

@@ -90,9 +90,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._record()
         if self.path.startswith("/context"):
-            self._send(200, {"status": "ok", "text": "BOARD-TEXT", "trust": "full"})
-        elif self.path.startswith("/preferences/top"):
-            self._send(200, {"items": [{"pref": "Kyle likes small commits", "polarity": "like"}]})
+            prefs = "[Synapse preferences]\n  - (likes) Kyle likes small commits"
+            reply = {"status": "ok", "text": "BOARD-TEXT", "trust": "full", "preferences": prefs}
+            self._send(200, reply)
         else:
             self._send(404, {})
 
@@ -492,7 +492,9 @@ def test_synapse_runs_inside_hermes(tmp_path: Path, server: _Server, isolation: 
     for request in server.requests("GET", "/"):
         assert request["headers"]["User-Agent"] == f"synapse-client/{__version__} hermes"
         assert request["headers"]["Authorization"] == f"Bearer {_TOKEN}"
-    assert server.requests("GET", "/context") and server.requests("GET", "/preferences/top")
+    (start,) = server.requests("GET", "/context")
+    assert start["path"].endswith("parts=board%2Cpreferences")
+    assert not server.requests("GET", "/preferences/top")  # the block came with the board
 
     # The tool call reached /mcp with its arguments and came back as Hermes's JSON.
     (call,) = server.requests("POST", "/mcp")

@@ -219,8 +219,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._record()
         if self.path.startswith("/context"):
-            self._send(200, {"status": "ok", "text": "BOARD-TEXT", "trust": "full"})
-        elif self.path.startswith("/preferences/top"):
+            reply = {"status": "ok", "text": "BOARD-TEXT", "trust": "full"}
+            if not self.server.older:
+                reply["preferences"] = "[Synapse preferences]\n  - (likes) Kyle likes small commits"
+            self._send(200, reply)
+        elif self.path.startswith("/preferences/top") and self.server.older:
             self._send(200, {"items": [{"pref": "Kyle likes small commits", "polarity": "like"}]})
         else:
             self._send(404, {})
@@ -270,6 +273,8 @@ class _Server(ThreadingHTTPServer):
         self.release = threading.Event()
         self.ingest_status = 200
         self.private_status = 200
+        #: A server from before /context carried the preferences block.
+        self.older = False
         self.tool_error = False
         self.tool_text = ""
 
@@ -384,14 +389,17 @@ def test_the_session_start_block_and_the_nudge(plugin, server, tmp_path, hermes_
     work.mkdir()
     provider = _start(_new(plugin), tmp_path / "hermes-a", cwd=str(work))
     block = provider.system_prompt_block()
-    assert "BOARD-TEXT" in block
-    assert "[Synapse preferences]\n  - (likes) Kyle likes small commits" in block
-    (ctx_request,) = [r for r in server.seen if r["path"].startswith("/context")]
-    assert "project=my-project" in ctx_request["path"]
+    assert block.endswith(
+        "BOARD-TEXT\n\n[Synapse preferences]\n  - (likes) Kyle likes small commits"
+    )
+    # One request for the board and the preferences, on one thread.
+    (ctx_request,) = [r for r in server.seen if r["method"] == "GET"]
+    assert ctx_request["path"] == "/context?project=my-project&parts=board%2Cpreferences"
     headers = {k.lower(): v for k, v in ctx_request["headers"].items()}
     assert headers["user-agent"] == f"synapse-client/{__version__} hermes"
     assert headers["authorization"] == f"Bearer {_TOKEN}"
-    assert {"synapse-board", "synapse-preferences", "synapse-outbox"} <= set(hermes_stub.SPAWNED)
+    assert {"synapse-session-start", "synapse-outbox"} <= set(hermes_stub.SPAWNED)
+    assert not {"synapse-board", "synapse-preferences"} & set(hermes_stub.SPAWNED)
 
     seen = len(server.seen)
     nudge = provider.prefetch("what did we decide about the cache?", session_id=_SID)
@@ -402,6 +410,19 @@ def test_the_session_start_block_and_the_nudge(plugin, server, tmp_path, hermes_
     assert provider.on_pre_compress([]) == ""
     assert provider.pre_compress_checkpoint_api_version == 1
     assert provider.name == "synapse"
+
+
+def test_a_server_from_before_the_preferences_block_is_asked_for_its_top_preferences(
+    plugin, server, tmp_path
+):
+    server.older = True
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    block = provider.system_prompt_block()
+    assert block.endswith(
+        "BOARD-TEXT\n\n[Synapse preferences]\n  - (likes) Kyle likes small commits"
+    )
+    gets = [r["path"].split("?")[0] for r in server.seen if r["method"] == "GET"]
+    assert gets == ["/context", "/preferences/top"]
 
 
 def test_the_session_start_keeps_to_its_budget(plugin, server, tmp_path):

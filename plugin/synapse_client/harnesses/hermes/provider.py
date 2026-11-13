@@ -92,7 +92,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -275,29 +275,18 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def _session_start(self, settings: Settings, client: Client, outbox: Outbox | None) -> str:
         """The credential notice and upload warning (local), then the board and the
-        preferences, fetched side by side; a piece not back within START_BUDGET is
-        left out."""
+        preferences, which are one request; left out when it is not back within
+        START_BUDGET."""
         label = self._project
-        jobs: dict[str, Callable[[], str]] = {
-            "board": lambda: context.board_part(client, label, settings, timeout=START_BUDGET),
-            "preferences": lambda: context.preferences_part(client, settings, timeout=START_BUDGET),
-        }
-        got: dict[str, str] = {}
-        done = threading.Lock()
+        got: list[tuple[str, str]] = []
 
-        def run(key: str) -> None:
-            text = jobs[key]()
-            with done:
-                got[key] = text
+        def run() -> None:
+            got.append(context.server_parts(client, label, settings, timeout=START_BUDGET))
 
-        threads = [spawn_context_thread(run, name=f"synapse-{key}", args=(key,)) for key in jobs]
-        for thread in threads:
-            thread.start()
-        deadline = time.monotonic() + START_BUDGET
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        with done:
-            board, prefs = got.get("board", ""), got.get("preferences", "")
+        thread = spawn_context_thread(run, name="synapse-session-start")
+        thread.start()
+        thread.join(START_BUDGET)
+        board, prefs = got[0] if got else ("", "")
         warning = failure_warning(outbox) if outbox is not None else None
         return context.assemble(
             (

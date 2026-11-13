@@ -14,6 +14,10 @@ It no longer sends a ``surface`` param: the bearer identifies the caller now, an
 host name the client asserts is evidence of nothing. Enrollment itself is interactive
 (it prints a sign-in code and waits for a human), so the hook never runs it.
 
+The same hook prints the preferences block, which comes in the same reply. These tests
+are about the board: the preferences are switched off here (SYNAPSE_PREFS_BLOCK=0), so
+the hook asks for ``parts=board``. tests/test_claude_on_core.py covers the two together.
+
 Stdlib-only script loaded by path (it lives outside the package). No live server: the
 client core's ``urlopen``, which every request the hook makes goes through, is replaced
 (tests.helpers.client_core.fake_urlopen). Whether the machine is enrolled is a device
@@ -86,6 +90,7 @@ def _isolated_env(monkeypatch, tmp_path, *, enrolled: bool = True) -> None:
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")  # the board alone (module docstring)
 
 
 def _load_hook() -> ModuleType:
@@ -133,7 +138,7 @@ def test_board_text_printed_verbatim(monkeypatch, tmp_path, capsys):
     assert _context(capsys) == _BOARD_TEXT
     # No `surface`: the token names the caller (schema 054), and the server decides
     # what that credential may see.
-    assert calls == [("/context", {"project": "synapse"})]
+    assert calls == [("/context", {"project": "synapse", "parts": "board"})]
 
 
 def test_kill_switch_no_output_no_http(monkeypatch, tmp_path, capsys):
@@ -190,7 +195,7 @@ def test_project_derived_from_hook_cwd(monkeypatch, tmp_path, capsys, cwd, expec
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     calls = _run(monkeypatch, mod, json.dumps({"cwd": cwd}), {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": expected})]
+    assert calls == [("/context", {"project": expected, "parts": "board"})]
     assert _context(capsys) == "b"
 
 
@@ -219,7 +224,7 @@ def test_project_falls_back_to_process_cwd(monkeypatch, tmp_path, stdin):
     _isolated_env(monkeypatch, tmp_path)  # chdirs to tmp_path
     mod = _load_hook()
     calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": tmp_path.name})]
+    assert calls == [("/context", {"project": tmp_path.name, "parts": "board"})]
 
 
 def test_a_401_on_an_unenrolled_machine_explains_itself(monkeypatch, tmp_path, capsys):
