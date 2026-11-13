@@ -704,12 +704,50 @@ def test_a_mark_is_an_owner_only_file_that_names_its_chat(tmp_path):
     assert sorted(path.read_text() for path in folder.iterdir())[1].endswith("why\n")
 
 
-def test_marking_never_raises(tmp_path):
+def test_marking_never_raises_and_says_when_it_could_not(tmp_path, caplog):
     hs.mark(None, [_LOCAL], "why")
-    hs.mark(tmp_path / "no" / "such" / "home", [_LOCAL], "why")
+    assert not hs.marked(None, [_LOCAL])
+    missing = tmp_path / "no" / "such" / "home"
+    with caplog.at_level(logging.WARNING):
+        hs.mark(missing, [_LOCAL], "why")
+    assert "could not note a chat others write into (FileNotFoundError)" in caplog.text
+    assert not hs.marked(missing, [_LOCAL])  # nothing there: not marked
     (tmp_path / "synapse").write_text("a file where the folder goes")
     hs.mark(tmp_path, [_LOCAL], "why")
-    assert not hs.marked(tmp_path, [_LOCAL]) and not hs.marked(None, [_LOCAL])
+    with pytest.raises(NotADirectoryError):  # not "nothing there": the marks are broken
+        hs.marked(tmp_path, [_LOCAL])
+
+
+def _broken_marks(home: Path) -> None:
+    """A marks folder no lookup gets through: a link to itself."""
+    (home / "synapse").mkdir(parents=True, exist_ok=True)
+    (home / "synapse" / "inert").symlink_to("inert")
+
+
+def test_marks_that_cannot_be_read_turn_the_session_off(tmp_path):
+    """ "Could not look" is not "not marked": the chat may be one the marks kept off."""
+    _store(tmp_path)
+    assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
+    _broken_marks(tmp_path)
+    verdict = hs.check_session(tmp_path, _LOCAL, _gateway())
+    assert verdict.mode == hs.INERT and "the marks could not be read" in verdict.reason
+    with pytest.raises(hs.StoreError):
+        hs.recheck(tmp_path, _LOCAL, gateway=True)
+    bare = tmp_path / "bare"  # an in-process session, no state.db
+    _broken_marks(bare)
+    verdict = hs.check_session(bare, _RESET_CHILD, _in_process())
+    assert verdict.mode == hs.INERT and "the marks could not be read" in verdict.reason
+    with pytest.raises(hs.StoreError):
+        hs.recheck(bare, _RESET_CHILD)
+
+
+def test_a_call_is_skipped_while_the_marks_cannot_be_read(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _store(home)
+    provider = _start_gateway(_new(plugin), home)
+    assert "BOARD-TEXT" in provider.system_prompt_block()
+    _broken_marks(home)
+    assert provider.system_prompt_block() == "" and provider.prefetch("x") == ""
 
 
 def test_an_agent_rebuilt_after_a_foreign_turn_stays_off(plugin, server, tmp_path):
@@ -776,3 +814,91 @@ def test_a_bot_chat_resumed_onto_the_owners_route_does_not_mark_that_chat(tmp_pa
     assert "Bot Chat" in hs.check_session(tmp_path, _BRANCH, _gateway()).reason
     assert hs.check_session(tmp_path, _LOCAL, _gateway()).mode == hs.ACTIVE
     assert hs.marked(tmp_path, [_BRANCH]) and not hs.marked(tmp_path, [_LOCAL])
+
+
+def _delete(home: Path, sid: str, *, keep_origin: bool = True) -> None:
+    """A deleted or pruned session (hermes_state_sessions.py :1768-1771,
+    hermes_state_mutation_retirement.py, hermes_state_maintenance.py): its row and
+    receipt go, and its children lose their ``parent_session_id``. Their
+    ``model_config`` keeps naming it unless ``keep_origin`` is off."""
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        if not keep_origin:
+            conn.execute("UPDATE sessions SET model_config=NULL WHERE parent_session_id=?", (sid,))
+        conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?", (sid,))
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.execute("DELETE FROM state_meta WHERE key=?", ("gateway.local_policy.v1:" + sid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_branch_stays_off_after_its_marked_parent_is_deleted(tmp_path):
+    """The branch holds a copy of the peers' turns, and a resume uploads up to ten of
+    them. Its parent's mark is copied down when it is first judged, so it does not
+    depend on a row Hermes may delete."""
+    _old_bot_chat(tmp_path)
+    assert "Bot Chat" in hs.check_session(tmp_path, _LOCAL, _gateway()).reason
+    gs._retitle(tmp_path, _LOCAL, "Old notes")
+    _branch(tmp_path)
+    assert "marked" in hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).reason
+    _delete(tmp_path, _LOCAL, keep_origin=False)  # nothing in the store names the parent
+    for verdict in (
+        hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)),
+        hs.recheck(tmp_path, _BRANCH, gateway=True, chat_id=_BRANCH),
+    ):
+        assert verdict.mode == hs.INERT and "marked" in verdict.reason
+
+
+def test_a_branch_never_opened_is_known_by_the_origin_hermes_keeps(tmp_path):
+    """Branched after the rename and never opened before the Bot Chat was deleted:
+    ``_branched_from`` still names the marked session."""
+    _old_bot_chat(tmp_path)
+    assert "Bot Chat" in hs.check_session(tmp_path, _LOCAL, _gateway()).reason
+    gs._retitle(tmp_path, _LOCAL, "Old notes")
+    _branch(tmp_path)
+    _delete(tmp_path, _LOCAL)
+    verdict = hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH))
+    assert verdict.mode == hs.INERT and "marked" in verdict.reason
+    # A config that names no session says nothing.
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert hs.lineage(conn, None, "not json") == []
+        assert hs.lineage(conn, None, json.dumps({"_branched_from": 7})) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("key", ["_reset_from", "_compressed_from"])
+def test_a_continuation_is_known_by_its_origin_too(tmp_path, key):
+    """An in-process session marked for a foreign turn has no chat to mark. A session
+    that continues it names it in its ``model_config`` (hermes_state_mutation_reset.py,
+    hermes_state_mutation_compress.py), with or without the parent link, and the mark
+    is copied down to it."""
+    hs.mark(tmp_path, [_RESET_CHILD], "a turn another agent or person wrote")
+    later = "20261112_181500_0a1b2c"
+    _row(tmp_path, later, "", model_config={key: _RESET_CHILD}, source="cli")
+    assert "marked" in hs.check_session(tmp_path, later, _in_process()).reason
+    assert hs.marked(tmp_path, [later])
+
+
+def test_evidence_read_from_a_parent_marks_the_parent(tmp_path):
+    """The Bot Chat was never opened here, its branch was: the mark names the Bot Chat
+    too, so it stays off once its title is gone."""
+    _old_bot_chat(tmp_path)
+    _branch(tmp_path)
+    assert "Bot Chat" in hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).reason
+    assert hs.marked(tmp_path, [_LOCAL]) and hs.marked(tmp_path, [_BRANCH])
+    gs._retitle(tmp_path, _LOCAL, "Old notes")
+    assert "marked" in hs.check_session(tmp_path, _LOCAL, _gateway()).reason
+
+
+def test_a_session_run_on_a_marked_chats_route_is_not_marked_itself(tmp_path):
+    """The mark is about that chat's history. A session of the owner's that a route of
+    it runs for a while is off there, and the owner's again on its own route."""
+    _old_bot_chat(tmp_path)
+    assert "Bot Chat" in hs.check_session(tmp_path, _LOCAL, _gateway()).reason
+    gs._retitle(tmp_path, _LOCAL, "Old notes")
+    _store(tmp_path, _BRANCH, source="gui")
+    assert "marked" in hs.check_session(tmp_path, _BRANCH, _gateway()).reason
+    assert hs.check_session(tmp_path, _BRANCH, _gateway(_BRANCH)).mode == hs.ACTIVE

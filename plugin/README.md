@@ -289,9 +289,10 @@ Chat-platform sessions (Telegram, Discord, Slack and the rest, through Hermes's 
 the API server, the Bot Chat and Desktop Group Chats, cron jobs, side agents and subagents
 get nothing, not even the tools, and a session stops for good at the first turn another
 agent or person wrote: there, others talk to the agent, and they must not read your memory
-or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it stays
-off after a rename, a branch or a restart; deleting its file there turns it back on. The
-reasons and the Hermes source behind them:
+or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
+its branches stay off after a rename or a restart. To turn one back on, delete every file
+there that names it (each holds the id it is for), once nothing in the chat says Bot Chat
+or Group any more. The reasons, the limits and the Hermes source behind them:
 [docs/client-harnesses.md](../docs/client-harnesses.md).
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,

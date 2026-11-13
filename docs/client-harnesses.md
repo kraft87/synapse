@@ -143,8 +143,9 @@ passes and, for a session they allow, Hermes's own record of who created it
 The session's rows in `state.db` are read again before the system prompt block, each
 nudge, upload and tool call: its title, stored source and chat, every row of that chat
 and of the chat its route answers on, and the sessions it was branched or continued from
-(`parent_session_id`: a parent row, any row of a parent's chat, or a parent chat's
-receipt that says Bot Chat, Group Chat member or `follow_profile_config`). A session can
+(`parent_session_id`, or the origin its `model_config` names once Hermes has cleared
+that link: a parent row, any row of a parent's chat, or a parent chat's receipt that
+says Bot Chat, Group Chat member or `follow_profile_config`). A session can
 be renamed "Bot Chat" or switched to another (`/resume`, compression) without a new
 provider; one that no longer passes turns the instance inert for good, and so does a
 gateway session whose row is gone. A turn another agent or person wrote is not uploaded
@@ -156,13 +157,20 @@ owner's id means only that nobody stamped the turn. A gateway session's project 
 from the `cwd` its client sent, never the daemon's.
 
 **Marks.** A session judged a Bot Chat, a Group Chat member or a chat that follows its
-profile, or handed a turn someone else wrote, is marked together with that chat: one
-owner-only file each under `<hermes_home>/synapse/inert/`, named by the SHA-256 of the
-id and holding the id and the reason. A marked session, every session of a marked chat,
-and every session branched or continued from one stay inert after the title is removed
-(archive, rename) and after Hermes builds a new agent for the session. Marks are only
-added, and a mark on a branch never marks its parent. Deleting the file turns that chat
-back on.
+profile, or handed a turn someone else wrote, is marked together with the chat or parent
+session that said so: one owner-only file each under `<hermes_home>/synapse/inert/`,
+named by the SHA-256 of the id and holding the id and the reason. A marked session and
+every session of a marked chat stay inert after the title is removed (archive, rename)
+and after Hermes builds a new agent for the session. So does a session branched or
+continued from a marked one. Its parent's mark is copied down to it the first time it is
+judged, because Hermes clears a child's `parent_session_id` when the parent is deleted
+or pruned; before that first judgment, the `_branched_from`, `_reset_from` or
+`_compressed_from` its `model_config` keeps still names the parent. Marks are only
+added, and a mark on a branch never marks its parent. A session comes back on only when
+every file that names it, its chat and the sessions it descends from is deleted (each
+file holds the id it is for), and the rows no longer say what was marked. Marks that
+cannot be read, for any reason but "no such file", turn the session inert at
+`initialize` and skip the call afterwards; a mark that cannot be written is logged.
 
 What this does not cover:
 
@@ -185,6 +193,12 @@ What this does not cover:
   chat created on the trial model as well as on Bot Chats, which are caught by title.
 - A chat that stopped looking like a Bot Chat before the provider first judged it has
   no mark: an older Bot Chat archived or renamed before then reads as an owner's chat.
+- A copy that names no origin reads as the owner's chat: ACP `fork_session`
+  (`acp_adapter/session.py`) and a seeded `session.create` without a parent
+  (`tui_gateway/methods_session.py`) copy a session's turns into a new row with no
+  `parent_session_id` and no `_branched_from`. Only the owner's own client can make one.
+  Nor is a branch found that was never judged before its parent was deleted, unless the
+  session it was branched from carries a mark itself.
 - A side agent built in the stdio TUI or Desktop backend's own process (not the daemon)
   carries no parent and no row, so it is active even when the session that started it
   is not (a Bot Chat open there, say). In that same process a model switch on a draft
@@ -193,7 +207,11 @@ What this does not cover:
   and the tools: Hermes gives them the owner as author.
 - Wrongly inert: a session from before Hermes's creation receipts resumed through the
   daemon, the owner's own `/background` and `/btw` there, every daemon session on
-  Windows, and an agent built while `state.db` could not be read.
+  Windows, and an agent built while `state.db` could not be read. For good: a chat the
+  owner titled exactly "Bot Chat", "Bot Chat #N", "Bot Chat (...)" or "Group: ...", even
+  briefly, once it is judged under that title, with every branch of it and every later
+  segment (`/new`) of such a branch. And every session of a home whose marks folder
+  cannot be read.
 - An automation turn inside an owner's chat (a cron delivery or notice, which Hermes
   marks with a `display_kind`) is skipped as synthetic, so the assistant's reply to it
   is uploaded with the previous real turn.
@@ -208,7 +226,10 @@ receipt), `gateway/control_socket.py` and `gateway/owner_identity.py` (the `uid:
 minted for a peer of the same OS user and for every dashboard login),
 `gateway/session_policy.py` (`follow_profile_config`), `gateway/session_bot.py` and
 `hermes_state_local_lineage.py` (the Bot Chat and its reset),
-`hermes_state_mutation_branch.py` (a branch and its `parent_session_id`), the Desktop's
+`hermes_state_mutation_branch.py`, `hermes_state_mutation_reset.py` and
+`hermes_state_mutation_compress.py` (a branch or continuation, its `parent_session_id`
+and the origin in its `model_config`), `hermes_state_sessions.py` (a deleted session's
+children lose the link), the Desktop's
 `plugins/hermes-bots/group-turns.ts` and `canonical-chat.ts` (Group Chat members and the
 Bot Chat it mints), `gateway/session_tui_side.py` and `gateway/status.py` (side agents and
 the daemon's pid record), `run_agent.py` (`turn_author`), `gateway/platforms/api_server.py`

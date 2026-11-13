@@ -4,9 +4,12 @@
 ``display_kind``; ``harnesses/hermes/sessions.py`` copies the shape of a gateway local
 session (its chat id, its route, the state keys of its creation receipt), the
 surfaces Hermes stores as an owner's own chat, and the session store's columns it
-reads. A Hermes that renames any of them would
-turn a failed turn back into an uploaded reply, or the owner's ``hermes chat`` back into
-an inert session, without a unit test noticing: these checks ask the checkout itself.
+reads; ``harnesses/hermes/lineage.py`` copies the ``model_config`` keys under which a
+branch, a reset and a compressed continuation name the session they came from. A Hermes
+that renames any of them would turn a failed turn back into an uploaded reply, the
+owner's ``hermes chat`` back into an inert session, or a copy of a Bot Chat back into
+the owner's chat once its parent is deleted, without a unit test noticing: these checks
+ask the checkout itself.
 
 Skipped unless ``SYNAPSE_HERMES_CHECKOUT`` names a Hermes checkout with its virtualenv
 at ``.venv`` (as tests/test_hermes_integration.py). A driver runs under the checkout's
@@ -28,6 +31,7 @@ from tests import test_hermes_integration as base
 from tests.helpers.client_core import use_core
 
 use_core()
+from synapse_client.harnesses.hermes import lineage as hl  # noqa: E402
 from synapse_client.harnesses.hermes import messages as hm  # noqa: E402
 from synapse_client.harnesses.hermes import sessions as hs  # noqa: E402
 
@@ -37,8 +41,11 @@ pytestmark = pytest.mark.skipif(
 
 _DRIVER = textwrap.dedent(
     """
-    import json, os, sqlite3
+    import inspect, json, os, sqlite3
 
+    import hermes_state_mutation_branch as branch
+    import hermes_state_mutation_compress as compress
+    import hermes_state_mutation_reset as reset
     from agent import turn_failure_copy as failures
     from gateway.config import Platform
     from gateway.session import SessionSource, build_session_key
@@ -56,6 +63,9 @@ _DRIVER = textwrap.dedent(
     owner = "uid:%d" % os.getuid()
     chat = local_identity(os.environ["HERMES_HOME"], owner, "req-1")
     local = SessionSource(platform=Platform.LOCAL, chat_id=chat, chat_type="dm", user_id=owner)
+    origins = [key for key, module in (("_branched_from", branch), ("_reset_from", reset),
+                                       ("_compressed_from", compress))
+               if "model_config={'%s': target}" % key in inspect.getsource(module)]
     print("RESULT " + json.dumps({
         "failed_kind": failures.FAILED_TURN_DISPLAY_KIND,
         "failed_notices": notices,
@@ -67,6 +77,7 @@ _DRIVER = textwrap.dedent(
         "surfaces": sorted(SURFACES),
         "stored_as_local": sorted(STORED_AS_LOCAL),
         "columns": columns,
+        "origins": origins,
     }))
     """
 )
@@ -132,3 +143,9 @@ def test_this_hermes_store_has_the_columns_the_rule_reads(names: dict[str, Any])
     sessions = {"id", "title", "source", "chat_id", "model_config", "parent_session_id"}
     assert sessions <= set(names["columns"]["sessions"])
     assert {"key", "value"} <= set(names["columns"]["state_meta"])
+
+
+def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[str, Any]) -> None:
+    """Hermes clears ``parent_session_id`` when a parent is deleted; these keys are what
+    still says a session is a copy or continuation of it."""
+    assert names["origins"] == list(hl._ORIGINS)
