@@ -12,7 +12,8 @@ Hermes's own sequences of hooks:
   * an ACP fork: its agent is built before its row and its copied history are written,
     and the row names no origin (acp_adapter/session.py ``fork_session``);
   * the agent built for the fork later (``_restore``), or for an id it went on to, which
-    goes by what the first one kept of it (carried.py ``note_copied``);
+    goes by what the first one kept of it (carried.py ``note_copied``), and three
+    orders in which nothing was kept and a copy still goes up (``test_still_open_...``);
   * the first turns after ``off --forget``: a flush as the turn starts or in the middle
     of it, an upload that runs late, a turn Hermes began itself, a message with no text;
   * a compression of the head alone (``/compress here N``), whose flush hooks are handed
@@ -360,6 +361,88 @@ def test_a_session_that_goes_on_from_such_a_chat_is_looked_back_at(plugin, serve
     _say(later, [*said, *_conversation(5)[-2:], *_conversation(6)[-2:]], third)
     assert _posted(server)[sent:] == [(third, ["question 1\n\nquestion 2", "", *_questions(3, 6)])]
     assert server.puts() == [] and not (tmp_path / "private").exists()
+
+
+def test_an_agent_told_no_message_count_keeps_what_it_finds(plugin, server, tmp_path):
+    """Hermes tells every agent it builds how many messages its store holds. Should
+    an agent be built without that keyword, nothing says the session's messages were
+    there before it: what its uploader finds is kept, as for a count of 0."""
+    home = tmp_path / "hermes-a"
+    _store(home, _ACP, source="acp", receipt=False, chat_id="")
+    _marker(tmp_path, _ACP)
+    server.private_rows.add(_ACP)
+    keywords = gs._in_process(platform="acp")
+    del keywords["message_count"]
+    fork = pl._new(plugin)
+    fork.initialize(_FORK, hermes_home=str(home), **keywords)
+    _store(home, _FORK, source="acp", receipt=False, chat_id="")
+    _say(fork, _conversation(4), _FORK)
+    assert _posted(server) == [(_FORK, ["question 4"])] and pl.carried.copied(home, _FORK)
+
+
+# ---------------------------------------------------------------------------
+# Still open (HANDOFF.md): copies no agent saw arrive
+#
+# The three tests below state what happens today, not what is wanted: a copy of a
+# private session's turn goes up. Each is listed under "Still open", and each changes
+# when its gap is closed.
+# ---------------------------------------------------------------------------
+
+
+def test_still_open_an_agent_built_again_for_a_fork_before_its_first_turn_sends_the_copies(
+    plugin, server, tmp_path
+):
+    """The agent that saw the fork arrive (built for an empty session, the copies
+    written after) never runs a turn: the user picks another model, and the ACP adapter
+    builds a new agent for the same session (acp_adapter/server.py), or the adapter is
+    restarted. The new agent is told it resumes a session with replies in it, as for
+    any chat opened again, and looks back at the copied turns."""
+    _, home = _fork(plugin, server, tmp_path)
+    second = _open(plugin, home, _FORK, platform="acp", resumed=True, message_count=6)
+    _say(second, _conversation(4), _FORK)
+    assert _posted(server) == [(_FORK, _questions(1, 4))]  # 1 to 3 were private
+    assert not pl.carried.copied(home, _FORK)
+
+
+def _unanswered_copy(server: Any, tmp_path: Path, origin: str, source: str) -> Path:
+    """A private session whose one message, "question 1", got no reply."""
+    home = tmp_path / "hermes-a"
+    _store(home, origin, source=source, receipt=False, chat_id="")
+    _marker(tmp_path, origin)
+    server.private_rows.add(origin)
+    return home
+
+
+@pytest.mark.parametrize("copy", ["an ACP fork built twice", "a session seeded with it"])
+def test_still_open_a_copy_with_no_reply_is_sent_by_the_agent_after_the_one_that_found_it(
+    plugin, server, tmp_path, copy
+):
+    """The copy is one message that got no reply. An agent built once the copy is in
+    the store is told the session holds a message and is new: what an ordinary chat
+    whose first message got no reply looks like (``_unanswered``). That is the second
+    agent of an ACP fork (a model switch, or a restart, before the fork's first
+    prompt), and the first agent of a session a client seeded with messages
+    (tui_gateway/methods_session.py). It takes the session for one that holds a copy,
+    and keeps the folded turn out, but records nothing (carried.py ``noter``): the
+    agent built next looks back, and the private message goes up."""
+    if copy == "an ACP fork built twice":
+        sid, platform = _FORK, "acp"
+        home = _unanswered_copy(server, tmp_path, _ACP, "acp")
+        _open(plugin, home, sid, platform=platform, message_count=0)
+        _store(home, sid, source="acp", receipt=False, chat_id="")
+    else:
+        sid, platform = _CHILD, "tui"
+        home = _unanswered_copy(server, tmp_path, _PARENT, "tui")
+        _store(home, sid, source="tui", receipt=False, chat_id="")  # names no parent
+    found = _open(plugin, home, sid, platform=platform, resumed=False, message_count=1)
+    said = [_conversation(0)[0], *_folded(1)]
+    found.on_turn_start(1, "question 2", previous_message="question 1")
+    found.sync_turn("question 2", "answer 2", session_id=sid, messages=said)
+    assert server.posts() == [] and not pl.carried.copied(home, sid)
+    later = _open(plugin, home, sid, platform=platform, resumed=True, message_count=2)
+    _say(later, [*said, *_conversation(3)[-2:]], sid)
+    assert _posted(server) == [(sid, ["question 1\n\nquestion 2", "", "question 3"])]
+    assert server.puts() == []
 
 
 # ---------------------------------------------------------------------------

@@ -234,9 +234,10 @@ What this does not cover:
   (`tui_gateway/methods_session.py`) copy a session's turns into a new row with no
   `parent_session_id` and no `_branched_from`. Only the owner's own client can make one.
   Private mode cannot follow such a copy either: an ACP fork uploads the turns begun in
-  it and not the copied ones (two narrow cases are left, a single copied turn whose
-  message Hermes cannot name, and an agent built for the fork before its first turn:
-  `HANDOFF.md`), and a seeded session looks back ten turns as a resumed one does.
+  it and not the copied ones (narrow cases are left: a single copied turn whose
+  message Hermes cannot name, and an agent built again for the fork before its first
+  turn, after a model switch or a restart: `HANDOFF.md`), and a seeded session looks
+  back ten turns as a resumed one does.
   Nor is a branch found that was never judged before its parent was deleted, unless the
   session it was branched from carries a mark itself; nor the child of an in-process
   compression whose parent row alone is deleted, which names its parent by the link only.
@@ -509,9 +510,12 @@ The core ports the hooks' behaviour and wording, with these differences:
   known, so neither goes up. Two turns before are not counted: with two uploads still
   to come, the second takes the count of the turn begun off the record, and that
   turn's own upload, or a flush, can then send it. It is counted once however often an
-  id is started and through however many ids the session moves: `start` adds in each
-  session an id goes on from one time, and none that a session in between had added
-  in already (`start(n2, continues=[n1, o])` after `start(n1, continues=[o])`). While
+  id is started and through however many ids the session moves. Each turn start
+  counted has a number of its own, and `start` gives an id the union of what the
+  sessions it goes on from hold: one that two of them hold is in it once
+  (`start(n2, continues=[n1, o])` after `start(n1, continues=[o])`), none is left out
+  when two of them went on from each other (`start(o, continues=[n1])` in between),
+  and one whose end a session among them has seen is not waited for again. While
   one is counted, an upload without
   `finished` picks no turn to send in a session that was off the record: that turn may
   stand whole in the records (its reply cut short, its upload late), and only the
@@ -526,10 +530,10 @@ The core ports the hooks' behaviour and wording, with these differences:
   more turns than were begun. The uploader then calls `copied(session_id)`, a
   constructor argument, for that session and for every one the doubt came through:
   what it found is in memory, and a process started for the session later would look
-  back. A harness need not keep it: Hermes passes no `copied` when its store held
-  messages of the session as the agent was built, since those can be the session's
-  own. One that kept it says so there with `keep_out(session_id)`, or starts the
-  session with 0. A look-back of 0 stays with the session, and with every
+  back. A harness need not keep it: the Hermes adapter passes no `copied` when
+  Hermes's store held messages of the session as the agent was built, since those can
+  be the session's own. One that kept it says so there with `keep_out(session_id)`,
+  or starts the session with 0. A look-back of 0 stays with the session, and with every
   id started as going on from it (`start(..., continues=...)`): a later start asks for
   a look-back in vain.
 

@@ -331,10 +331,12 @@ you left, and it is on the record unless you mark it or its own row says it cont
 private session. An ACP fork names no session it came from: it is on the record, and
 uploads the turns begun in it, not the ones copied into it. A file under
 `$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds for the
-fork later keeps them out too. Two narrow cases are left: the copy of a single turn
-whose message had no text (a picture alone) can go up with the fork's first turn, and
-an agent built for the fork before its first turn (the ACP adapter restarted) looks
-back ten turns. A session seeded with another's messages names none either, and
+fork later keeps them out too. Narrow cases are left. The copy of a single turn
+whose message had no text (a picture alone) can go up with the fork's first turn. An
+agent built again for the fork before its first turn (you pick another model before
+your first prompt, or the ACP adapter restarts) looks back ten turns. And when the
+copy is one message that got no reply, that agent keeps it out but the agent built
+after it uploads it. A session seeded with another's messages names none either, and
 is taken for a resumed one: up to ten of the copied turns are uploaded, whatever the
 session they came from was. A chat whose first message got no reply looks like a fork
 when you open it again: the agent built then does not upload that first exchange, and

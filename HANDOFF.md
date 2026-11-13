@@ -57,14 +57,18 @@ changed, what to do on each machine, what was proven, and what is still open.
   A turn begun off the record is counted once, until the upload that ends it has been
   seen: also when compressions move it, or its session, through several ids on the
   way. The provider starts a new id at the switch and again at that id's first upload,
-  with every id its row names; each of them is counted into it once, also one whose
-  counts an id in between had taken first (it was counted twice, and the first turn
-  back on the record was then not uploaded). The one turn before it is counted too
-  when its end was not seen yet. Which turn a late upload ends is not known, so the
-  count errs to private: the late upload of a turn begun off the record is not taken
-  for the end of a later turn, and the late upload of the turn before is not taken for
-  the end of the one begun off the record. Two late uploads are one more than it
-  counts ("Still open").
+  with every id its row names. What is counted is kept turn start by turn start, each
+  under a number of its own, and a new id holds what the ids it goes on from hold, each
+  once: whichever of them had it from which, and also when two of them went on from
+  each other. (Kept as a sum, such a turn was first counted twice across two
+  compressions, and the first turn back on the record was not uploaded; then, with
+  every id read once, it was left out when the agent had gone back to the id a
+  compression left.) A turn whose end one of those ids has seen is not waited for
+  again. The one turn before it is counted too when its end was not seen yet. Which
+  turn a late upload ends is not known, so the count errs to private: the late upload
+  of a turn begun off the record is not taken for the end of a later turn, and the
+  late upload of the turn before is not taken for the end of the one begun off the
+  record. Two late uploads are one more than it counts ("Still open").
 - **A flush goes under the session Hermes named last, when the provider can tell whose
   turns it holds.** `on_session_end` and `on_pre_compress` carry no session id, and
   after the third way above the id the provider was built for is not the agent's. The
@@ -181,12 +185,15 @@ changed, what to do on each machine, what was proven, and what is still open.
   and the provider keeps it as an empty file under `$HERMES_HOME/synapse/copied/`,
   named like the ones in `settled/`: for the fork, and for the id it had already moved
   to when it was found. It keeps it only when Hermes's store held no message of the
-  session as it built the agent (`message_count` at `initialize`, `carried.noter`): a
-  fork's history is written after its agent. A chat whose first message got no reply,
-  opened again, is said to be new as well, and its first turn start names a message
-  before. Its messages are its own, so no file is written for it and the agent built
-  next looks back at them. An agent built for a session with that file looks back at
-  nothing (`initialize`, and at an upload for an id it was never moved to:
+  session as it built the agent (`message_count` at `initialize`, `carried.noter`; an
+  agent told no count keeps it): the first agent of a fork is built before the fork's
+  history is written. A chat whose first message got no reply, opened again, is said
+  to be new as well, and its first turn start names a message before. Its messages are
+  its own, so no file is written for it and the agent built next looks back at them.
+  The count does not tell that chat from a copy of one unanswered message that was in
+  the store before the agent: no file is written for such a copy either ("Still
+  open"). An agent built for a session with that file looks back at nothing
+  (`initialize`, and at an upload for an id it was never moved to:
   `TurnUploader.keep_out`). A session that goes on from one (a branch of it, a
   compression's new id) is recorded as `held`, and is not made private for it. The file
   is not an answer: a session whose row names another is still asked about, since that
@@ -255,38 +262,39 @@ changed, what to do on each machine, what was proven, and what is still open.
   while its question is open (the server has still to answer, or still to be told)
   tells every caller how it ended, also when one of them raises, and a carry after it
   closed is told nothing.
-- `tests/test_client_core_turn_upload.py` (new): turns kept for one session do not go
-  up under another, and each session has its own look-back; a session that was off the
-  record is not looked back at under any id it goes on with; of what it holds when it
-  is first found on the record, a turn goes up only when it was seen to begin there:
-  not one no start was seen for, one that began off the record and ends on it, one
-  still running when another ends, or one that holds more than its own exchange (a
-  reply the user did not ask for, a reply that lands on a turn cut short, a row the
-  harness adds after a reply); an upload that runs late is not the end of the turn
-  begun since, whichever of the two began off the record, and each turn begun off it
-  is counted until its own end, under every id left, and once however often an id is
-  started and through however many ids it or its session moves; a turn begun on the
+- `tests/test_client_core_turn_upload.py` (new): turns kept for one session do not go up
+  under another, and each session has its own look-back; a session that was off the
+  record is not looked back at under any id it goes on with; of what it holds when it is
+  first found on the record, a turn goes up only when it was seen to begin there: not
+  one no start was seen for, one that began off the record and ends on it, one still
+  running when another ends, or one that holds more than its own exchange (a reply the
+  user did not ask for, a reply that lands on a turn cut short, a row the harness adds
+  after a reply); an upload that runs late is not the end of the turn begun since,
+  whichever of the two began off the record, and each turn begun off it is counted until
+  its own end, under every id left, and once however often an id is started and through
+  however many ids it or its session moves, also when two ids went on from each other
+  and when it began under an id another had gone on from already; one whose end was seen
+  under one id is not waited for under an id that goes on later; a turn begun on the
   record is not counted for the one before it; a flush leaves the turn now running for
-  the upload
-  that ends it, which judges it then, notes the turns it is shown and uses up no
-  look-back, and is not the end of a turn; while a turn begun off the record is to
+  the upload that ends it, which judges it then, notes the turns it is shown and uses up
+  no look-back, and is not the end of a turn; while a turn begun off the record is to
   end, the flush of a session that was off the record sends no new turn, the ones kept
-  for the server's answer still go, and with no such turn to end, or in a session
-  never off the record, a flush sends what it holds; a turn sent or kept on the record
-  stays on it when the session goes private again, and one spoken then stays off it; a
-  turn
-  begun before the server said "private" began off the record; a turn that began under
-  the id left ends under the new one; a look-back counts finished turns only; a
-  session said to be new uploads nothing before its first turn starts, and
-  holds turns from before when it shows more turns than were begun, checked at its
-  first upload only; a harness that does not say when turns start is taken at its
-  word; a session found to hold turns from before is named to the harness, with every
-  id that doubt came through, and a harness that raises there stops nothing; a
-  session the harness says holds copies is not looked back at, which forgets nothing
-  it sent; a turn refused at the send is kept when the session waits for the server
-  again, and not when it is private; a marker written by hand is not taken for the
-  server's answer; a turn is not kept once another thread's upload was told the session
-  is private.
+  for the server's answer still go, and with no such turn to end, or in a session never
+  off the record, a flush sends what it holds; a turn sent or kept on the record stays
+  on it when the session goes private again, and one spoken then stays off it; a turn
+  begun before the server said "private" began off the record, and is counted until its
+  own end; a turn that began under the id left ends under the new one; a look-back
+  counts finished turns only; a session said to be new uploads nothing before its first
+  turn starts, and holds turns from before when it shows more turns than were begun,
+  checked at its first upload only, each turn start counted once whichever id went on
+  from which, and one in a session not in doubt not at all; a harness that does not say
+  when turns start is taken at its word; a session found to hold turns from before is
+  named to the harness, with every id that doubt came through and none that was only
+  named before it was met, and a harness that raises there stops nothing; a session the
+  harness says holds copies is not looked back at, which forgets nothing it sent; a turn
+  refused at the send is kept when the session waits for the server again, and not when
+  it is private; a marker written by hand is not taken for the server's answer; a turn
+  is not kept once another thread's upload was told the session is private.
 - `tests/test_hermes_provider.py`: a compression or a branch from a private session
   uploads nothing under the new id, at a turn, before a compression or at exit; a
   private parent is enough, by marker or by server row; `/resume` and `/new` carry
@@ -313,20 +321,22 @@ changed, what to do on each machine, what was proven, and what is still open.
   same, and keeps the copies out whatever the answer.
 - `tests/test_hermes_private_moves.py` (new): a flush goes under the session Hermes
   named last, at a turn start or an upload, and not under an id that goes on from some
-  other session; the flush of the session left at `/new` does not go under the new id;
-  a late upload does not take the agent back to an id a hook named before or to the
-  parent a switch names (each in the one shape built here); a new session id after
-  `off --forget` is not looked back at, whether a switch
-  or only the row says what it goes on from; `off --forget` after a switch stands when
-  the record could not be written; turns kept for a session stay with it when another
-  is resumed in place; a compression of the id the agent is in is one in place; a
-  switch back to the bound id does not send its turns again; a switch goes by the id
-  the provider is bound to, the id Hermes named last and the parent it names; an agent
-  built later for a carried session keeps its turns out, built while it is private or
-  after `off --forget`, with no request; so does the agent of a branch made from it
-  later, and the one built for the id a compression moved it to, under their own ids
-  and without being made private; a branch settled as on the record, and an id found
-  at an upload to go on from another, are looked back at ten turns.
+  other session; the flush of the session left at `/new` does not go under the new id; a
+  late upload does not take the agent back to an id a hook named before or to the parent
+  a switch names (each in the one shape built here); a new session id after `off
+  --forget` is not looked back at, whether a switch or only the row says what it goes on
+  from; `off --forget` after a switch stands when the record could not be written; turns
+  kept for a session stay with it when another is resumed in place; a compression of the
+  id the agent is in is one in place; a switch back to the bound id does not send its
+  turns again; a turn begun off the record under an id the agent went back to stays out
+  after the next compression, whose new id goes on from two ids that went on from each
+  other; a switch goes by the id the provider is bound to, the id Hermes named last and
+  the parent it names; an agent built later for a carried session keeps its turns out,
+  built while it is private or after `off --forget`, with no request; so does the agent
+  of a branch made from it later, and the one built for the id a compression moved it
+  to, under their own ids and without being made private; a branch settled as on the
+  record, and an id found at an upload to go on from another, are looked back at ten
+  turns.
 - `tests/test_hermes_turn_starts.py` (new), Hermes's own order of hooks: an ACP fork
   uploads none of the turns copied into it, also when its first message has no text,
   and under an id only a switch says it goes on to;
@@ -350,12 +360,16 @@ changed, what to do on each machine, what was proven, and what is still open.
   agent per turn uploads each turn as before, with the record of copies written at its
   second turn; a chat whose first message got no reply, opened again, gets no such
   record, and the agent built next looks back at it, as does the one built for a
-  session that goes on from it.
+  session that goes on from it; an agent told no message count keeps what it finds.
+  Three tests there state what is still open, as it stands (`test_still_open_...`): an
+  agent built again for a fork before its first turn sends the copies, and a copy that
+  is one message with no reply, in a fork built twice or in a seeded session, is sent
+  by the agent after the one that found it.
 - `tests/test_hermes_messages.py`: a user row with no text stays in the records as a
   row that opens no turn, and what `joined` counts; a user row that carries a summary
   stays, with no text; a user row Hermes folded a later message into is followed by a
   row with no text, by either key Hermes leaves on it, and an assistant row is not.
-- Each of those rules was taken out of the code in turn (263 changes, one at a time);
+- Each of those rules was taken out of the code in turn (272 changes, one at a time);
   the tests failed every time.
 - In a real Hermes checkout (bca51750): `tests/test_hermes_integration.py` marks a
   session private and makes the calls a compression makes on Hermes's own
@@ -368,7 +382,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   the agent's session as a turn starts while the flush hooks carry none, and that
   `on_turn_start` comes after the turn-start compaction and before the turn's
   `prefetch`, with the user message before this one.
-- Reviewed seven times by a separate agent that tried to make private turns leave. The
+- Reviewed eight times by a separate agent that tried to make private turns leave. The
   first review found two ways; the second found ten defects, four of them ways under
   narrow conditions; the third found ten more, four of them ways (a flush after a move
   Hermes did not announce, a reply Hermes began after `off --forget`, a compression to
@@ -408,8 +422,18 @@ changed, what to do on each machine, what was proven, and what is still open.
   a second compression, the doubt of a session found to hold copies passed back one id
   only, and a carry whose callback was dropped when the session had been made private
   here already. Those are fixed here too. One older way it found is under "Still
-  open": two uploads that both run late past a turn begun off the record. Each fix has
-  a test here that fails without it.
+  open": two uploads that both run late past a turn begun off the record. The eighth
+  found that two of the seventh's fixes had each opened a narrow way. The count, with
+  every id read once, left out a turn begun off the record when two ids had gone on
+  from each other: the agent goes back to the id a compression left, the turn begins
+  there, and a second compression follows. And the record that is no longer written
+  for a session with messages in the store is not written either for a fork whose agent
+  is built a second time before its first turn, when the copy is one message that got
+  no reply. The first is fixed here: what is counted is kept turn start by turn start,
+  so one can be neither left out nor counted twice, in whatever order ids are started.
+  The second is under "Still open", with the wider case it belongs to; the review also
+  showed that a model switch reaches that case with no restart. Each fix has a test
+  here that fails without it.
 
 **Still open**
 
@@ -451,13 +475,23 @@ changed, what to do on each machine, what was proven, and what is still open.
   from one is recorded as `held`. Where that record could not be written, an agent
   built later looks back ten turns, the copies among them.
 - An ACP fork has no such record before it is found to hold copies: at its first turn
-  start, or at its first upload when that start names no message before. An agent the
-  ACP adapter builds for the fork before then (after a restart) is told it resumes a
-  session, and looks back ten turns: the copies go up. So they do one id on: a branch
-  of the fork that was asked about before the fork's first turn start keeps its empty
-  record, and an agent built for it later looks back. The same is read off the code,
-  not tested, for the id a compression moved the fork to before its first turn, when
-  the adapter restarts before that turn start.
+  start, or at its first upload when that start names no message before. An agent
+  Hermes builds for the fork before then did not see the copies arrive. The user picks
+  another model before the fork's first prompt, and the ACP adapter builds a new agent
+  for the same session, with no restart (`acp_adapter/server.py`); or the adapter is
+  restarted. That agent is told it resumes a session, and looks back ten turns: the
+  copies go up. When the copy is one message that got no reply, it is told the session
+  is new and holds a message: it keeps the copy out, in memory, and records nothing
+  (above), and the agent built after it looks back and uploads the message; so does
+  one built for an id a compression moved the fork to since. Both are tested as they
+  stand. So the copies go up one id on: a branch of the fork that was asked about
+  before the fork's first turn start keeps its empty record, and an agent built for it
+  later looks back. The same is read off the code, not tested, for the id a compression
+  moved the fork to before its first turn, when the adapter restarts before that turn
+  start. For the model switch this can be closed in the provider: a note, for as long
+  as the process lives, of a session that was empty when its first agent was built and
+  in which no turn has begun. That is left for a change of its own. Across a restart
+  nothing Hermes records tells such a fork from a chat opened again.
 - A seeded session (`session.create` with messages and no parent,
   `tui_gateway/methods_session.py`; who calls it that way was not established) is a
   copy that names no origin, and Hermes writes its row before it builds the agent: the
@@ -466,7 +500,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   a resumed one: Hermes would have to record where the copy came from. One seeded with
   no reply among its messages is said to be new: the agent built then keeps the copies
   out as a fork's does, in memory, and with messages in the store no record is kept,
-  so an agent built later looks back at them (read off the code, not tested).
+  so an agent built later looks back at them (tested as it stands, with one message).
 - An ACP fork is known by its first turn start saying a message came before, or by its
   first upload holding more turns than were begun. Both miss a fork whose turn start
   names no message before and whose copied history counts as one turn: a flush inside
@@ -494,11 +528,14 @@ changed, what to do on each machine, what was proven, and what is still open.
   turn before one begun off the record is counted with it when its end was not seen:
   cut short, one more turn is not uploaded after `off --forget`; with its upload
   running late, it is not uploaded itself. Both in a carried session only.
-- The count of an id is taken along once, by the first session that goes on from it. A
-  turn that began off the record under an id after the agent had left it for such a
-  session would not be counted under the id the agent moves to next. No order of
-  Hermes's calls is known that begins a turn there: a turn start goes under the id
-  named last, which moves at the switch, and a late `sync_turn` does not move it back.
+- A new id takes along what is counted under the ids it is started with: at the
+  switch, the id the provider was bound to, the one Hermes named last and the parent
+  the switch names; at its first upload, the chain its row names. A turn start goes
+  under the id named last when it comes. Should that id be none of those, a turn begun
+  off the record under it is not counted under the new id. Read off the code, not
+  tested: Hermes would have to name yet another id between the turn start and the
+  switch, and the id the turn began under be neither the one the provider is bound to
+  nor the parent, nor in the new id's row.
 - While such a turn is counted, a flush of a session that was off the record sends no
   new turn. A turn that ended on the record and whose upload had not run when a turn
   began off it used to go up at a flush that came first. It does not now, and its own

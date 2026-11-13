@@ -54,11 +54,15 @@ class _Session:
         # by a harness that says when turns start. Until its first upload, the turn
         # starts (``begun`` counts them) show whether that is so.
         self.new = checked and lookback is None
-        self.begun = 0
+        # What is counted is kept one by one, each under a number of its own, not as a
+        # sum: a session that goes on from several others (``start``) holds what they
+        # hold once, whichever of them had it from which.
+        self.begun: set[int] = set()
         self.began = False  # the last turn to start began on the record, its end not seen
-        self.unseen = 0  # turns begun off the record whose end has not been seen
-        # The sessions it goes on from whose counts are in its own (``start``): the
-        # ones it was started with, and the ones those had taken.
+        self.unseen: set[int] = set()  # turns begun off the record, their end not seen
+        self.ended: set[int] = set()  # of those, the ones whose end was seen since
+        # The sessions it went on from, and the ones those went on from (``_close``):
+        # itself among them, once it was started again.
         self.took: frozenset[str] = frozenset()
 
     def close(self) -> None:
@@ -108,6 +112,12 @@ class TurnUploader:
         self._begins = begins
         self._copied = copied
         self._sessions: dict[str, _Session] = {}
+        self._counted = 0
+
+    def _one(self) -> int:
+        """A number for one more thing counted. Called with the lock held."""
+        self._counted += 1
+        return self._counted
 
     def start(
         self, session_id: str, lookback: int | None = None, *, continues: Iterable[str] = ()
@@ -119,26 +129,27 @@ class TurnUploader:
         the record here: no later look-back may reach a turn spoken then. What is known
         of the turn now running stays, also from the sessions it goes on from (a turn
         that began under one of them ends under this id), as does a doubt not settled
-        yet: whether one said to be new holds turns from before. Each of those
-        sessions is counted once, however often this id is started and whichever
-        session in between took its counts first (a second switch, whose new id goes
-        on from both). A session that names the ones it goes on from is not said to
-        be new: what they are says whether their turns may go up."""
+        yet: whether one said to be new holds turns from before. Each turn start
+        those sessions counted is counted once here, and none is left out, however
+        often this id is started, whichever of them went on from which, and in
+        whatever order (a second switch whose new id goes on from both; a switch back
+        to the id left). A turn whose end one of them has seen is not waited for
+        again. A session that names the ones it goes on from is not said to be new:
+        what they are says whether their turns may go up."""
         with self._lock:
             ids = dict.fromkeys((session_id, *continues))
             past = {sid: self._sessions[sid] for sid in ids if sid in self._sessions}
             if any(one.was_private for one in past.values()):
                 lookback = 0
-            # A session started before holds the counts of the sessions it took then,
-            # and of the ones those had taken: none of them is counted again.
-            took = frozenset().union(*(one.took for one in past.values()))
-            fresh = [one for sid, one in past.items() if sid not in took]
             state = self._sessions[session_id] = _Session(lookback, self._begins and len(ids) == 1)
-            state.took = (took | past.keys()) - {session_id}
+            state.took = frozenset(past).union(*(one.took for one in past.values()))
             state.new = state.new or (lookback != 0 and any(one.new for one in past.values()))
-            state.begun = sum(one.begun for one in fresh if one.new)
             state.began = any(one.began for one in past.values())
-            state.unseen = sum(one.unseen for one in fresh)
+            for one in past.values():
+                state.begun |= one.begun if one.new else set()
+                state.unseen |= one.unseen
+                state.ended |= one.ended
+            state.unseen -= state.ended
 
     def keep_out(self, session_id: str) -> None:
         """``session_id`` holds turns from before that are not its own to upload, and
@@ -210,10 +221,11 @@ class TurnUploader:
             state.began = not private
             # The upload that ends the turn before may still come, after this start: it
             # is counted too, or it would pass for the end of this turn.
-            state.unseen += private + (private and unended)
+            if private:
+                state.unseen |= {self._one(), *([self._one()] if unended else [])}
             if state.new and not state.begun and earlier:
                 found = self._close(session_id, state)
-            state.begun += 1
+            state.begun.add(self._one())
         self._found(found)
 
     def upload(
@@ -288,12 +300,15 @@ class TurnUploader:
                 state = self._sessions[session_id] = _Session(self._lookback, self._begins)
             if standing == TAKEN:
                 # A turn begun before the answer began off the record, as it turns out.
-                state.unseen, state.began = state.unseen + state.began, False
+                if state.began:
+                    state.unseen.add(self._one())
+                state.began = False
             # Whether the turn now running, or the one just ended, began on the record.
             on_record = state.began and not state.unseen
-            began_off = finished and state.unseen > 0
+            began_off = finished and bool(state.unseen)
             if finished:
-                state.unseen = max(0, state.unseen - 1)
+                state.ended |= set(sorted(state.unseen)[:1])  # one turn has ended
+                state.unseen -= state.ended
                 state.began = False
             # A turn sent or kept here was spoken on the record: it stays there.
             ours = state.sent | state.kept.keys()
@@ -308,7 +323,7 @@ class TurnUploader:
             if state.new:
                 if not state.begun and not finished:
                     return False  # what it holds is not known before its first turn
-                if len(all_turns) > state.begun + (not finished):
+                if len(all_turns) > len(state.begun) + (not finished):
                     found = self._close(session_id, state)
                 state.new = False
             if state.lookback == 0 or (began_off and state.was_private):
@@ -334,7 +349,7 @@ class TurnUploader:
             # A turn begun off the record is still to end, and its rows may be whole
             # (a reply cut short, an upload that runs late). The upload that ends a
             # turn notes it: until then one that ends none picks no turn to send.
-            quiet = not finished and state.unseen > 0 and state.was_private
+            quiet = not finished and bool(state.unseen) and state.was_private
             selected: list[_Pair] = []
             for before, turn in () if quiet else messages.pending(all_turns, state.sent):
                 if opening(turn) in state.off or opening(turn) == held:

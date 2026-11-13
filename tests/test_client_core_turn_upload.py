@@ -12,8 +12,8 @@ it was moved to, a late upload for the one it left. Pinned here:
   * an upload that ends no turn notes the turns it is shown and settles nothing more,
     and one that runs late is not taken for the end of another turn;
   * a turn begun off the record is counted once however often its session is started
-    and through however many ids it or its session moves, and until its end is seen no
-    flush sends a turn;
+    and through however many ids it or its session moves, also when two of them went on
+    from each other, and until its end is seen no flush sends a turn;
   * a session said to be new is not believed when its turn starts show otherwise, and
     the harness is told (``copied``), so that it can say so later (``keep_out``);
   * an upload acts on the server's answer only when it got the answer itself
@@ -433,6 +433,25 @@ def test_a_turn_begun_under_a_marker_is_counted_once_when_the_server_says_privat
     assert _records(wire) == [_turn(2)]
 
 
+def test_a_turn_begun_before_the_server_said_private_is_counted_until_its_own_end(tmp_path):
+    """The answer comes at a flush that shows no row of the turn still running, and
+    `off --forget` follows. The next turn begins on the record before the upload of the
+    first has run. That upload ends the turn begun off the record, as it turned out,
+    and not the one begun since: it stays out."""
+    turns, wire = _turns(tmp_path)
+    wire.rows.add("s-old")
+    assert turns.uploader.carry_private(["s-old"], "s-new") is False
+    turns.begin("s-new")  # turn 1, while the server has not said
+    assert turns.upload([], "s-new", timeout=5) is False  # a flush: "private"
+    assert (tmp_path / "private" / "s-new").is_file()
+    _forget(wire, tmp_path, "s-new")
+    turns.begin("s-new")  # turn 2, on the record
+    assert turns.upload(_turn(1), "s-new", timeout=5, finished=True) is False
+    assert wire.tries == 0
+    assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(2)]
+
+
 def test_a_turn_that_ended_before_the_server_said_private_is_not_one_still_running(tmp_path):
     """The turn ends while the server does not answer, and a flush gets the answer:
     private. No turn was running then, so none is counted as begun off the record, and
@@ -828,6 +847,81 @@ def test_a_turn_begun_off_the_record_is_counted_once_across_two_moves(tmp_path, 
     assert _records(wire) == [_turn(3)]
 
 
+@pytest.mark.parametrize("named", [["s-0", "s-1"], ["s-1", "s-0"]], ids=["back first", "on first"])
+def test_two_sessions_that_went_on_from_each_other_keep_the_turn_begun_off_the_record(
+    tmp_path, named
+):
+    """The id left is gone back to (Hermes: an undo that names it, after a compression
+    whose turn raised). A turn begins off the record under it, and a third id goes on
+    from both. Each of the two went on from the other, and the turn is still counted,
+    once: its upload runs late, after the next turn has begun, and is not taken for
+    the end of that one."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    turns.start("s-1", 0, continues=["s-0"])
+    turns.start("s-0", 0, continues=["s-1"])
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")  # turn 2, off the record
+    marker.unlink()
+    turns.start("s-2", 0, continues=named)
+    turns.begin("s-2")  # turn 3, on the record: turn 2's upload has not run yet
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-2", timeout=5, finished=True) is False
+    assert turns.upload(said + _turn(3), "s-2", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3)]
+
+
+@pytest.mark.parametrize("ended", [False, True], ids=["both to end", "the first has ended"])
+def test_a_turn_begun_under_an_id_after_it_was_gone_on_from_is_counted_too(tmp_path, ended):
+    """A turn start goes under the id the harness named last, and that may be one
+    another id has gone on from already. The turn begun there off the record is
+    counted when a third id goes on from both: beside the one begun before, which both
+    hold and which is counted once, or alone when that one's end was seen under the
+    second id (the first still holds it, and it is not waited for again)."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")  # turn 2, off the record
+    turns.start("s-1", 0, continues=["s-0"])
+    said = _turn(1) + _turn(2)
+    if ended:
+        assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    turns.begin("s-0")  # turn 3, off the record too, under the id left
+    marker.unlink()
+    turns.start("s-2", 0, continues=["s-1", "s-0"])
+    if not ended:
+        assert turns.upload(said, "s-2", timeout=5, finished=True) is False
+    said = said + _turn(3)
+    assert turns.upload(said, "s-2", timeout=5, finished=True) is False
+    turns.begin("s-2")
+    assert turns.upload(said + _turn(4), "s-2", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(4)]
+
+
+@pytest.mark.parametrize("again", [False, True], ids=["as it was", "started again since"])
+def test_a_turn_whose_end_was_seen_is_not_waited_for_under_an_id_that_goes_on_later(
+    tmp_path, again
+):
+    """The end of the turn begun off the record was seen under the first id. A second
+    id went on from the first before that and still holds the turn as one to end. A
+    third that goes on from both waits for no upload: the turn begun in it goes up.
+    Also when the first id was started again since it saw that end."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")  # turn 2, off the record
+    marker.unlink()
+    turns.start("s-1", 0, continues=["s-0"])
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-0", timeout=5, finished=True) is False
+    if again:
+        turns.start("s-0", 0)
+    turns.start("s-2", 0, continues=["s-1", "s-0"])
+    turns.begin("s-2")
+    assert turns.upload(said + _turn(3), "s-2", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3)]
+
+
 def test_a_flush_sends_no_new_turn_while_a_turn_begun_off_the_record_is_to_end(tmp_path):
     """Turn 4 began off the record and its rows are complete: its reply was cut short
     while it came in (Hermes keeps the part that came and sends no upload), or its
@@ -1103,6 +1197,56 @@ def test_the_turns_begun_under_the_id_left_are_counted_once_too(tmp_path):
     turns.start("s-2", 10, continues=["s-1"])
     assert turns.upload(_turn(1) + _turn(2), "s-2", timeout=5, finished=True) is True
     assert _records(wire) == [_turn(2)] and found == ["s-2", "s-1"]
+
+
+@pytest.mark.parametrize("under", ["s-1", "s-2"], ids=["the id gone back to", "the id left again"])
+@pytest.mark.parametrize("copies", [0, 1], ids=["its own turns", "a copy among them"])
+def test_turns_begun_are_counted_once_each_whichever_session_went_on_from_which(
+    tmp_path, under, copies
+):
+    """A session said to be new moves to a second id and back, and a third id goes on
+    from both. Two turns were begun, the first before the moves and the second under
+    either id: each is counted once and neither is left out. An upload that shows two
+    turns finds nothing, and they go up. One that shows three finds a copy."""
+    found: list[str] = []
+    turns, wire = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.begin("s-1")  # nothing said a turn came before this one
+    turns.start("s-2", 10, continues=["s-1"])
+    turns.start("s-1", 10, continues=["s-2"])
+    turns.begin(under)
+    turns.start("s-3", 10, continues=["s-1", "s-2"])
+    said = [row for n in range(1, 3 + copies) for row in _turn(n)]
+    assert turns.upload(said, "s-3", timeout=5, finished=True) is True
+    assert _records(wire) == ([_turn(3)] if copies else [said])
+    assert found == (["s-3", "s-1", "s-2"] if copies else [])
+
+
+def test_a_session_named_before_it_was_met_is_not_one_the_doubt_came_through(tmp_path):
+    """A start may name a session nothing is remembered of (the harness read it off
+    the new id's row). The doubt did not come through it: when it is met later and
+    said to be new, the copies found under the id that named it say nothing of it."""
+    found: list[str] = []
+    turns, _ = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.start("s-2", 10, continues=["s-1", "s-0"])
+    turns.start("s-0")
+    turns.begin("s-2", earlier=True)
+    assert found == ["s-2", "s-1"]
+
+
+def test_the_turns_begun_in_a_session_not_in_doubt_do_not_count_for_one_that_is(tmp_path):
+    """The new id goes on from a session said to be new and from one that was never in
+    doubt, in which a turn was begun. That turn start says nothing about the copies:
+    the first turn start under the new id still shows them."""
+    found: list[str] = []
+    turns, _ = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-0", 10)
+    turns.begin("s-0")
+    turns.start("s-1")
+    turns.start("s-2", 10, continues=["s-1", "s-0"])
+    turns.begin("s-2", earlier=True)
+    assert found == ["s-2", "s-1"]
 
 
 def test_an_id_left_that_was_not_in_doubt_is_not_named(tmp_path):

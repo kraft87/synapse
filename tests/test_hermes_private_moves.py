@@ -304,6 +304,47 @@ def test_forget_after_a_switch_stands_when_the_note_of_the_carry_could_not_be_ke
     assert not carried.settled(home, _CHILD)
 
 
+def test_a_turn_begun_under_an_id_gone_back_to_stays_out_after_the_next_compression(
+    plugin, server, tmp_path
+):
+    """A compression moves a private session to a second id, and the turn raises: the
+    TUI keeps the first id as its key (tui_gateway/prompt_turn.py re-anchors it only
+    with a result). `/undo` then names the first id (tui_gateway/methods_tools.py; that
+    Hermes takes the old key there was read off its code, not run): the provider goes
+    back to it, and each of the two ids has gone on from the other. Question 4 begins
+    off the record under the first, and a compression in the middle of it moves the
+    agent to a third id, which goes on from both. After `off --forget`, question 4's
+    upload runs late, after question 5 has begun: the turn begun off the record is
+    still counted, so that upload is not taken for the end of question 5."""
+    home = tmp_path / "hermes-a"
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    _marker(tmp_path, _PARENT)
+    server.private_rows.add(_PARENT)
+    agent = _open(plugin, home, _PARENT, resumed=True, message_count=6)
+    asked = [*_conversation(3), {"role": "user", "content": "question 4", "message_uid": "u4"}]
+    _store(home, _THIRD, source="tui", receipt=False, chat_id="")
+    _link(home, _THIRD, _PARENT, None)
+    agent.on_pre_compress(asked)
+    agent.on_session_switch(_THIRD, parent_session_id=_PARENT, reason="compression")
+    assert (tmp_path / "private" / _THIRD).is_file()
+    agent.on_session_switch(_PARENT, parent_session_id="", reset=False, rewound=True)
+    agent.on_turn_start(4, "question 4", previous_message="question 3")
+    agent.prefetch("question 4", session_id=_THIRD)
+    _store(home, _NEW, source="tui", receipt=False, chat_id="")
+    _link(home, _NEW, _THIRD, None)
+    agent.on_pre_compress(asked)
+    agent.on_session_switch(_NEW, parent_session_id=_THIRD, reason="compression")
+    assert (tmp_path / "private" / _NEW).is_file()
+    _forget(server, tmp_path, _NEW)
+    agent.on_turn_start(5, "question 5", previous_message="question 4")
+    agent.prefetch("question 5", session_id=_NEW)
+    agent.sync_turn("question 4", "a", session_id=_NEW, messages=_conversation(4))
+    assert server.posts() == []
+    agent.sync_turn("question 5", "a", session_id=_NEW, messages=_conversation(5))
+    _say(agent, _conversation(6), _NEW)
+    assert _posted(server) == [(_NEW, ["question 5"]), (_NEW, _questions(5, 6))]
+
+
 # ---------------------------------------------------------------------------
 # An agent built later for a session that holds turns from off the record
 # ---------------------------------------------------------------------------
