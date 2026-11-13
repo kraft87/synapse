@@ -3,6 +3,47 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — notes: a related note is kept beside the old one, and replaced text is kept (schema 070, optional)
+
+**What changed**
+
+- **The fault.** `remember()` compares a new note's hook with the stored notes. A close
+  match of the same type went to a confirm call that could answer only "same" (replace
+  the stored text) or "contradicts" (retire the stored note). A new benchmark result on
+  the topic of an older one fitted neither, was called "same", and replaced the older
+  note's text. Nothing in the notes table kept what was replaced.
+- **A third answer, "related".** Same topic, but each note records its own thing (another
+  measurement, a later event, a different result): the new note is stored beside the old
+  one and the old one is not touched. The prompt says to prefer it when unsure.
+- **A confirm call that fails keeps both notes.** It used to answer "same". A wrong
+  "same" loses text; a wrong "related" leaves a duplicate that the nightly notes lane
+  merges. A new note identical to its match (same hook and body) is "same" without a
+  call, so a replayed write still lands on the stored note. `SYNAPSE_NOTES_CONFIRM=0` is
+  unchanged: every match is "same".
+- **Schema 070, `notes_history`.** Two triggers on `notes` copy the row as it was before
+  any change of hook, body, type, project, tier or `superseded_by`, and before a delete.
+  Every writer is covered, the nightly lane and hand-run SQL included. Read a note's
+  earlier versions with
+  `SELECT * FROM notes_history WHERE note_id = N ORDER BY recorded_at`.
+
+**What to do on each machine**
+
+1. Take the new image. It runs the same with or without 070 (the file is optional).
+2. `scripts/apply_schema.sh "$SYNAPSE_DB_URL"` from a checkout of this version. It
+   applies 070 and moves the stamp. Nothing needs stopping.
+
+**Rollback**
+
+The previous image runs on a database with 070. To remove the table:
+`DROP TRIGGER notes_history_update_trg ON notes; DROP TRIGGER notes_history_delete_trg ON notes; DROP FUNCTION notes_history_record(); DROP TABLE notes_history;`
+
+**What was proven**
+
+- `tests/test_notes_store.py`, `tests/test_remember_notes.py`: "related" and a failed
+  confirm call each insert and leave the stored row as it was; identical text updates
+  with no call; an update, a retirement, a retype and a delete each leave the earlier row
+  in `notes_history`; a write that changes no content leaves none.
+
 ## 2026-11-13 — skills: accepting a retune runs its routing check, which had never run
 
 **What changed**
