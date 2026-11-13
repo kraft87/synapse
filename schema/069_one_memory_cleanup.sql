@@ -88,7 +88,9 @@ BEGIN
     -- A dropped column silently takes every index on it along: one this file does not name
     -- (a search index, say) must stop it. Views, triggers, constraints, statistics,
     -- policies and other columns' defaults or generated expressions over it are in pg_depend
-    -- too; only the column's own default is not a dependent to keep.
+    -- too. Two things are the column itself and not dependents to keep: its own default,
+    -- and its own NOT NULL, which PostgreSQL 18 records as a constraint (older servers keep
+    -- it on the column and have no such row).
     SELECT string_agg(DISTINCT pg_describe_object(d.classid, d.objid, d.objsubid), '; ') INTO bad
       FROM pg_depend d
       JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
@@ -99,6 +101,10 @@ BEGIN
        AND NOT (d.classid = 'pg_attrdef'::regclass
                 AND d.objid IN (SELECT ad.oid FROM pg_attrdef ad
                                  WHERE ad.adrelid = d.refobjid AND ad.adnum = d.refobjsubid))
+       AND NOT (d.classid = 'pg_constraint'::regclass
+                AND d.objid IN (SELECT co.oid FROM pg_constraint co
+                                 WHERE co.conrelid = d.refobjid AND co.contype = 'n'
+                                   AND co.conkey = ARRAY[d.refobjsubid::int2]))
        AND NOT (d.classid = 'pg_class'::regclass
                 AND d.objid IN (SELECT c.oid FROM pg_class c
                                  WHERE c.relnamespace = 'public'::regnamespace
