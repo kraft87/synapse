@@ -14,25 +14,43 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
 
 - Any of ``user_id_alt``, ``user_name``, ``chat_name``, ``thread_id``: a messaging chat.
   INERT.
-- No gateway identity and ``agent_context`` or ``platform`` "cron": CRON (tools only).
+- ``agent_context`` or ``platform`` "cron": a scheduled job (cron/scheduler.py
+  ``_construct_cron_agent``). INERT, with no way to turn it on: whoever can have the bot
+  schedule a job, from any chat, chooses its prompt and where its output goes
+  (tools/cronjob_tools.py).
 - ``agent_context`` other than "primary" (a subagent, a memory flush or other fork):
   INERT. A ``platform`` other than "cli", "tui", "desktop", "acp" (every messaging
   platform, "api_server", "bot_room", "a2a", "kanban", "webhook", ...): INERT.
 - ``session_title`` "Bot Chat" (also "Bot Chat #2", "Bot Chat (...)"): INERT. The Bot
   Chat is a local session other agents and API-key peers write into
-  (gateway/session_bot.py, gateway/platforms/api_server_bot_chat.py).
-- No gateway identity at all: the agent runs in the process that created it (the stdio
+  (gateway/session_bot.py, gateway/platforms/api_server_bot_chat.py). A title that
+  starts "Group:": INERT. The Desktop titles a Group Chat member's session
+  "Group: <room> · <thread>" (apps/desktop/src/plugins/hermes-bots/group-turns.ts), and
+  other bots' messages are submitted into it; Hermes reads the same prefix
+  (tui_gateway/agent_factory.py).
+- No gateway identity at all: the agent runs in the process that built it (the stdio
   TUI and Desktop backend, tui_gateway/agent_factory.py; ACP; the classic CLI runner).
-  ACTIVE, as before: that process belongs to the person who started it.
+  ACTIVE, as before, that process belonging to the person who started it, unless the
+  process says otherwise: ``HERMES_SESSION_SOURCE`` (``hermes chat --source``,
+  hermes_cli/main.py; "kanban" for a Kanban worker, hermes_cli/kanban_db_dispatch.py)
+  naming a source outside ROW_SOURCES is INERT, and so is any agent the gateway daemon
+  itself builds without a chat: a ``/background`` or ``/btw`` side agent
+  (gateway/session_tui_side.py ``_side_agent``) carries no identity and no parent, so
+  nothing says whose session it serves. The daemon is recognised the way Hermes
+  recognises itself (tools/process_registry.py ``_is_supervised_gateway_process``): its
+  ``gateway.lock`` or ``gateway.pid`` record (gateway/status.py ``_build_pid_record``)
+  names this process.
 - Gateway identity: the turn runs in the gateway daemon, which serves every local
   client and every messaging platform. ACTIVE only for the shape of a local session
   (gateway/session_execution.py ``_build_fresh_agent``; gateway/run_turn_runner.py maps
   ``Platform.LOCAL`` to "cli"/"tui"/"desktop"/"acp"): ``chat_type`` "dm", ``chat_id``
   ``local-<64 hex>`` (hermes_state_keys.py ``local_identity``), ``gateway_session_key``
   ``agent:<profile>:local:dm:<chat_id>``, and ``user_id`` this machine's owner,
-  ``uid:<os.getuid()>``: the subject gateway/control_socket.py mints only for a peer
-  of the same OS user (SO_PEERCRED). POSIX only: on Windows the subject is a SID and
-  such a session is INERT.
+  ``uid:<os.getuid()>``. That is the subject gateway/control_socket.py mints for a peer
+  of the same OS user (SO_PEERCRED), and also the one every dashboard or Webapp login
+  acts as (gateway/owner_identity.py ``principal_subject``): Hermes treats whoever
+  signs in to its dashboard as the machine's owner, and so does this rule. POSIX only:
+  on Windows the subject is a SID and such a session is INERT.
 
 The session store (``check_session``)
 -------------------------------------
@@ -47,27 +65,47 @@ gateway minted, gateway/session_bot.py ``_bot_chat_creation_id``) and the frozen
 client's own request, with the ``cwd`` it ran in when it sent one). It is read
 read-only, with a short timeout, and never written. A gateway-shaped session is ACTIVE
 only when that receipt is there and says: created by the owner, not a Bot Chat, a
-source in OWNER_SOURCES, and the same route. ``tool`` stays INERT: Hermes keeps it out
-of the owner's own chats too (gateway/session_policy.py ``DAYBREAK_LABELS``). A session
-with an API binding (``gateway.api.binding.v1.<id>``) is INERT. A session the store
-does not know, or a store that cannot be read, is INERT.
+source in OWNER_SOURCES, the same route, and a request that does not follow its
+profile. ``tool`` stays INERT: Hermes keeps it out of the owner's own chats too
+(gateway/session_policy.py ``DAYBREAK_LABELS``). ``oneshot`` (``hermes chat -q``,
+``hermes -z``) stays ACTIVE: it is the owner's own one-shot question, and a script of
+the same OS user that sends one could read the Synapse token anyway. A request with
+``follow_profile_config`` is a chat the Desktop or the gateway makes for other agents:
+the Bot Chat the Desktop mints with a random ``request_id``
+(apps/desktop/src/plugins/hermes-bots/canonical-chat.ts, gateway/session_controls.py
+``_create``) and every Group Chat member (group-turns.ts; the Desktop turns
+``room_plumbing`` into this flag, apps/desktop/src/api/canonical-protocol.ts, so
+``room_plumbing`` itself is never stored and is checked only in case it ever is).
+INERT. The policy's ``follow_adopted`` mark is NOT read: Hermes also sets it on an
+ordinary chat created on the welcome trial's model (gateway/session_local.py
+``stage_local_session``). A session with an API binding (``gateway.api.binding.v1.<id>``)
+is INERT. A session the store does not know, or a store that cannot be read, is INERT.
 
 The session's own row is checked too, for every session: the session a chat runs need
 not be the one it was created with (``/resume`` switches a route to another session,
 gateway/slash_commands_session.py; the classic CLI's ``/resume`` and compression switch
-the agent's session in place). A row titled as a Bot Chat, stored under a ``source``
-other than the local ones in ROW_SOURCES (the gateway stores its local chats as
-"local", "oneshot" or "tool", gateway/session_policy.py ``STORED_AS_LOCAL``), or on a
-chat that is not a local one makes the session INERT; a row on another local chat needs
-that chat's receipt to pass as well. For an in-process session no store, or no row (a
-session not written yet), leaves it ACTIVE.
+the agent's session in place). A row stored under a ``source`` other than the local
+ones in ROW_SOURCES (the gateway stores its local chats as "local", "oneshot" or
+"tool", gateway/session_policy.py ``STORED_AS_LOCAL``), or on a chat that is not a
+local one makes the session INERT; a row on another local chat needs that chat's
+receipt to pass as well. So does a row titled as a Bot Chat or "Group:", or whose
+``model_config`` carries ``follow_profile_config`` or ``room_plumbing`` (what the
+in-process backend stores for those chats, tui_gateway/session_workdir.py; Hermes's
+own Bot Chat rule, gateway/session_local_migration.py ``bot_chat_row``), and that holds
+for EVERY row of the same chat: a reset (``/new``) or compression continues a chat in
+an untitled row with the same ``chat_id`` (hermes_state_local_lineage.py
+``reset_local_target``, hermes_state_compression.py ``_publish_child_session_row``),
+and Hermes delivers the Bot Chat's traffic to that row (gateway/session_bot.py
+``_target``). For an in-process session no store, or no row (a session not written
+yet), leaves it ACTIVE; a gateway session always has its row, written with its receipt
+(hermes_state_local.py ``commit_local_session``), so one without is INERT.
 
 What the store says can change after the agent is built: a session may be renamed "Bot
 Chat" (hermes_state_titles.py; Hermes then routes the Bot Chat's traffic to it without
 rebuilding the agent), or switched to another session in place. ``recheck`` reads the
-row again before each nudge, upload and tool call. An API binding cannot be added to a
-local session later: gateway/session_api.py ``bind_api_steps`` refuses a session whose
-row or live origin is not the API server's.
+rows again before the system prompt block, each nudge, upload and tool call. An API
+binding cannot be added to a local session later: gateway/session_api.py
+``bind_api_steps`` refuses a session whose row or live origin is not the API server's.
 
 The working directory of a gateway session is the client's: the receipt's request
 ``cwd``, only when the client sent one. The policy's own ``cwd`` falls back to the
@@ -85,6 +123,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 ACTIVE = "active"
+#: A mode no session gets any more: a cron job is INERT. Kept so older imports resolve.
 CRON = "cron"
 INERT = "inert"
 
@@ -96,19 +135,30 @@ OWNER_SOURCES = frozenset({"cli", "tui", "gui", "acp", "oneshot"})
 ROW_SOURCES = frozenset({"cli", "tui", "desktop", "gui", "acp", "oneshot", "local"})
 #: Seconds to wait for a locked session store.
 DB_TIMEOUT = 1.0
+#: The process's session source (hermes_cli/main.py ``--source``).
+SOURCE_ENV = "HERMES_SESSION_SOURCE"
+#: Largest gateway pid record read, in bytes.
+RECORD_LIMIT = 65536
 
 _MESSAGING_IDENTITY = ("user_id_alt", "user_name", "chat_name", "thread_id")
 _GATEWAY_IDENTITY = ("gateway_session_key", "chat_id", "chat_type")
 _LOCAL_CHAT = re.compile(r"local-[0-9a-f]{64}")
 _LOCAL_ROUTE = re.compile(r"agent:[^:\s]+:local:dm:(local-[0-9a-f]{64})")
 _BOT_CHAT = re.compile(r"bot chat(\s*#\s*\d+|\s*\(.*\))?", re.IGNORECASE | re.DOTALL)
+_GROUP_CHAT = "group:"
+_FOLLOWS = ("follow_profile_config", "room_plumbing")
 _POLICY_KEY = "gateway.local_policy.v1:"
 _API_KEY = "gateway.api.binding.v1."
 _BOT_CHAT_REQUEST = "bot-chat:"
+_DAEMON_RECORDS = ("gateway.lock", "gateway.pid")
+_DAEMON_KIND = "hermes-gateway"
+_IS_BOT_CHAT = "the Bot Chat, which other agents and API peers write into"
+_IS_GROUP = "a Group Chat member, which other agents write into"
+_FOLLOWS_PROFILE = "a chat that follows its profile (the Bot Chat or a Group Chat member)"
 
 
 class Verdict(NamedTuple):
-    """``mode`` (ACTIVE, CRON or INERT), why it is INERT, and a gateway session's cwd."""
+    """``mode`` (ACTIVE or INERT), why it is INERT, and a gateway session's cwd."""
 
     mode: str
     reason: str = ""
@@ -134,9 +184,53 @@ def bot_chat(title: Any) -> bool:
     return isinstance(title, str) and _BOT_CHAT.fullmatch(title.strip()) is not None
 
 
+def group_chat(title: Any) -> bool:
+    """Whether ``title`` names a Group Chat member's session ("Group: ...")."""
+    return isinstance(title, str) and title.strip().lower().startswith(_GROUP_CHAT)
+
+
+def _title_verdict(title: Any) -> Verdict | None:
+    if bot_chat(title):
+        return Verdict(INERT, _IS_BOT_CHAT)
+    if group_chat(title):
+        return Verdict(INERT, _IS_GROUP)
+    return None
+
+
 def gateway_session(kwargs: Mapping[str, Any]) -> bool:
     """Whether the keywords carry the gateway's chat identity."""
     return any(kwargs.get(key) for key in _GATEWAY_IDENTITY)
+
+
+def _record(path: Path) -> Any:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(RECORD_LIMIT + 1)
+        return json.loads(data) if len(data) <= RECORD_LIMIT else None
+    except (OSError, ValueError):
+        return None
+
+
+def gateway_daemon(home: Any) -> bool:
+    """Whether this process is the Hermes gateway daemon: a ``gateway.lock`` or
+    ``gateway.pid`` record under ``home`` or the process's own Hermes home names it."""
+    homes = [str(home)] if home else []
+    try:
+        own = os.environ.get("HERMES_HOME", "").strip() or str(Path.home() / ".hermes")
+        homes.append(os.path.expanduser(os.path.expandvars(own)))
+    except RuntimeError:  # no home directory to fall back on
+        pass
+    pid = os.getpid()
+    for base in homes:
+        for name in _DAEMON_RECORDS:
+            record = _record(Path(base) / name)
+            if (
+                isinstance(record, dict)
+                and record.get("kind") == _DAEMON_KIND
+                and record.get("pid") == pid
+            ):
+                return True
+    return False
 
 
 def from_keywords(kwargs: Mapping[str, Any]) -> Verdict:
@@ -147,15 +241,19 @@ def from_keywords(kwargs: Mapping[str, Any]) -> Verdict:
     agent_context = _word(kwargs.get("agent_context")) or "primary"
     platform = _word(kwargs.get("platform")) or "cli"
     gateway = gateway_session(kwargs)
-    if not gateway and CRON in (agent_context, platform):
-        return Verdict(CRON)
+    if CRON in (agent_context, platform):
+        return Verdict(INERT, "a scheduled cron job, not a conversation the owner is having")
     if agent_context != "primary":
         return Verdict(INERT, f"agent_context {agent_context!r}, not a primary session")
     if platform not in LOCAL_PLATFORMS:
         return Verdict(INERT, f"platform {platform!r}, not a local surface")
-    if bot_chat(kwargs.get("session_title")):
-        return Verdict(INERT, "the Bot Chat, which other agents and API peers write into")
+    titled = _title_verdict(kwargs.get("session_title"))
+    if titled is not None:
+        return titled
     if not gateway:
+        source = _word(os.environ.get(SOURCE_ENV))
+        if source and source not in ROW_SOURCES:
+            return Verdict(INERT, f"started as {source!r}, not one of the owner's own chats")
         return Verdict(ACTIVE)
     chat_id = kwargs.get("chat_id")
     if kwargs.get("chat_type") != "dm" or not (
@@ -202,7 +300,7 @@ def _receipt_verdict(receipt: Any, chat_id: str, route: Any) -> Verdict:
         return Verdict(INERT, "a creation record for another session")
     request_id = receipt.get("request_id")
     if not isinstance(request_id, str) or request_id.startswith(_BOT_CHAT_REQUEST):
-        return Verdict(INERT, "the Bot Chat, which other agents and API peers write into")
+        return Verdict(INERT, _IS_BOT_CHAT)
     policy = receipt.get("policy")
     source = policy.get("source") if isinstance(policy, dict) else None
     if source not in OWNER_SOURCES:
@@ -210,17 +308,61 @@ def _receipt_verdict(receipt: Any, chat_id: str, route: Any) -> Verdict:
     try:
         request = json.loads(policy.get("request_json") or "{}")
     except (TypeError, ValueError):
-        request = {}
-    cwd = request.get("cwd") if isinstance(request, dict) else None
+        request = None
+    if not isinstance(request, dict):
+        return Verdict(INERT, "a creation record that could not be read")
+    if any(request.get(flag) is True for flag in _FOLLOWS):
+        return Verdict(INERT, _FOLLOWS_PROFILE)
+    titled = _title_verdict(request.get("title"))
+    if titled is not None:
+        return titled
+    cwd = request.get("cwd")
     return Verdict(ACTIVE, cwd=cwd if isinstance(cwd, str) and cwd.strip() else None)
 
 
-def _verdict(conn: sqlite3.Connection, session_id: str, kwargs: Mapping[str, Any]) -> Verdict:
-    """The store's verdict for a session. RAISES sqlite3.Error or ValueError."""
+def _row_verdict(title: Any, model_config: Any) -> Verdict | None:
+    """What a session row's title and ``model_config`` rule out, or None."""
+    titled = _title_verdict(title)
+    if titled is not None:
+        return titled
+    try:
+        config = json.loads(model_config) if isinstance(model_config, str) else None
+    except ValueError:
+        config = None  # Hermes reads an unparseable model_config as empty too
+    if isinstance(config, dict) and any(config.get(flag) for flag in _FOLLOWS):
+        return Verdict(INERT, _FOLLOWS_PROFILE)
+    return None
+
+
+def _chat_rows_verdict(conn: sqlite3.Connection, chats: list[str]) -> Verdict | None:
+    """What any row of ``chats`` rules out: every segment of a chat (a reset or
+    compressed continuation keeps its ``chat_id``) is held to the others' titles."""
+    if not chats:
+        return None
+    marks = ",".join("?" * len(chats))
+    query = f"SELECT title, model_config FROM sessions WHERE chat_id IN ({marks})"
+    for title, model_config in conn.execute(query, chats):
+        found = _row_verdict(title, model_config)
+        if found is not None:
+            return found
+    return None
+
+
+def _verdict(
+    conn: sqlite3.Connection,
+    session_id: str,
+    kwargs: Mapping[str, Any],
+    *,
+    need_row: bool = False,
+) -> Verdict:
+    """The store's verdict for a session; INERT without its row when ``need_row``.
+    RAISES sqlite3.Error or ValueError."""
     gateway = gateway_session(kwargs)
     row = conn.execute(
-        "SELECT title, source, chat_id FROM sessions WHERE id=?", (session_id,)
+        "SELECT title, source, chat_id, model_config FROM sessions WHERE id=?", (session_id,)
     ).fetchone()
+    if row is None and need_row:
+        return Verdict(INERT, "a gateway session the store no longer has")
     chats = [str(kwargs.get("chat_id"))] if gateway else []
     row_chat = str(row[2] or "") if row is not None else ""
     if row_chat and row_chat not in chats:
@@ -229,14 +371,18 @@ def _verdict(conn: sqlite3.Connection, session_id: str, kwargs: Mapping[str, Any
         if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (_API_KEY + key,)).fetchone():
             return Verdict(INERT, "an API server conversation")
     if row is not None:
-        if bot_chat(row[0]):
-            return Verdict(INERT, "the Bot Chat, which other agents and API peers write into")
+        found = _row_verdict(row[0], row[3])
+        if found is not None:
+            return found
         if row[1] == "tool":
             return Verdict(INERT, "created as 'tool', not one of the owner's own chats")
         if row[1] not in ROW_SOURCES:
             return Verdict(INERT, f"a session stored as {row[1]!r}, not a local chat")
         if row_chat and _LOCAL_CHAT.fullmatch(row_chat) is None:
             return Verdict(INERT, "a session of a chat that is not a local one")
+    found = _chat_rows_verdict(conn, chats)
+    if found is not None:
+        return found
     verdict = Verdict(ACTIVE)
     for index, chat in enumerate(chats):
         route = kwargs.get("gateway_session_key") if gateway and index == 0 else None
@@ -252,6 +398,8 @@ def check_session(home: Any, session_id: str, kwargs: Mapping[str, Any]) -> Verd
     """The verdict for a session the keywords allow, checked against the session store
     of ``home``. Never raises."""
     gateway = gateway_session(kwargs)
+    if not gateway and gateway_daemon(home):
+        return Verdict(INERT, "an agent the gateway daemon built without a chat (a side task)")
     if not home:
         return (
             Verdict(INERT, "no Hermes home to check the session in") if gateway else Verdict(ACTIVE)
@@ -263,24 +411,25 @@ def check_session(home: Any, session_id: str, kwargs: Mapping[str, Any]) -> Verd
     if conn is None:
         return Verdict(INERT, "no session store (state.db)") if gateway else Verdict(ACTIVE)
     try:
-        return _verdict(conn, session_id, kwargs)
+        return _verdict(conn, session_id, kwargs, need_row=gateway)
     except (sqlite3.Error, ValueError) as err:
         return Verdict(INERT, f"the session store could not be read ({type(err).__name__})")
     finally:
         conn.close()
 
 
-def recheck(home: Any, session_id: str) -> Verdict:
-    """The store's verdict for ``session_id`` now, without the keywords (what the row and
-    its chat's receipt say); ACTIVE without a store or a row. RAISES StoreError when the
-    store is there but could not be read."""
+def recheck(home: Any, session_id: str, *, gateway: bool = False) -> Verdict:
+    """The store's verdict for ``session_id`` now, without the keywords (what the rows of
+    its chat and the chat's receipt say). Without a store or a row: ACTIVE for an
+    in-process session, INERT for a ``gateway`` one. RAISES StoreError when the store is
+    there but could not be read."""
     if not home or not session_id:
-        return Verdict(ACTIVE)
+        return Verdict(INERT, "no session to check") if gateway else Verdict(ACTIVE)
     conn = _connect(str(home))
     if conn is None:
-        return Verdict(ACTIVE)
+        return Verdict(INERT, "no session store (state.db)") if gateway else Verdict(ACTIVE)
     try:
-        return _verdict(conn, session_id, {})
+        return _verdict(conn, session_id, {}, need_row=gateway)
     except (sqlite3.Error, ValueError) as err:
         raise StoreError(type(err).__name__) from err
     finally:

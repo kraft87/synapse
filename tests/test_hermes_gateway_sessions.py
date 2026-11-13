@@ -107,12 +107,13 @@ def _store(
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, "
             "created_source TEXT, user_id TEXT, chat_id TEXT, chat_type TEXT, "
-            "session_key TEXT, cwd TEXT, title TEXT)"
+            "session_key TEXT, cwd TEXT, title TEXT, model_config TEXT)"
         )
         conn.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT)")
         chat = sid if chat_id is None else chat_id
         conn.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO sessions (id, source, created_source, user_id, chat_id, "
+            "chat_type, session_key, cwd, title) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 sid,
                 source,
@@ -221,7 +222,7 @@ def test_the_owners_local_shapes_pass_the_keywords(kwargs):
         (_gateway(platform="a2a"), "platform"),
         (_gateway(platform="kanban"), "platform"),
         (_gateway(platform="webhook"), "platform"),
-        (_gateway(platform="cron", agent_context="cron"), "agent_context"),
+        (_gateway(platform="cron", agent_context="cron"), "cron job"),
         (_gateway(agent_context="subagent"), "agent_context"),
         (_gateway(agent_context="flush"), "agent_context"),
         ({"platform": "api_server", "user_id": "api", "chat_id": "c1"}, "platform"),
@@ -235,9 +236,16 @@ def test_every_other_shape_is_inert_and_says_why(kwargs, why):
     assert why in verdict.reason
 
 
-def test_cron_keeps_its_tools_only_without_a_chat():
-    assert hs.from_keywords({"platform": "cron", "agent_context": "cron"}).mode == hs.CRON
-    assert hs.from_keywords(_gateway(platform="cron")).mode == hs.INERT
+def test_a_cron_job_is_inert_with_or_without_a_chat():
+    """cron/scheduler.py ``_construct_cron_agent`` builds the job's agent with
+    ``platform="cron"``; agent_init_memory_provider.py makes that ``agent_context``."""
+    for kwargs in (
+        {"platform": "cron", "agent_context": "cron"},
+        {"platform": "cli", "agent_context": "cron"},
+        _gateway(platform="cron"),
+    ):
+        verdict = hs.from_keywords(kwargs)
+        assert verdict.mode == hs.INERT and "cron job" in verdict.reason
 
 
 def test_off_posix_a_gateway_session_is_inert(monkeypatch):

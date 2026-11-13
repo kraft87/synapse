@@ -16,15 +16,31 @@ changed, what to do on each machine, what was proven, and what is still open.
   (`harnesses/hermes/sessions.py`):
   - the local shape: `chat_id` `local-<hex>`, `chat_type` "dm", the
     `agent:<profile>:local:dm:` route and `user_id` `uid:<this OS user>`;
-  - and a creation receipt in `<hermes_home>/state.db`, opened read-only, that names
-    the owner as creator, an owner's chat as the source (not `--source tool`), and no
-    Bot Chat.
+  - its row in `<hermes_home>/state.db`, opened read-only;
+  - and a creation receipt there that names the owner as creator, an owner's chat as
+    the source (not `--source tool`), no Bot Chat title, and no `follow_profile_config`
+    in the request (the Desktop's mark for its Bot Chat and Group Chat members).
+  - No row of the same chat may be titled "Bot Chat" or "Group: ...": a `/new` or an
+    auto-reset in the Bot Chat publishes an untitled child that peers still reach.
   - Everything else stays inert: messaging platforms, the API server, hosted rooms,
-    peer agents, the Bot Chat, subagents, sessions someone else created, and any shape
-    not listed. The reason is logged once.
-  - The session's row is read again before each nudge, upload and tool call. A session
-    that stops passing turns the instance inert for good.
+    peer agents, the Bot Chat, Desktop Group Chat members, subagents, sessions someone
+    else created, and any shape not listed. The reason is logged once.
+  - The session's rows are read again before the system prompt block and each nudge,
+    upload and tool call. A session that stops passing, or a gateway session whose row
+    is gone, turns the instance inert for good.
   - The project comes from the `cwd` the client sent, never from the daemon's.
+- **In-process sessions** (no chat identity) are active unless the process is the
+  gateway daemon (its `gateway.lock` or `gateway.pid` record holds this pid: a
+  `/background` or `/btw` side agent), it was started with a `--source` that is not an
+  owner's chat (`HERMES_SESSION_SOURCE` "tool", "kanban", ...), or its row is titled
+  "Bot Chat" / "Group: ..." or carries `follow_profile_config` / `room_plumbing` in
+  `model_config`.
+- **Cron jobs are inert, the tools included.** They used to get the tools: whoever can
+  have the bot schedule a job chooses its prompt and where its output is delivered.
+  `CRON` stays importable; no session gets it.
+- **A turn another agent or person wrote turns the session inert for good**, logged once:
+  an author on `on_turn_start` (before its nudge) or a `turn_author` on `sync_turn`
+  (that turn is not uploaded).
 - **A failed turn is never uploaded.** Hermes's notice for a failed turn (an assistant
   row typed `display_kind: failed_turn`, or the bare notice) was uploaded as the
   assistant's reply. The failed turn is now dropped, its user message included. An
@@ -90,6 +106,25 @@ changed, what to do on each machine, what was proven, and what is still open.
   provider as `hermes chat` does), Desktop and ACP.
 - Hermes keeps the nudge in its stored transcript (`api_content`). The upload strips
   it; the transcript is Hermes's.
+- An automation turn in an owner's chat (a cron delivery or notice, a `display_kind`
+  row) is skipped as synthetic, so the assistant's reply to it is filed with the
+  previous real turn.
+- The welcome-trial mark `follow_adopted` is not read: Hermes sets it on an ordinary
+  chat created on the trial model (`gateway/session_local.py`) as well as on Bot Chats.
+- The board already in a stored system prompt stays: Hermes restores it verbatim for a
+  continuing session (renamed, branched, handed off). Only later rebuilds go without.
+  The first turn's prompt is built before `on_turn_start` names an author.
+- Whoever can sign in to the Hermes dashboard or Webapp is the owner here: Hermes maps
+  every login to the owner's `uid:` subject.
+- A side agent built in the stdio TUI or Desktop backend's own process has no parent
+  and no row, so it is active even when its parent is a Bot Chat.
+- A Bot Chat whose title was cleared (archived) and that carries no
+  `follow_profile_config` reads as an owner chat; Hermes no longer delivers to it.
+- Four assertions in `tests/test_hermes_provider.py` pin the old rule and fail until
+  that file is updated: `test_scope[kwargs6-cron]` and `test_scope[kwargs7-cron]` (cron
+  is now "inert"), `test_a_cron_session_has_tools_and_nothing_else` (no tools for cron),
+  and `test_a_finished_turn_is_uploaded` (it passes a `turn_author`, so nothing is
+  uploaded).
 
 ## 2026-11-12 — ingest: the transcript line rules live in one module
 

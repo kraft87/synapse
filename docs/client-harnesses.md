@@ -115,29 +115,57 @@ passes and, for a session they allow, Hermes's own record of who created it
 
 - **Active**: `agent_context` "primary" (Hermes's default) on a local surface, `platform`
   "cli" (Hermes's default), "tui", "desktop" or "acp", run by this machine's owner. With
-  no chat identity the agent runs in the process that created it (the stdio TUI and
-  Desktop backend, ACP, the classic CLI). `hermes chat` and the TUI run their turns in
-  the gateway daemon, which passes a chat identity even for them: such a session is
-  active only with the shape of a local session (`chat_id` `local-<hex>`, `chat_type`
-  "dm", its `agent:<profile>:local:dm:` route, `user_id` `uid:<this OS user>`) and a
-  creation receipt in `<hermes_home>/state.db`, read read-only, naming the owner as its
-  creator, an owner's chat as its source (not `--source tool`) and no Bot Chat. The
-  board, the nudge, uploads and the tools all work.
-- **Cron** (`agent_context` or `platform` "cron", no chat identity): the tools work;
-  nothing is injected and nothing is uploaded. A scheduled job may need the memory, but
-  its prompts are not a conversation the user had.
-- **Inert**, everything else: subagents and other forks, the API server, every messaging
-  gateway, hosted rooms and peer agents, the Bot Chat, a session created by someone else
-  or by a third-party integration, one the store does not know, and any shape not listed
-  above. Nothing is injected or uploaded, and a tool call returns an error: someone else
-  must not read the owner's memory through the agent, nor have their messages stored as
-  the owner's. The reason is logged once.
+  no chat identity the agent runs in the process that built it (the stdio TUI and
+  Desktop backend, ACP, the classic CLI), unless that process is the gateway daemon
+  (its `gateway.lock` or `gateway.pid` record names it) or was started with a
+  `--source` that is not the owner's own (`HERMES_SESSION_SOURCE` "tool", "kanban", ...).
+  `hermes chat` and the TUI run their turns in the gateway daemon, which passes a chat
+  identity even for them: such a session is active only with the shape of a local
+  session (`chat_id` `local-<hex>`, `chat_type` "dm", its `agent:<profile>:local:dm:`
+  route, `user_id` `uid:<this OS user>`), its row in `<hermes_home>/state.db`, and a
+  creation receipt there, read read-only, naming the owner as its creator, an owner's
+  chat as its source (not `--source tool`; `-q`/`-z` one-shot runs count as the owner's),
+  no Bot Chat, and no `follow_profile_config` in its request. The board, the nudge,
+  uploads and the tools all work.
+- **Inert**, everything else: subagents and other forks, cron jobs (no tools either:
+  whoever can have the bot schedule a job chooses its prompt and where its output goes),
+  the API server, every messaging gateway, hosted rooms and peer agents, the Bot Chat
+  (by its title, its receipt, or the title of any row of its chat, so a `/new` in it
+  stays inert), a Desktop Group Chat member (a "Group:" title, or the
+  `follow_profile_config` the Desktop sends for it), a `/background` or `/btw` side agent
+  of the daemon, a session created by someone else or by a third-party integration, one
+  the store does not know, and any shape not listed above. Nothing is injected or
+  uploaded, and a tool call returns an error: someone else must not read the owner's
+  memory through the agent, nor have their messages stored as the owner's. The reason is
+  logged once.
 
-The session's row in `state.db` (title, stored source, chat) is read again before each
-nudge, upload and tool call, since a session can be renamed "Bot Chat" or switched to
-another (`/resume`, compression) without a new provider; one that no longer passes turns
-the instance inert for good. A gateway session's project comes from the `cwd` its client
+The session's rows in `state.db` (its title, stored source and chat, and every row of
+that chat) are read again before the system prompt block, each nudge, upload and tool
+call, since a session can be renamed "Bot Chat" or switched to another (`/resume`,
+compression) without a new provider; one that no longer passes turns the instance inert
+for good, and so does a gateway session whose row is gone. A turn another agent or
+person wrote (Hermes names its author on `on_turn_start` and passes `turn_author` to
+`sync_turn`; both are None on the owner's own turn) is not uploaded and turns the
+instance inert for good. A gateway session's project comes from the `cwd` its client
 sent, never the daemon's.
+
+What this does not cover:
+
+- The board already in a system prompt stays there. Hermes stores the prompt and
+  restores it verbatim for a continuing session, so a session renamed "Bot Chat",
+  branched or handed off after its first turn keeps the board it was built with; only
+  later rebuilds go without it.
+- Hermes treats whoever can sign in to its dashboard or Webapp as the machine's owner
+  (`gateway/owner_identity.py`): their sessions carry the owner's `uid:` subject, so they
+  are the owner's here too.
+- The welcome-trial mark (`follow_adopted`) is not read: Hermes puts it on an ordinary
+  chat created on the trial model as well as on Bot Chats, which are caught by title.
+- A side agent built in the stdio TUI or Desktop backend's own process (not the daemon)
+  carries no parent and no row, so it is active even when the session that started it
+  is not (a Bot Chat open there, say).
+- An automation turn inside an owner's chat (a cron delivery or notice, which Hermes
+  marks with a `display_kind`) is skipped as synthetic, so the assistant's reply to it
+  is uploaded with the previous real turn.
 
 The Hermes source this rests on: `_memory_provider_init_kwargs` in
 `agent/agent_init_memory_provider.py` (platform defaults to "cli"; `agent_context` is the
@@ -145,9 +173,15 @@ agent's `memory_agent_context`, else "cron" or "subagent" by platform, else "pri
 the chat identity is `_GATEWAY_IDENTITY_PARAMS` in `agent/agent_init_params.py`),
 `gateway/session_execution.py` (a gateway passes its platform and the chat identity),
 `hermes_state_keys.py` and `hermes_state_local.py` (the local chat id and its creation
-receipt), `gateway/control_socket.py` (the `uid:` subject, minted for a peer of the same
-OS user), `gateway/platforms/api_server.py` ("api_server"), `tui_gateway/agent_factory.py`
-("tui", "desktop"), `acp_adapter/session.py` ("acp"), `cron/scheduler.py` ("cron") and
+receipt), `gateway/control_socket.py` and `gateway/owner_identity.py` (the `uid:` subject,
+minted for a peer of the same OS user and for every dashboard login),
+`gateway/session_policy.py` (`follow_profile_config`), `gateway/session_bot.py` and
+`hermes_state_local_lineage.py` (the Bot Chat and its reset), the Desktop's
+`plugins/hermes-bots/group-turns.ts` and `canonical-chat.ts` (Group Chat members and the
+Bot Chat it mints), `gateway/session_tui_side.py` and `gateway/status.py` (side agents and
+the daemon's pid record), `run_agent.py` (`turn_author`), `gateway/platforms/api_server.py`
+("api_server"), `tui_gateway/agent_factory.py` ("tui", "desktop"),
+`acp_adapter/session.py` ("acp"), `cron/scheduler.py` ("cron") and
 `tools/delegate_tool.py` (`memory_agent_context="subagent"`).
 
 **Install.**
@@ -194,10 +228,10 @@ like every other harness, so there is no Hermes setup wizard step.
 |---|---|
 | `is_available()` | A URL and a token resolve. No network. |
 | `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences side by side within 5 seconds, fail-open, then drains the outbox on a thread of its own. |
-| `system_prompt_block()` | The text fetched in `initialize()`, in an active session. Hermes caches it for the session and asks again after a compression. |
+| `system_prompt_block()` | The text fetched in `initialize()`, in an active session that the store still says is the owner's. Hermes caches it for the session, stores it with the session and restores it for a continuing one, and asks again after a compression. |
 | `prefetch(query)` | The timestamp line and the recall nudge, in an active session. No request is made. |
-| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. |
-| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, and nothing for a private session. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
+| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn with an author (`author_id`, `author_name`) turns the session inert before its nudge. |
+| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn carries a `turn_author`. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
 | `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. |
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
