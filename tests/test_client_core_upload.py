@@ -8,7 +8,9 @@ Pinned here:
     a private session's body;
   * a drain drops what went private since it was queued, leaves what it cannot tell
     about, and goes on to the rest;
-  * ``TurnUploader`` sends each finished turn once, in the ``messages`` format.
+  * ``TurnUploader`` sends each finished turn once, in the ``messages`` format;
+  * a conversation that goes on under a new session id stays private when the id it
+    leaves is (``Uploader.carry_private``).
 
 No network: the client's transport is replaced by a recorder. Temp directories only.
 """
@@ -35,12 +37,21 @@ from synapse_client.settings import Settings  # noqa: E402
 
 class _Wire:
     """In place of the client's Transport: records each ingest request, then answers it
-    or raises ``fail``."""
+    or raises ``fail``. ``requests`` are the others (the private-session routes), which
+    raise ``fail_private``."""
 
     def __init__(self) -> None:
         self.tries = 0
         self.posts: list[dict[str, Any]] = []
         self.fail: BaseException | None = None
+        self.requests: list[tuple[str, str, float]] = []
+        self.fail_private: BaseException | None = None
+
+    def request_json(self, method: str, path: str, timeout: float = 15) -> Any:
+        self.requests.append((method, path, timeout))
+        if self.fail_private is not None:
+            raise self.fail_private
+        return {"private": method != "DELETE"}
 
     def post_json(self, url: str, body: Any, timeout: float = 30) -> Any:
         self.tries += 1
@@ -433,3 +444,163 @@ def test_after_a_failed_batch_the_rest_are_queued_without_a_request(tmp_path):
     assert turns.uploader.drain(timeout=5) == (2, 0)
     sent = [row["id"] for post in wire.posts for row in post["body"]["records"]]
     assert sent.count("a20") == 2 and sent.count("a21") == 1  # 20 leads the second as context
+
+
+# ---------------------------------------------------------------------------
+# A conversation that goes on under a new session id
+# ---------------------------------------------------------------------------
+
+_CONTINUES = "synapse: session s-new continues s-old, which is in private mode"
+
+
+def test_a_session_that_continues_a_private_one_is_private_too(tmp_path):
+    client, wire = _client(tmp_path)
+    lines: list[str] = []
+    up = upload.Uploader(client, Outbox(tmp_path / "q"), log=lines.append)
+    _mark(tmp_path, "s-old")
+    assert up.carry_private(["s-parent", "", "s-old"], "s-new") is True
+    assert (tmp_path / "private" / "s-new").is_file()
+    assert wire.requests == [("PUT", "/private-sessions/s-new", 5)]
+    assert lines == [f"{_CONTINUES}: it is off the record too"]
+    # The marker is all there is to it: another uploader refuses the session too.
+    assert upload.Uploader(client).send(_body("s-new"), timeout=5) == (upload.PRIVATE, "")
+    assert wire.tries == 0
+
+
+def test_nothing_is_written_when_no_earlier_session_is_private(tmp_path):
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    _mark(tmp_path, "s-other")
+    _mark(tmp_path, "s-stale", hours=13)
+    assert up.carry_private(["s-old", "", "s-stale"], "s-new") is False
+    assert not (tmp_path / "private" / "s-new").exists() and wire.requests == []
+    assert up.send(_body("s-new"), timeout=5) == (upload.SENT, "")
+
+
+def test_a_marker_that_cannot_be_read_is_carried_as_private(tmp_path):
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    _unreadable(tmp_path, "s-old")
+    assert up.carry_private(["s-old"], "s-new") is True
+    assert (tmp_path / "private" / "s-new").is_file() and len(wire.requests) == 1
+
+
+def test_carrying_to_the_session_itself_or_to_none_writes_nothing(tmp_path):
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    marker = _mark(tmp_path, "s-old", hours=2)
+    age = marker.stat().st_mtime
+    assert up.carry_private(["s-old"], "s-old") is True
+    assert up.carry_private(["s-old"], "") is True
+    assert wire.requests == [] and marker.stat().st_mtime == age
+    assert os.listdir(tmp_path / "private") == ["s-old"]
+
+
+def test_a_server_that_cannot_be_told_is_told_again_at_the_next_turn(tmp_path):
+    """The marker alone lasts twelve hours and `private off` removes it; the session it
+    continues may be private for good. So the uploader holds the new one itself until
+    the server has its row, and asks again each time the session has a turn."""
+    client, wire = _client(tmp_path)
+    lines: list[str] = []
+    warned: list[str] = []
+    up = upload.Uploader(client, log=lines.append, warn=warned.append)
+    turns = upload.TurnUploader(up, client="t", source="t-sync")
+    _mark(tmp_path, "s-old")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-old"], "s-new") is True
+    assert lines == [] and warned == [
+        f"{_CONTINUES}; the server could not be told. Nothing is uploaded for it here, "
+        "and the server is told again at the session's next turn"
+    ]
+    (tmp_path / "private" / "s-new").unlink()  # expired, or `private off`
+    assert up.is_private("s-new") and up.settle_private("s-new") is False
+
+    assert turns.upload(_turn(1), "s-new", timeout=5) is False  # asks again: still down
+    wire.fail_private = None
+    assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5) is False  # and is told
+    put = ("PUT", "/private-sessions/s-new", 5)
+    assert wire.requests == [put] * 4 and wire.tries == 0
+    assert up.settle_private("s-new") is True and len(wire.requests) == 4
+
+    # The row is there now, so the session is as private as one `on` was run for: with
+    # its marker gone its turns are sent, and the server drops them.
+    assert not up.is_private("s-new")
+    assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5) is True
+    assert up.settle_private("s-never-carried") is True and len(wire.requests) == 4
+    assert warned == warned[:1]
+
+
+def _no_marker_written(monkeypatch) -> None:
+    def refuse(settings: Any, session_id: str) -> Path:
+        raise PermissionError(13, "read-only", session_id)
+
+    monkeypatch.setattr(private, "mark", refuse)
+
+
+def test_a_session_whose_marker_cannot_be_written_is_held_by_the_uploader(tmp_path, monkeypatch):
+    """No marker says the new session is private, so the uploader that knows it refuses
+    the session itself: what it is handed, and what waits in its outbox."""
+    client, wire = _client(tmp_path)
+    box = Outbox(tmp_path / "q")
+    lines: list[str] = []
+    warned: list[str] = []
+    up = upload.Uploader(client, box, log=lines.append, warn=warned.append)
+    turns = upload.TurnUploader(up, client="t", source="t-sync")
+    _mark(tmp_path, "s-old")
+    box.put(_body("s-new"), "timeout")
+    box.put(_body("s-on"), "timeout")
+    _no_marker_written(monkeypatch)
+    assert up.carry_private(["s-old"], "s-new") is True
+    assert not (tmp_path / "private" / "s-new").exists()
+    assert warned == [
+        f"{_CONTINUES}; its marker could not be written (PermissionError), so nothing is "
+        "uploaded for it until this program ends"
+    ]
+    assert lines == [f"{_CONTINUES}: it is off the record too"]  # the server was told
+    assert up.is_private("s-new") and not up.is_private("s-on")
+    assert up.settle_private("s-new") is True and len(wire.requests) == 1  # nothing owed
+    assert up.send(_body("s-new"), timeout=5) == (upload.PRIVATE, "")
+    assert up.send({"records": [{"sessionId": "s-new"}]}, timeout=5) == (upload.PRIVATE, "")
+    assert up.queue(_body("s-new"), "timeout") == upload.PRIVATE
+    assert turns.upload(_turn(1), "s-new", timeout=5) is False
+    assert wire.tries == 0
+    # Its queued body is left as it is: only a marker or the server can say drop it.
+    assert up.drain(timeout=5) == (1, 1) and wire.sessions() == ["s-on"]
+    assert _queued(box) == [_body("s-new")]
+
+
+def test_a_held_session_is_carried_on_to_the_next(tmp_path, monkeypatch):
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    _mark(tmp_path, "s-1")
+    _no_marker_written(monkeypatch)
+    assert up.carry_private(["s-1"], "s-2") is True
+    assert up.carry_private(["s-2"], "s-3") is True
+    assert up.is_private("s-3") and os.listdir(tmp_path / "private") == ["s-1"]
+    assert [path for _, path, _ in wire.requests] == [
+        "/private-sessions/s-2",
+        "/private-sessions/s-3",
+    ]
+
+
+def test_a_session_id_no_marker_can_be_named_by_is_held(tmp_path):
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    _mark(tmp_path, "s-old")
+    assert up.carry_private(["s-old"], "../s-new") is True
+    assert up.send(_body("../s-new"), timeout=5) == (upload.PRIVATE, "")
+    assert wire.tries == 0 and not (tmp_path / "s-new").exists()
+    assert os.listdir(tmp_path / "private") == ["s-old"]
+
+
+def test_carrying_never_raises(tmp_path, monkeypatch):
+    client, wire = _client(tmp_path)
+
+    def broken(line: str) -> None:
+        raise RuntimeError("log is gone")
+
+    up = upload.Uploader(client, log=broken, warn=broken)
+    _mark(tmp_path, "s-old")
+    _no_marker_written(monkeypatch)
+    wire.fail_private = RuntimeError("anything at all")
+    assert up.carry_private(["s-old"], "s-new") is True and up.is_private("s-new")

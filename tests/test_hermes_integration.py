@@ -96,6 +96,10 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {})
 
+    def do_PUT(self) -> None:
+        self._record()
+        self._send(200 if self.path.startswith("/private-sessions/") else 404, {"private": True})
+
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"null")
@@ -302,6 +306,69 @@ _DRIVER = textwrap.dedent(
 )
 
 
+#: A private conversation that Hermes compresses into a child session: the calls
+#: agent/conversation_compression.py makes on the manager, in its order.
+_SWITCH_DRIVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+
+    from agent.memory_manager import MemoryManager
+    from plugins.memory import load_memory_provider
+
+    sid, model, secret, cwd = sys.argv[1:5]
+    child = sid[:-6] + "be11ef"
+    out = {"warnings": [], "child": child}
+
+
+    def turn(n):
+        return [
+            {"role": "user", "content": f"question {n}", "timestamp": 1000.0 + n},
+            {"role": "assistant", "content": f"answer {n}"},
+        ]
+
+
+    manager = MemoryManager()
+    manager.add_provider(load_memory_provider("synapse"))
+    manager.initialize_all(
+        session_id=sid,
+        platform="cli",
+        hermes_home=os.environ["HERMES_HOME"],
+        agent_context="primary",
+        warning_callback=out["warnings"].append,
+        status_callback=lambda *args: None,
+        resumed=False,
+        message_count=0,
+        cwd=cwd,
+        agent_identity="default",
+        agent_workspace="hermes",
+    )
+    messages = [{"role": "system", "content": "You are Hermes."}] + turn(1)
+    manager.sync_all("question 1", "answer 1", session_id=sid, messages=messages)
+    manager.flush_pending(timeout=60)
+    manager.on_pre_compress(messages)
+    manager.on_session_switch(child, parent_session_id=sid, reset=False, reason="compression")
+    messages += turn(2)
+    manager.sync_all("question 2", "answer 2", session_id=child, messages=messages)
+    out["flushed"] = manager.flush_pending(timeout=60)
+    manager.on_session_end(messages)
+    manager.shutdown_all()
+
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        host = get_plugin_manager()._running_plugin_host()
+        out["host_pid"] = host.pid if host is not None else None
+        if host is not None:
+            host.shutdown()
+    except Exception as exc:
+        out["host_error"] = repr(exc)
+    print("RESULT " + json.dumps(out))
+    """
+)
+
+
 def _checkout() -> tuple[Path, Path]:
     checkout = Path(os.path.expanduser(_CHECKOUT)).resolve()
     python = checkout / ".venv" / "bin" / "python"
@@ -314,7 +381,15 @@ def _size(root: Path) -> int:
     return sum(p.stat().st_size for p in root.rglob("*") if p.is_file() and not p.is_symlink())
 
 
-def _run(tmp_path: Path, server: _Server, isolation: str) -> dict[str, Any]:
+def _run(
+    tmp_path: Path,
+    server: _Server,
+    isolation: str,
+    driver_text: str = _DRIVER,
+    private: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Run ``driver_text`` under the checkout's interpreter, for a scratch user with the
+    sessions in ``private`` marked private."""
     checkout, python = _checkout()
     user = tmp_path / "home"
     hermes_home = tmp_path / "hermes"
@@ -324,6 +399,9 @@ def _run(tmp_path: Path, server: _Server, isolation: str) -> dict[str, Any]:
         json.dumps({"url": server.url, "token": _TOKEN}), encoding="utf-8"
     )
     hermes_home.mkdir()
+    for session_id in private:
+        (synapse_home / "private").mkdir(exist_ok=True)
+        (synapse_home / "private" / session_id).write_text("", encoding="utf-8")
     report = hi.HermesHarness(which=lambda name: None, env={}).install(
         server.url, hermes_home=hermes_home
     )
@@ -336,7 +414,7 @@ def _run(tmp_path: Path, server: _Server, isolation: str) -> dict[str, Any]:
     guard.mkdir()
     (guard / "sitecustomize.py").write_text(_GUARD, encoding="utf-8")
     driver = tmp_path / "driver.py"
-    driver.write_text(_DRIVER, encoding="utf-8")
+    driver.write_text(driver_text, encoding="utf-8")
     network_log = tmp_path / "network.log"
     project = tmp_path / "work" / "atlas"
     project.mkdir(parents=True)
@@ -367,6 +445,7 @@ def _run(tmp_path: Path, server: _Server, isolation: str) -> dict[str, Any]:
     out["network"] = network_log.read_text() if network_log.exists() else ""
     out["home_size"] = _size(hermes_home)
     out["project"] = str(project)
+    out["private_dir"] = str(synapse_home / "private")
     return out
 
 
@@ -462,3 +541,21 @@ def test_synapse_runs_inside_hermes(tmp_path: Path, server: _Server, isolation: 
     for prefix in markers["prefixes"]:
         assert hm._synthetic({}, prefix + " body"), prefix
     assert hm._synthetic({"display_kind": markers["steer_kind"]}, "steer text")
+
+
+@pytest.mark.parametrize("isolation", ["in_process", "host"])
+def test_a_private_conversation_stays_private_when_hermes_compresses_it(
+    tmp_path: Path, server: _Server, isolation: str
+) -> None:
+    """Hermes's own manager announces the child session of a compression; the provider
+    makes it private as the session it continues is, and nothing is uploaded under
+    either id. In the plugin host too, where the announcement crosses a process."""
+    out = _run(tmp_path, server, isolation, _SWITCH_DRIVER, private=(_SID,))
+    assert out["network"] == "" and out["warnings"] == []
+    if isolation == "host":
+        assert out.get("host_pid"), "the provider did not run in Hermes's plugin host"
+    child = out["child"]
+    assert child != _SID and sorted(os.listdir(out["private_dir"])) == sorted([_SID, child])
+    assert [r["path"] for r in server.requests("PUT", "/")] == [f"/private-sessions/{child}"]
+    assert server.requests("POST", "/ingest") == []
+    assert server.requests("GET", "/context")  # the session itself was a working one

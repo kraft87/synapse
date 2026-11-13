@@ -5,11 +5,14 @@
 session (its chat id, its route, the state keys of its creation receipt), the
 surfaces Hermes stores as an owner's own chat, and the session store's columns it
 reads; ``harnesses/hermes/lineage.py`` copies the ``model_config`` keys under which a
-branch, a reset and a compressed continuation name the session they came from. A Hermes
-that renames any of them would turn a failed turn back into an uploaded reply, the
-owner's ``hermes chat`` back into an inert session, or a copy of a Bot Chat back into
-the owner's chat once its parent is deleted, without a unit test noticing: these checks
-ask the checkout itself.
+branch, a reset and a compressed continuation name the session they came from;
+``harnesses/hermes/provider.py`` reads how a session switch is announced (``reset``, and
+``reason="resume"``) to tell a conversation that goes on under a new id from another
+conversation. A Hermes that renames any of them would turn a failed turn back into an
+uploaded reply, the owner's ``hermes chat`` back into an inert session, a copy of a Bot
+Chat back into the owner's chat once its parent is deleted, or a compressed private
+conversation back into an uploaded one, without a unit test noticing: these checks ask
+the checkout itself.
 
 Skipped unless ``SYNAPSE_HERMES_CHECKOUT`` names a Hermes checkout with its virtualenv
 at ``.venv`` (as tests/test_hermes_integration.py). A driver runs under the checkout's
@@ -42,6 +45,7 @@ pytestmark = pytest.mark.skipif(
 _DRIVER = textwrap.dedent(
     """
     import inspect, json, os, sqlite3
+    from pathlib import Path
 
     import hermes_state_mutation_branch as branch
     import hermes_state_mutation_compress as compress
@@ -66,6 +70,21 @@ _DRIVER = textwrap.dedent(
     origins = [key for key, module in (("_branched_from", branch), ("_reset_from", reset),
                                        ("_compressed_from", compress))
                if "model_config={'%s': target}" % key in inspect.getsource(module)]
+    def says(path, text):
+        return " ".join(Path(path).read_text(encoding="utf-8").split()).count(text)
+
+    switches = {
+        "compression": says("agent/conversation_compression.py",
+                            'reset=False, reason="compression" )'),
+        "branch": says("hermes_cli/cli_commands_mixin.py",
+                       'parent_session_id=parent_session_id, reason="branch")'),
+        "resume": says("hermes_cli/cli_commands_mixin.py",
+                       'parent_session_id=old_session_id, reason="resume")'),
+        "resume_and_branch_keep": says("hermes_cli/cli_session_switch.py",
+                                       'reset=False, reason=reason)'),
+        "new_session": says("hermes_cli/cli_session_mixin.py",
+                            'reset=True, reason="new_session")'),
+    }
     print("RESULT " + json.dumps({
         "failed_kind": failures.FAILED_TURN_DISPLAY_KIND,
         "failed_notices": notices,
@@ -78,6 +97,7 @@ _DRIVER = textwrap.dedent(
         "stored_as_local": sorted(STORED_AS_LOCAL),
         "columns": columns,
         "origins": origins,
+        "switches": switches,
     }))
     """
 )
@@ -151,3 +171,20 @@ def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[
     three gateway writers, by their source text: it does not run a delete, and it does
     not cover the in-process writers."""
     assert names["origins"] == list(hl._ORIGINS)
+
+
+def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(
+    names: dict[str, Any],
+) -> None:
+    """The provider keeps a conversation private across a new session id unless the
+    switch is a reset (``/new``) or says ``reason="resume"`` (another conversation). A
+    compression that came to pass ``reset=True`` would upload a private conversation
+    under its new id; a resume under another reason would make the conversation resumed
+    private for no reason of its own. By the source text of the call sites."""
+    assert names["switches"] == {
+        "compression": 2,  # the child session, and the notice after either mode
+        "branch": 1,
+        "resume": 1,
+        "resume_and_branch_keep": 1,
+        "new_session": 1,
+    }

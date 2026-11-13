@@ -386,11 +386,25 @@ class SynapseMemoryProvider(MemoryProvider):
         sent; the next upload then looks back at most LOOKBACK turns, as for a resume.
         It forgets the compression cut too; a compression that keeps the id sets it."""
         try:
+            new = str(new_session_id or "")
             with self._lock:
-                new = str(new_session_id or "")
-                if reset or (new and new != self._session_id):
+                old = self._session_id
+            goes_on = bool(new) and new != old and not reset
+            # The same conversation under a new id (a compression, a /branch) stays off
+            # the record when the id it leaves is. /resume opens another conversation.
+            # Outside the lock: telling the server is a request.
+            uploader = self._uploader if self._mode == ACTIVE else None
+            private_too = (
+                goes_on
+                and kwargs.get("reason") != "resume"
+                and uploader is not None
+                and uploader.carry_private([old, str(parent_session_id or "")], new)
+            )
+            with self._lock:
+                if reset or goes_on:
                     if self._turns is not None:
-                        self._turns.forget(LOOKBACK)
+                        # Turns spoken off the record are not looked back at.
+                        self._turns.forget(0 if private_too else LOOKBACK)
                     self._cut = None
                 elif kwargs.get("reason") == "compression":
                     self._cut = _clock()

@@ -17,6 +17,7 @@ plugin/                          what every install method ships
     api.py                       Client: one method per server endpoint
     context.py                   session-start block, per-prompt nudge (the wording)
     private.py                   is this session private (the marker file and its TTL)
+    private_toggle.py            the private-mode toggle: marker + server row, on/off/status
     project.py                   project label for a working directory
     outbox.py                    durable queue for uploads that failed
     messages.py                  a conversation in the `messages` format, cut into turns
@@ -80,6 +81,13 @@ server-only change leaves the version alone. The rules live in `scripts/release_
    ingest route itself, so no adapter can forget the check. The two older shippers that
    still post on their own (Claude Code's and Codex's Stop hooks) run the same check
    inside their senders.
+7. **One private-mode toggle.** `private_toggle.Toggle` is the toggle of every harness:
+   the marker (`private.mark`), the server row (`Client.private_put`), the read-back,
+   and what `off` and `--forget` leave behind. `synapse private`, and the
+   `private_mode.py` of the Claude Code and Codex plugins, only build the client and
+   hand it the arguments. A harness that gives a continuing conversation a new session
+   id calls `Uploader.carry_private`, or the turns spoken off the record go up under
+   the new id.
 
 ## What an adapter provides
 
@@ -310,7 +318,7 @@ like every other harness, so there is no Hermes setup wizard step.
 | `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. |
 | `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn's `turn_author` is a bot or not the session's user. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
-| `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. A compression that keeps the id (`reason="compression"`) records the time, on the clock Hermes stamps its messages with; recall and recall_full_turns then carry it as `self_since`, so the turns before it serve again. A new id, a reset or a restart forgets it. |
+| `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. A conversation that goes on under a new id (a compression, `/branch`: any new id that is neither a reset nor `reason="resume"`) stays private when the id it leaves, or its parent, is: the new id gets the marker and the server row (`Uploader.carry_private`), and no turn before the switch is looked back at. `/new` and `/resume` open another conversation, which is on the record. A compression that keeps the id (`reason="compression"`) records the time, on the clock Hermes stamps its messages with; recall and recall_full_turns then carry it as `self_since`, so the turns before it serve again. A new id, a reset or a restart forgets it. |
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `self_since` on `recall` and `recall_full_turns`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
 | `handle_tool_call(name, args)` | `tools.call()`: adds the session id, and the compression time where there is one, the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
 
@@ -332,14 +340,17 @@ interim text, the interrupt placeholder) keeps only its tool calls.
 
 **Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
 spool (a `remember` call that fails is reported to the model, not queued), the
-recall-feedback nudge, a private-mode toggle (markers are honoured; there is no Hermes
-command that writes one), skills sync into `$HERMES_HOME/skills`, config sync, a history
+recall-feedback nudge, a Hermes command for private mode (the toggle is
+`synapse private on|off|status <session-id>` in a terminal, the one Claude Code and Codex
+use; there is no slash command or tool for it), skills sync into `$HERMES_HOME/skills`,
+config sync, a history
 importer for `state.db`, and Synapse in messaging-gateway and API-server sessions
 (above). Skill invocations are uploaded as Hermes hands them over: the manager strips
 the skill body from the user text it passes, not from `messages`.
 
-**Tests.** The uploader and the private rule at the request are in
-`tests/test_client_core_upload.py`. `tests/test_hermes_messages.py`,
+**Tests.** The uploader, the private rule at the request and the carry-over are in
+`tests/test_client_core_upload.py`; the toggle in `tests/test_client_core_private_toggle.py`
+and, against a server, `tests/test_private_mode.py`. `tests/test_hermes_messages.py`,
 `test_hermes_provider.py` (against a stub of Hermes's base class) and
 `test_hermes_install.py` run everywhere, with
 `test_hermes_gateway_sessions.py` (the rule, over a `state.db` built like Hermes's),
@@ -363,8 +374,8 @@ with `Settings.load` and sends through `Transport`, and session start, the promp
 the recall-feedback nudge and the Stop hook's private check come from the core; its
 sender (`_post`) runs `private.check_payload` on the body it is about to send. Codex
 keeps its own Stop-hook shipper (rollout cursors, catch-up sweep and retry), the
-session-id injection hook (`pre_tool_use.py`), the private-mode toggle
-(`scripts/private_mode.py`) and the skills-sync glue.
+session-id injection hook (`pre_tool_use.py`) and the skills-sync glue. Its
+`scripts/private_mode.py` is the core's toggle with Codex's settings (plugin 0.24.10).
 
 Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `config.py`
 resolves with `Settings.load` and sends through `Transport`; the board, preferences and
@@ -374,9 +385,10 @@ is `private.is_private`, with `private.check_payload` run again inside the sende
 (`_post_records`), which the catch-up sweep and `synapse-import` share. Claude Code keeps
 its own Stop-hook shipper (byte cursor,
 chunking, the detached `--ship`, retry bookkeeping, the catch-up sweep), the session-id
-injection hook (`self_session_inject.py`), the private-mode toggle
-(`scripts/private_mode.py`), the remember spool, the git feeder and the skills and config
-sync, which send through `config.py`'s helpers. The two harnesses' wiring moving into
+injection hook (`self_session_inject.py`), the remember spool, the git feeder and the
+skills and config sync, which send through `config.py`'s helpers. Its
+`scripts/private_mode.py` is the core's toggle with the plugin's settings (plugin
+0.24.10). The two harnesses' wiring moving into
 `harnesses/` beside Hermes's is the next change.
 
 A module moves like this: the code goes into `synapse_client/`, the old path keeps a
@@ -431,6 +443,13 @@ The core ports the hooks' behaviour and wording, with these differences:
   drain goes on to the rest either way. `TurnUploader` is the `messages` uploader Hermes
   started with: finished turns once each, the turn before as context, a resumed
   conversation looking back only so far.
+- **A conversation that changes its session id.** Private mode is kept per session id.
+  `Uploader.carry_private(earlier, new)` gives `new` the marker and the server row when
+  one of `earlier` is private (or has a marker that cannot be read), and answers whether
+  it did. Where a write fails the uploader refuses the session itself: until the
+  program ends when the marker could not be written, and until the server has the row
+  when the request failed; `TurnUploader.upload` asks the server again each time that
+  session has a turn (`settle_private`).
 
 ## Adding a harness
 
@@ -444,5 +463,6 @@ The core ports the hooks' behaviour and wording, with these differences:
    conversation as `messages` records (`messages.py` says what a record holds; the
    adapter only converts its harness's shapes), tool calls -> `tools.call`. Do not post
    to the ingest route from the adapter: the uploader is where a private session's turns
-   are stopped and a failed upload is queued.
+   are stopped and a failed upload is queued. If the harness can give a conversation a
+   new session id while it goes on, call `Uploader.carry_private` when it does.
 4. Add a column to the table above and say what is not ported.

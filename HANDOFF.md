@@ -3,6 +3,74 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — client: one private-mode toggle, and a Hermes conversation stays private under a new session id (plugin 0.24.10)
+
+**What changed**
+
+- **One toggle, in the core.** The Claude Code plugin and the Codex plugin each carried a
+  whole `private_mode.py`, two copies of the same 250 lines kept equal by hand. The
+  toggle is now `synapse_client/private_toggle.py`: the marker (`private.mark`,
+  `private.unmark`), the server row through the client (`Client.private_put`,
+  `private_get`, `private_delete`), the read-back, and what `off` and `--forget` leave
+  behind. Both scripts build a client from their plugin's settings and hand it the
+  arguments. Same commands, same lines printed, same exit codes.
+- **Hermes: private mode follows the conversation.** Hermes gives a conversation a new
+  session id when it compresses or branches it. Private mode is kept per session id, so
+  the turns spoken off the record were uploaded under the new id at its first finished
+  turn, up to ten of them. Now a switch to a new id that is neither a reset nor a resume
+  checks the id it leaves and the parent Hermes names: when either is private (or has a
+  marker that cannot be read), the new id gets the marker and the server row, and no
+  turn from before the switch is looked back at. `/new` and `/resume` open another
+  conversation and inherit nothing.
+- **When a write fails at that switch**, the provider refuses the new session itself and
+  says so as a WARNING in Hermes's log. No marker could be written: until Hermes exits.
+  The server could not be told (a 5-second request): until the server has the row; the
+  request is made again each time that session finishes a turn.
+- **Hermes has no command of its own for private mode.** It is `synapse private
+  on|off|status <session-id>` in a terminal, the command the other two harnesses use
+  (`hermes sessions list` shows the id). That was already so; the README now says it.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.10. Nothing to migrate, no setting to change, no
+   server change.
+
+**Proven**
+
+- `tests/test_private_mode.py` (every toggle case against a local server, run for the
+  Claude Code script and the Codex script) passes unchanged on the wrappers.
+  `tests/test_client_core_private_toggle.py` (new) covers the core toggle and the marker
+  functions directly.
+- `tests/test_client_core_upload.py`: a session that continues a private one is private
+  for any uploader; nothing is written when no earlier id is private; a marker that
+  cannot be written, and an id no marker can be named by, are held by the uploader,
+  queued uploads included; a held session is carried on to the next; a server that was
+  down is asked again at each turn and once it answers is not asked again.
+- `tests/test_hermes_provider.py`: a compression or a branch from a private session
+  uploads nothing under the new id, at a turn, before a compression or at exit; a
+  private parent is enough; `/resume` and `/new` do not inherit; with the new id's marker
+  removed the earlier turns stay unsent; an inert session writes nothing.
+- Each of those tests fails with its line of the change taken out (eight changes tried).
+- In a real Hermes checkout (bca51750): `tests/test_hermes_integration.py` marks a
+  session private and makes the calls a compression makes on Hermes's own
+  `MemoryManager`; the child id gets the marker and the row and nothing is uploaded
+  under either id, in-process and in Hermes's plugin host. It fails without the
+  carry-over. `tests/test_hermes_checkout_names.py` reads the call sites that announce a
+  switch: compression and branch pass `reset=False`, resume passes `reason="resume"`,
+  `/new` passes `reset=True`.
+
+**Still open**
+
+- A carried session whose server row never lands before Hermes exits is kept off the
+  record by its marker alone, for twelve hours. Resumed after that, up to ten of its
+  turns are uploaded. The WARNING line names the session; `synapse private on <id>`
+  settles it.
+- Not seen in a live Hermes session: the switch was driven through Hermes's own
+  manager in tests, not by a real compression with a real model.
+- A Hermes slash command or tool for private mode. The toggle is typed in a terminal.
+- From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
+  uploaded and are lost at exit.
+
 ## 2026-11-12 — cli: `synapse update` lets the client it installed update the harnesses (plugin 0.24.9)
 
 **What changed**

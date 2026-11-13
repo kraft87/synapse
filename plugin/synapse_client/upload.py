@@ -6,6 +6,7 @@ which ``Client.ingest`` runs again at the request). It writes the body to the ou
 before its request, so a process that exits mid-request leaves it queued; removes it
 once delivered; keeps it, as waiting, when the send failed. ``drain`` sends what is
 waiting, and drops what belongs to a session taken off the record since it was queued.
+``carry_private`` keeps a conversation private when it goes on under a new session id.
 
 ``TurnUploader`` uploads the finished turns of one conversation in the ``messages``
 format (messages.py), once each, with the turn before as context.
@@ -18,7 +19,7 @@ turns on the machine without each adapter remembering to check.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,10 @@ class Uploader:
         self.outbox = outbox
         self._log = log
         self._warn = warn or log
+        # Private sessions this uploader refuses itself (carry_private): the ones with
+        # no marker to read, and the ones the server is still to be told about.
+        self._unmarked: set[str] = set()
+        self._owed: set[str] = set()
 
     def _say(self, line: str, to: Log | None = None) -> None:
         log = to or self._log
@@ -61,11 +66,68 @@ class Uploader:
             except Exception:
                 pass
 
+    def _holds(self, sessions: Iterable[str]) -> bool:
+        return any(sid in self._unmarked or sid in self._owed for sid in sessions)
+
     def is_private(self, session_id: str) -> bool:
-        """Whether nothing may be uploaded for ``session_id`` (private.is_private)."""
-        return private.is_private(self.client.settings, session_id, self._log)
+        """Whether nothing may be uploaded for ``session_id``: it is in private mode
+        (private.is_private), or held here by ``carry_private``."""
+        return self._holds([session_id]) or private.is_private(
+            self.client.settings, session_id, self._log
+        )
+
+    def carry_private(self, earlier: Iterable[str], session_id: str, *, timeout: float = 5) -> bool:
+        """Keep a conversation off the record when it goes on under a new session id (a
+        compression that starts a new session, a branch): private mode is kept per id,
+        and the new one has neither a marker nor a server row.
+
+        When one of ``earlier`` (the ids the conversation had) is private here, or has a
+        marker that cannot be read, ``session_id`` gets the marker and the row, and the
+        answer is True: nothing is uploaded for it. Where a write fails this uploader
+        holds the session itself, and says so to ``warn``: for as long as it lives when
+        the marker could not be written, and until the server has been told when the
+        request failed (``settle_private`` tries again). False: none of them is private,
+        and nothing was written. Never raises."""
+        source = next((sid for sid in earlier if sid and self.is_private(sid)), "")
+        if not source or not session_id or session_id == source:
+            return bool(source)
+        said = f"synapse: session {session_id} continues {source}, which is in private mode"
+        try:
+            private.mark(self.client.settings, session_id)
+        except (OSError, ValueError) as err:
+            self._unmarked.add(session_id)
+            self._say(
+                f"{said}; its marker could not be written ({type(err).__name__}), so "
+                "nothing is uploaded for it until this program ends",
+                self._warn,
+            )
+        self._owed.add(session_id)
+        if self.settle_private(session_id, timeout=timeout):
+            self._say(f"{said}: it is off the record too")
+        else:
+            self._say(
+                f"{said}; the server could not be told. Nothing is uploaded for it here, "
+                "and the server is told again at the session's next turn",
+                self._warn,
+            )
+        return True
+
+    def settle_private(self, session_id: str, *, timeout: float = 5) -> bool:
+        """Tell the server about a private session it has not been told about yet
+        (``carry_private``, when its request failed). True when nothing is owed for
+        ``session_id``, or the request went through now. Never raises."""
+        if session_id not in self._owed:
+            return True
+        try:
+            self.client.private_put(session_id, timeout=timeout)
+        except Exception:
+            return False
+        self._owed.discard(session_id)
+        return True
 
     def _refused(self, payload: Mapping[str, Any]) -> bool:
+        if self._holds(private.sessions_of(payload)):
+            return True
         try:
             private.check_payload(self.client.settings, payload, (), self._log)
         except private.PrivateSession:
@@ -136,6 +198,8 @@ class Uploader:
         def send(payload: Any) -> None:
             if not isinstance(payload, Mapping):
                 raise Skip("not an ingest body", drop=True)
+            if self._holds(private.sessions_of(payload)):
+                raise Skip("its session is held off the record here", drop=False)
             try:
                 self.client.ingest(payload, timeout=timeout, log=self._log)
             except private.PrivateSession as refused:
@@ -187,11 +251,15 @@ class TurnUploader:
         True when at least one batch reached the server.
 
         Nothing is sent, and nothing remembered, for a session in private mode or with no
-        id. A batch whose send fails waits in the outbox and counts as handled; the
-        batches after it are queued without a request, since theirs would fail the same
-        way. A batch that could not be queued either is tried again by the next upload.
-        Never raises over a failed send."""
-        if not session_id or self.uploader.is_private(session_id):
+        id; a private one the server is still to be told about is settled instead
+        (Uploader.settle_private). A batch whose send fails waits in the outbox and
+        counts as handled; the batches after it are queued without a request, since
+        theirs would fail the same way. A batch that could not be queued either is tried
+        again by the next upload. Never raises over a failed send."""
+        if not session_id:
+            return False
+        if self.uploader.is_private(session_id):
+            self.uploader.settle_private(session_id)
             return False
         all_turns = messages.turns(records)
         with self._lock:

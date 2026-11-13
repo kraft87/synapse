@@ -225,6 +225,13 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {})
 
+    def do_PUT(self) -> None:
+        self._record()
+        if self.path.startswith("/private-sessions/") and self.server.private_status == 200:
+            self._send(200, {"private": True})
+        else:
+            self._send(self.server.private_status, {"error": "down"})
+
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"null")
@@ -262,6 +269,7 @@ class _Server(ThreadingHTTPServer):
         self.hang = threading.Event()
         self.release = threading.Event()
         self.ingest_status = 200
+        self.private_status = 200
         self.tool_error = False
         self.tool_text = ""
 
@@ -271,6 +279,9 @@ class _Server(ThreadingHTTPServer):
 
     def posts(self, path: str = "/ingest") -> list[Any]:
         return [r["body"] for r in self.seen if r["method"] == "POST" and r["path"] == path]
+
+    def puts(self) -> list[str]:
+        return [r["path"] for r in self.seen if r["method"] == "PUT"]
 
 
 @pytest.fixture()
@@ -568,6 +579,101 @@ def test_a_session_switch_rebinds(plugin, server, tmp_path):
     provider.on_session_switch("20261112_120000_ffffff", reset=True)
     provider.sync_turn("q", "a", messages=_conversation(2))
     assert len(server.posts()) == 3
+
+
+_NEXT = "20261112_120000_ffffff"
+
+
+def _private(tmp_path: Path, session_id: str) -> Path:
+    marker = tmp_path / "private" / session_id
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    return marker
+
+
+@pytest.mark.parametrize("reason", ["compression", "branch", None])
+def test_a_conversation_that_goes_on_under_a_new_id_stays_private(plugin, server, tmp_path, reason):
+    """Hermes gives a conversation it compresses or branches a new session id. Private
+    mode is kept per id, so the turns spoken off the record went up under the new one."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, _SID)
+    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(2))
+    provider.on_session_switch(
+        _NEXT, parent_session_id=_SID, **({"reason": reason} if reason else {})
+    )
+    assert (tmp_path / "private" / _NEXT).is_file()
+    assert server.puts() == [f"/private-sessions/{_NEXT}"]
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    provider.on_pre_compress(_conversation(3))
+    provider.on_session_end(_conversation(3))
+    assert server.posts() == []
+
+
+def test_a_private_parent_is_enough_to_stay_private(plugin, server, tmp_path):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, "20261111_090000_aaaaaa")
+    provider.on_session_switch(_NEXT, parent_session_id="20261111_090000_aaaaaa", reason="branch")
+    provider.sync_turn("q", "a", messages=_conversation(1))
+    assert (tmp_path / "private" / _NEXT).is_file() and server.posts() == []
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        {"parent_session_id": _SID, "reason": "resume"},  # /resume: another conversation
+        {"reset": True, "reason": "new_session"},  # /new
+    ],
+)
+def test_another_conversation_does_not_inherit_private_mode(plugin, server, tmp_path, switch):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, _SID)
+    provider.on_session_switch(_NEXT, **switch)
+    assert not (tmp_path / "private" / _NEXT).exists() and server.puts() == []
+    provider.sync_turn("q", "a", messages=_conversation(1))
+    (body,) = server.posts()
+    assert body["session_id"] == _NEXT
+
+
+def test_turns_spoken_off_the_record_are_not_looked_back_at(plugin, server, tmp_path):
+    """The new id's marker goes (`private off`, or its twelve hours): what was said
+    before stays unsent, where any other switch looks back LOOKBACK turns."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, _SID)
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    provider.sync_turn("q", "a", messages=_conversation(2))
+    (tmp_path / "private" / _NEXT).unlink()
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    assert server.posts() == []
+    provider.sync_turn("q", "a", messages=_conversation(4))
+    (body,) = server.posts()
+    assert body["session_id"] == _NEXT
+    assert _users(body["records"]) == ["question 3", "question 4"]
+
+
+def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tmp_path):
+    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    _private(tmp_path, _SID)
+    server.private_status = 503
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    told = len(server.puts())
+    assert told >= 1 and (tmp_path / "private" / _NEXT).is_file()
+    (tmp_path / "private" / _NEXT).unlink()  # the marker alone would not have lasted
+    provider.sync_turn("q", "a", messages=_conversation(1))
+    assert len(server.puts()) > told and server.posts() == []
+    server.private_status = 200
+    told = len(server.puts())
+    provider.sync_turn("q", "a", messages=_conversation(2))
+    assert len(server.puts()) == told + 1 and server.posts() == []
+    provider.sync_turn("q", "a", messages=_conversation(3))
+    assert len(server.puts()) == told + 1  # told once: not asked again
+
+
+def test_a_session_that_is_off_carries_nothing(plugin, server, tmp_path):
+    """A provider that uploads nothing writes nothing either: no marker, no request."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a", agent_context="subagent")
+    _private(tmp_path, _SID)
+    provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
+    assert not (tmp_path / "private" / _NEXT).exists() and server.puts() == []
 
 
 # ---------------------------------------------------------------------------
