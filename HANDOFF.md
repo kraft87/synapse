@@ -3,7 +3,7 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
-## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.5)
+## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.6)
 
 **What changed**
 
@@ -32,7 +32,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**
 
 1. Nothing to migrate and no setting to change. The server part takes effect with the image.
-2. `synapse update` for plugin 0.24.5; until then a client sends no `self_since` and
+2. `synapse update` for plugin 0.24.6; until then a client sends no `self_since` and
    behaves as before. A server older than this release rejects the argument, so the client
    must not get ahead of its server; `synapse update` cannot, because the installer serves
    the client that matches the server it runs on.
