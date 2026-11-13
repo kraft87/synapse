@@ -304,6 +304,33 @@ def test_forget_after_a_switch_stands_when_the_note_of_the_carry_could_not_be_ke
     assert not carried.settled(home, _CHILD)
 
 
+def test_a_new_id_found_at_an_upload_is_not_looked_back_at_when_no_record_says_so(
+    plugin, server, tmp_path, monkeypatch
+):
+    """The record could not be written, and the session and its parent are both put
+    back on the record. An upload then names a new id that only its row says goes on
+    from the session. Nothing on disk says the session held turns from off the record
+    and nobody is private, but the agent that carried it remembers: the new id is
+    started with the sessions it goes on from, and is not looked back at."""
+    home = tmp_path / "hermes-a"
+    _child(home, None)
+    _marker(tmp_path, _PARENT)
+    provider = _open(plugin, home, _PARENT, resumed=True)
+    module = sys.modules[type(provider).__module__]  # the provider's own copy of the core
+    monkeypatch.setattr(module.carried, "settle", lambda home, session_id, made=False: None)
+    provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
+    _forget(server, tmp_path, _CHILD)
+    (tmp_path / "private" / _PARENT).unlink()  # `off --forget` for the parent as well
+    _say(provider, _conversation(4), _CHILD)
+    assert _posted(server) == [(_CHILD, ["question 4"])]
+    _store(home, _THIRD, source="tui", receipt=False, chat_id="")
+    _link(home, _THIRD, _CHILD, None)
+    tail = [_conversation(4)[0], *_conversation(4)[3:], *_conversation(5)[-2:]]  # turns 2 to 5
+    _say(provider, tail, _THIRD)
+    assert _posted(server)[1:] == [(_THIRD, ["question 5"])]
+    assert not (tmp_path / "private" / _THIRD).exists()
+
+
 def test_a_turn_begun_under_an_id_gone_back_to_stays_out_after_the_next_compression(
     plugin, server, tmp_path
 ):
