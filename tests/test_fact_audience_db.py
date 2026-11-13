@@ -33,7 +33,6 @@ from ingestion.db import Database  # noqa: E402
 from ingestion.llm_client import LLMHTTPError, UsageLimitError  # noqa: E402
 from ingestion.poller import Poller  # noqa: E402
 from ingestion.surfaces import FACT_AUDIENCE_PROBE  # noqa: E402
-from tests.helpers.embed import GROUP  # noqa: E402
 from tests.helpers.surfaces import (  # noqa: E402
     clear_surfaces,
     register_device,
@@ -82,17 +81,15 @@ def _fact(
     audience: str | None = None,
     web: int | None = None,
     retired: bool = False,
-    group: str = GROUP,
 ) -> int:
     """One fact; its id is its insertion order. ``ep`` is its only source episode."""
     return conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
         "  episodes, t_valid, t_invalid, web_artifact_id, audience) "
-        "VALUES (%s, 'default', %s, 'a', 'b', 'RELATES', %s, %s::jsonb, "
+        "VALUES (%s, 'default', 'a', 'b', 'RELATES', %s, %s::jsonb, "
         "        '2026-01-01T00:00:00+00:00', %s, %s, %s) RETURNING id",
         (
             f"fad-{uuid.uuid4().hex}",
-            group,
             text,
             None if ep is None else f"[{ep}]",
             "2026-02-01T00:00:00+00:00" if retired else None,

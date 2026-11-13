@@ -1,17 +1,13 @@
-"""Recall reads one memory per owner: no read looks at a row's legacy ``group_id``.
+"""Recall reads one memory per owner, as one ranked list.
 
-Rows written before schema 067 carry ``technical`` or ``personal``; after it every row says
-``technical``. Production holds both states during the rollout, so every test seeds both
-values side by side and pins what no longer depends on them:
-
-  * full trust: the vector, BM25 and hop legs each serve both values, in ONE ranked list that
-    ends at the fact limit, with no extras after it and no cross-group marker in the telemetry
-  * one fact-floor request over that list, and the retrieval-count bump reaches both values
-  * a superseded pair, the supersession surface and the episode overlay link rows across
-    the two values
-  * a restricted device is served no ``personal``-audience fact from any search leg, whichever
-    value the row carries: vector, BM25, hop, superseded pairs, surface, overlay, and no
-    seed entities
+* full trust: the vector, BM25 and hop legs each serve, in ONE ranked list that ends at the
+  fact limit, with no extras after it and no cross-group marker in the telemetry
+* one fact-floor request over that list, and the retrieval-count bump reaches every fact
+  it served
+* a superseded pair, the supersession surface and the episode overlay link a live fact to
+  the one it retired
+* a restricted device is served no ``personal``-audience fact from any search leg: vector,
+  BM25, hop, superseded pairs, surface, overlay, and no seed entities
 """
 
 from __future__ import annotations
@@ -29,8 +25,6 @@ from mcp_server.recall_settings import _SUP_LIMIT
 from tests.helpers.embed import onehot
 
 WORK = "work-proj"
-TECH, PERS = "technical", "personal"
-LEGACY = (TECH, PERS)
 _RESTRICTED = SurfaceTrust(trust="restricted", allowed_projects=(WORK,), known=True)
 _INVALID = "2026-02-01T00:00:00+00:00"
 
@@ -57,7 +51,6 @@ def _ep(conn, project: str = WORK) -> int:
 def _fact(
     conn,
     uid: str,
-    group: str,
     fact: str,
     ep: int,
     *,
@@ -69,13 +62,12 @@ def _fact(
     invalidated_by: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
         "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience) "
-        "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
+        "VALUES (%s, 'default', %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
         "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
         (
             uid,
-            group,
             src,
             tgt,
             fact,
@@ -88,11 +80,11 @@ def _fact(
     )
 
 
-def _entity(conn, uid: str, group: str, name: str, emb: int) -> None:
+def _entity(conn, uid: str, name: str, emb: int) -> None:
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, summary, "
-        "  embedding) VALUES (%s, 'default', %s, %s, %s, 's', %s::vector)",
-        (uid, group, name, name.lower(), kg_pg._vec_literal(onehot(emb))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, summary, embedding) "
+        "VALUES (%s, 'default', %s, %s, 's', %s::vector)",
+        (uid, name, name.lower(), kg_pg._vec_literal(onehot(emb))),
     )
 
 
@@ -145,29 +137,20 @@ def _uuids(facts: list[dict[str, Any]]) -> set[str]:
 
 
 def _seed_legs(conn) -> None:
-    """In each legacy value, per leg only that leg can serve, a work-safe fact and a
-    personal-audience one: ``v`` by vector (its text misses the query), ``b`` by BM25 (no
-    embedding), ``h`` by the hop from the value's seed entity (neither). Every fact sits
-    inside the allowlist, so for a restricted caller only its label decides."""
+    """Per leg only that leg can serve, a work-safe fact and a personal-audience one: ``v`` by
+    vector (its text misses the query), ``b`` by BM25 (no embedding), ``h`` by the hop from the
+    seed entity (neither). Every fact sits inside the allowlist, so for a restricted caller only
+    its label decides."""
     ep = _ep(conn)
-    for g in LEGACY:
-        _entity(conn, f"seed-{g}", g, f"Seed {g}", 0)
-        for kind, audience in (("safe", "work-safe"), ("personal", "personal")):
-            _fact(conn, f"v-{kind}-{g}", g, f"alpha {kind} {g}", ep, emb=0, audience=audience)
-            _fact(conn, f"b-{kind}-{g}", g, f"widget {kind} {g}", ep, audience=audience)
-            _fact(
-                conn,
-                f"h-{kind}-{g}",
-                g,
-                f"epsilon {kind} {g}",
-                ep,
-                src=f"seed-{g}",
-                audience=audience,
-            )
+    _entity(conn, "seed", "Seed", 0)
+    for kind, audience in (("safe", "work-safe"), ("personal", "personal")):
+        _fact(conn, f"v-{kind}", f"alpha {kind}", ep, emb=0, audience=audience)
+        _fact(conn, f"b-{kind}", f"widget {kind}", ep, audience=audience)
+        _fact(conn, f"h-{kind}", f"epsilon {kind}", ep, src="seed", audience=audience)
 
 
-_SAFE = {f"{leg}-safe-{g}" for leg in "vbh" for g in LEGACY}
-_EVERY = _SAFE | {f"{leg}-personal-{g}" for leg in "vbh" for g in LEGACY}
+_SAFE = {f"{leg}-safe" for leg in "vbh"}
+_EVERY = _SAFE | {f"{leg}-personal" for leg in "vbh"}
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +158,7 @@ _EVERY = _SAFE | {f"{leg}-personal-{g}" for leg in "vbh" for g in LEGACY}
 # ---------------------------------------------------------------------------
 
 
-def test_full_trust_serves_both_legacy_values_on_every_leg(kg, db_url):
+def test_full_trust_serves_every_leg_in_one_list(kg, db_url):
     _seed_legs(kg)
     metrics: list[dict[str, Any]] = []
     out = _engine(db_url, metrics=metrics).recall("widget", trust=FULL_TRUST)
@@ -186,56 +169,50 @@ def test_full_trust_serves_both_legacy_values_on_every_leg(kg, db_url):
     assert "group_id" not in metrics[0]
 
 
-def test_the_facts_are_ranked_across_both_values_not_one_value_then_the_other(kg, db_url):
-    """The best matches are personal-pile facts (found by vector AND BM25) and the technical
-    pile has many weaker BM25-only ones: a ranking per pile would put the technical facts
-    first and append a few personal ones after the limit."""
+def test_the_best_matches_lead_the_one_ranked_list(kg, db_url):
+    """Three facts are found by vector AND BM25, twelve weaker ones by BM25 only: the three
+    lead the list, and nothing is appended after the limit."""
     ep = _ep(kg)
     for i in range(3):
-        _fact(kg, f"p{i}", PERS, f"widget {i}", ep, emb=0)
+        _fact(kg, f"p{i}", f"widget {i}", ep, emb=0)
     for i in range(12):
-        _fact(kg, f"t{i:02d}", TECH, "widget " + "filler " * (i + 4), ep)
+        _fact(kg, f"t{i:02d}", "widget " + "filler " * (i + 4), ep)
     facts, _ = Recall(db_url, "")._search_kg("widget", onehot(0), [], 5)
     assert len(facts) == 5
     assert _uuids(facts[:3]) == {"p0", "p1", "p2"}
     assert not any("_cross" in f for f in facts)
 
 
-def test_recall_serves_the_fact_limit_over_both_values_and_no_extras(kg, db_url):
+def test_recall_serves_the_fact_limit_and_no_extras(kg, db_url):
     ep = _ep(kg)
     limit = recall_mod._FACT_LIMIT
-    for i in range(limit * 3 // 4):  # each value alone is short of the limit, both pass it
-        _fact(kg, f"t{i}", TECH, f"widget tech {i}", ep, emb=0)
-        _fact(kg, f"p{i}", PERS, f"widget personal {i}", ep, emb=0)
+    for i in range(limit * 3 // 2):
+        _fact(kg, f"f{i}", f"widget {i}", ep, emb=0)
     metrics: list[dict[str, Any]] = []
     out = _engine(db_url, metrics=metrics).recall("widget", trust=FULL_TRUST)
     assert len(out["facts"]) == limit
     assert len(metrics[0]["served_ids"]["facts"]) == limit
-    # both values are in it, not one value's full list with the other's after
-    assert {u[0] for u in _served(out)} == {"t", "p"}
 
 
-def test_a_recall_makes_one_fact_floor_request_over_both_values(kg, db_url, monkeypatch):
+def test_a_recall_makes_one_fact_floor_request_over_every_leg(kg, db_url, monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
     ep = _ep(kg)
-    _entity(kg, "seed-t", TECH, "Seed Tech", 0)
-    _fact(kg, "v-t", TECH, "alpha tech", ep, emb=0)
-    _fact(kg, "b-t", TECH, "widget tech", ep)
-    _fact(kg, "h-t", TECH, "epsilon tech", ep, src="seed-t")
-    _fact(kg, "v-p", PERS, "alpha personal", ep, emb=0)
-    _fact(kg, "b-p", PERS, "widget personal", ep)
+    _entity(kg, "seed", "Seed", 0)
+    _fact(kg, "v1", "alpha one", ep, emb=0)
+    _fact(kg, "b1", "widget one", ep)
+    _fact(kg, "h1", "epsilon one", ep, src="seed")
+    _fact(kg, "v2", "alpha two", ep, emb=0)
+    _fact(kg, "b2", "widget two", ep)
     r = _engine(db_url)
-    scores = {"alpha tech": 0.9, "widget tech": 0.9, "epsilon tech": 0.9}
-    r._reranker = _Rerank(scores | {"alpha personal": 0.9, "widget personal": 0.1})
+    scores = {"alpha one": 0.9, "widget one": 0.9, "epsilon one": 0.9, "alpha two": 0.9}
+    r._reranker = _Rerank(scores | {"widget two": 0.1})
     out = r.recall("widget", trust=FULL_TRUST)
     assert len(r._reranker.calls) == 1
-    assert sorted(r._reranker.calls[0]) == sorted(
-        ["alpha tech", "widget tech", "epsilon tech", "alpha personal", "widget personal"]
-    )
-    assert _served(out) == {"v-t", "b-t", "h-t", "v-p"}, "the sub-floor personal-pile fact drops"
+    assert sorted(r._reranker.calls[0]) == sorted([*scores, "widget two"])
+    assert _served(out) == {"v1", "b1", "h1", "v2"}, "the sub-floor fact drops"
 
 
-def test_the_retrieval_count_bump_reaches_both_values(kg, db_url):
+def test_the_retrieval_count_bump_reaches_every_served_fact(kg, db_url):
     _seed_legs(kg)
     out = _engine(db_url, bump=True).recall("widget", trust=FULL_TRUST)
     assert _served(out) == _EVERY
@@ -244,21 +221,18 @@ def test_the_retrieval_count_bump_reaches_both_values(kg, db_url):
 
 
 # ---------------------------------------------------------------------------
-# Superseded pairs, the supersession surface and the overlay link across values
+# Superseded pairs, the supersession surface and the overlay
 # ---------------------------------------------------------------------------
 
 
-def _supersession(
-    conn, now_group: str, old_group: str, *, now_audience: str | None, old_audience: str | None
-) -> int:
-    """A live fact and the retired one it superseded, in the given legacy values; returns
-    the episode that cites the retired one. The live fact has no embedding and its text
-    misses "widget", so a search for "widget" reaches it only through the retired one."""
+def _supersession(conn, *, now_audience: str | None, old_audience: str | None) -> int:
+    """A live fact and the retired one it superseded; returns the episode that cites the
+    retired one. The live fact has no embedding and its text misses "widget", so a search for
+    "widget" reaches it only through the retired one."""
     ep = _ep(conn)
     _fact(
         conn,
         "now",
-        now_group,
         "gadget runs on postgres",
         ep,
         src="s",
@@ -268,7 +242,6 @@ def _supersession(
     _fact(
         conn,
         "old",
-        old_group,
         "widget runs on sqlite",
         ep,
         emb=0,
@@ -288,11 +261,8 @@ def _extras(r: Recall, ep: int, **scope: Any) -> tuple[list[str], set[str], dict
     return [p["id"] for p in pairs], _uuids(surface), overlay
 
 
-@pytest.mark.parametrize(("now_group", "old_group"), [(a, b) for a in LEGACY for b in LEGACY])
-def test_full_trust_pairs_surface_and_overlay_ignore_the_legacy_value(
-    kg, db_url, now_group, old_group
-):
-    ep = _supersession(kg, now_group, old_group, now_audience="personal", old_audience="personal")
+def test_full_trust_pairs_surface_and_overlay_serve_a_personal_pair(kg, db_url):
+    ep = _supersession(kg, now_audience="personal", old_audience="personal")
     pairs, surface, overlay = _extras(Recall(db_url, ""), ep)
     assert pairs == ["f:old"]
     assert surface == {"now"}
@@ -301,26 +271,25 @@ def test_full_trust_pairs_surface_and_overlay_ignore_the_legacy_value(
 
 def test_a_successor_repeating_a_served_fact_text_is_served_once(kg, db_url):
     """The ranked list serves a text once however many rows carry it. The same sentence is
-    live in both legacy values here: one is reached by the ranked list, the other as the
-    successor of a retired fact, and the surface must not serve it a second time."""
+    live on two pairs here: one is reached by the ranked list, the other as the successor of
+    a retired fact, and the surface must not serve it a second time."""
     ep = _ep(kg)
-    _fact(kg, "live-t", TECH, "widget runs on postgres", ep, emb=0, src="s1", tgt="t1")
-    _fact(kg, "live-p", PERS, "widget runs on postgres", ep, src="s2", tgt="t2")
+    _fact(kg, "live-1", "widget runs on postgres", ep, emb=0, src="s1", tgt="t1")
+    _fact(kg, "live-2", "widget runs on postgres", ep, src="s2", tgt="t2")
     _fact(
         kg,
-        "old-p",
-        PERS,
+        "old-2",
         "widget runs on sqlite",
         ep,
         emb=0,
         src="s2",
         tgt="t2",
         t_invalid=_INVALID,
-        invalidated_by="live-p",
+        invalidated_by="live-2",
     )
     out = _engine(db_url).recall("widget", trust=FULL_TRUST)
     assert [f["fact"] for f in out["facts"]] == ["widget runs on postgres"]
-    assert _served(out) == {"live-t"}
+    assert _served(out) == {"live-1"}
 
 
 def test_successors_repeating_each_other_take_one_surface_slot(kg, db_url):
@@ -332,11 +301,10 @@ def test_successors_repeating_each_other_take_one_surface_slot(kg, db_url):
     for i, text in enumerate(texts):
         # nearer the query for a smaller i, all inside the surface's distance gate
         w = 1.0 - 0.05 * i
-        _fact(kg, f"now-{i}", LEGACY[i % 2], text, ep, src=f"s{i}", tgt="t")
+        _fact(kg, f"now-{i}", text, ep, src=f"s{i}", tgt="t")
         _fact(
             kg,
             f"old-{i}",
-            LEGACY[i % 2],
             f"widget {i} runs on sqlite",
             ep,
             src=f"s{i}",
@@ -355,16 +323,14 @@ def test_successors_repeating_each_other_take_one_surface_slot(kg, db_url):
 
 
 def _many_retired(conn, ep: int, n: int, personal_from: int | None = None) -> None:
-    """``n`` retired facts citing one episode, each with its live successor, alternating
-    between the legacy values. Retired in index order, the oldest first, so reading the rows in
-    storage order keeps the wrong ones. From ``personal_from`` on, both sides are personal."""
+    """``n`` retired facts citing one episode, each with its live successor. Retired in index
+    order, the oldest first, so reading the rows in storage order keeps the wrong ones. From
+    ``personal_from`` on, both sides are personal."""
     for i in range(n):
         audience = "personal" if personal_from is not None and i >= personal_from else "work-safe"
-        group = LEGACY[i % 2]
         _fact(
             conn,
             f"now-{i}",
-            group,
             f"gadget {i} runs on postgres",
             ep,
             src=f"s{i}",
@@ -373,7 +339,6 @@ def _many_retired(conn, ep: int, n: int, personal_from: int | None = None) -> No
         _fact(
             conn,
             f"old-{i}",
-            group,
             f"widget {i} runs on sqlite",
             ep,
             src=f"s{i}",
@@ -391,8 +356,8 @@ def _gadgets(*indexes: int) -> list[str]:
 def test_the_overlay_keeps_the_most_recently_retired_links_under_its_limit(
     kg, db_url, with_served_text
 ):
-    """More facts cite the episode than the lookup fetches, in both legacy values: the rows
-    that survive the fetch limit are the most recently retired, not whichever the plan reads."""
+    """More facts cite the episode than the lookup fetches: the rows that survive the fetch
+    limit are the most recently retired, not whichever the plan reads."""
     ep = _ep(kg)
     cap = 2
     n = cap * (4 if with_served_text else 1) + 4
@@ -422,26 +387,25 @@ def test_a_restricted_overlay_keeps_the_most_recent_links_that_pass_the_label_ru
 # ---------------------------------------------------------------------------
 
 
-def test_restricted_search_serves_no_personal_fact_from_either_value_on_any_leg(kg, db_url):
+def test_restricted_search_serves_no_personal_fact_on_any_leg(kg, db_url):
     _seed_legs(kg)
     facts, seeds = Recall(db_url, "")._search_kg(
         "widget", onehot(0), [], 40, allowed_projects=[WORK]
     )
-    assert _uuids(facts) == _SAFE, "vector, BM25 and hop: the work-safe facts of both values only"
+    assert _uuids(facts) == _SAFE, "vector, BM25 and hop: the work-safe facts only"
     assert seeds == [], "no seed entity: its name and summary come from all its facts"
     # the same rows are all there for full trust, so the filter is what removed them
     full, full_seeds = Recall(db_url, "")._search_kg("widget", onehot(0), [], 40)
     assert _uuids(full) == _EVERY
-    assert {s["uuid"] for s in full_seeds} == {f"seed-{g}" for g in LEGACY}
+    assert {s["uuid"] for s in full_seeds} == {"seed"}
 
 
-def test_a_restricted_recall_serves_no_personal_fact_from_either_value(kg, db_url):
+def test_a_restricted_recall_serves_no_personal_fact(kg, db_url):
     _seed_legs(kg)
     r = _engine(db_url)
     assert _served(r.recall("widget", trust=_RESTRICTED)) == _SAFE
 
 
-@pytest.mark.parametrize(("now_group", "old_group"), [(TECH, PERS), (PERS, TECH)])
 @pytest.mark.parametrize(
     ("now_audience", "old_audience", "served"),
     [
@@ -452,11 +416,9 @@ def test_a_restricted_recall_serves_no_personal_fact_from_either_value(kg, db_ur
     ],
 )
 def test_a_restricted_pair_surface_and_overlay_need_both_sides_work_safe(
-    kg, db_url, now_group, old_group, now_audience, old_audience, served
+    kg, db_url, now_audience, old_audience, served
 ):
-    ep = _supersession(
-        kg, now_group, old_group, now_audience=now_audience, old_audience=old_audience
-    )
+    ep = _supersession(kg, now_audience=now_audience, old_audience=old_audience)
     pairs, surface, overlay = _extras(Recall(db_url, ""), ep, allowed_projects=[WORK])
     if served:
         assert pairs == ["f:old"]
@@ -472,7 +434,7 @@ def test_a_restricted_recall_is_pulled_no_successor_of_a_personal_fact(
 ):
     """End to end: the successor is reachable only through the supersession surface, and the
     surface needs the retired fact to pass the label rule too. Both rows are inside the
-    allowlist and in different legacy values, so only the label decides."""
-    _supersession(kg, TECH, PERS, now_audience="work-safe", old_audience=old_audience)
+    allowlist, so only the label decides."""
+    _supersession(kg, now_audience="work-safe", old_audience=old_audience)
     assert _served(_engine(db_url).recall("widget", trust=_RESTRICTED)) == served
     assert _served(_engine(db_url).recall("widget", trust=FULL_TRUST)) == {"now"}

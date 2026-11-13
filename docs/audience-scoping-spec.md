@@ -88,8 +88,8 @@ serving rule reads it (the dashboard's Timeline page filters on it, as an operat
 ### 2b. Knowledge-graph facts: one memory, a label on each fact
 
 The knowledge graph is one memory per owner. No graph partition is a trust boundary, and no
-serving path reads the `group_id` column (schema 067 merged the former personal and
-technical groups). What a restricted surface may be served is decided per fact by two
+`group_id` column is left to read (schema 067 merged the former personal and technical
+groups, and 069 dropped the column). What a restricted surface may be served is decided per fact by two
 things: the fact's provenance (below) and its audience label, `kg_relationships.audience`
 (schema 066), which uses the same two tiers as notes: `personal` or `work-safe`, NULL until
 labelled. A `personal` fact is never served on a restricted surface. A fact written after

@@ -24,7 +24,7 @@ from ingestion.kg_pg_read import KGPostgresReader
 from mcp_server import dashboard_routes, kg_pg
 from mcp_server.recall import Recall
 from mcp_server.recall_warnings import warn_sink
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 from tests.helpers.surfaces import clear_surfaces
 
 #: One per heap filter: the clause's SQL text is a string value under this key. Plans are
@@ -64,13 +64,12 @@ def corpus(conn):
     work, other = eps[1], eps[2]  # projects 'work' and 'other'
     for i in range(24):
         conn.execute(
-            "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-            "  fact, episodes, t_valid, t_invalid, audience) VALUES (%s, %s, %s, 'ent-x', "
+            "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
+            "  fact, episodes, t_valid, t_invalid, audience) VALUES (%s, %s, 'ent-x', "
             "  'ent-y', 'RELATES', %s, %s::jsonb, '2026-01-01T00:00:00+00:00', %s, %s)",
             (
                 f"f-{i}",
                 ["default", "default", "tenant2"][i % 3],
-                [GROUP, "personal"][i % 2],
                 "widget" + " cog" * i,
                 f"[{[work, work, work, work, other, work, other][i % 7]}"
                 + (f", {other}]" if i % 7 == 5 else "]"),
@@ -88,7 +87,7 @@ def corpus(conn):
                 "widget" + " tick" * i,
                 f"bm25-{uuid.uuid4().hex[:8]}",
                 ["p", "", None, "q"][i % 4],
-                [GROUP, "personal"][i % 2],
+                ["technical", "personal"][i % 2],
             ),
         )
     yield conn

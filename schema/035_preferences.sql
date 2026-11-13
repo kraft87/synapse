@@ -31,9 +31,18 @@ CREATE TABLE IF NOT EXISTS preferences (
 );
 
 -- Live-set lookup: the gate's dedup KNN and both serving paths only ever read live rows
--- for one owner/group, so the partial index over exactly that predicate keeps them fast.
-CREATE INDEX IF NOT EXISTS preferences_live_idx
-    ON preferences (owner_id, group_id) WHERE t_invalid IS NULL;
+-- for one owner, so the partial index over exactly that predicate keeps them fast.
+-- Built this way only while group_id is there: 069 drops the column and builds the index
+-- again on owner_id alone.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'preferences'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS preferences_live_idx
+            ON preferences (owner_id, group_id) WHERE t_invalid IS NULL;
+    END IF;
+END
+$$;
 
 -- Vector index DEFERRED, matching timeline_events (033): a single user accrues only dozens
 -- of live preferences, so a filtered seqscan is instant; 2048-dim also exceeds vector-type

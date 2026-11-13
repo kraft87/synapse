@@ -23,6 +23,15 @@ CREATE TABLE IF NOT EXISTS notes (
     source_ref    TEXT,
     CONSTRAINT notes_type_chk CHECK (type IN ('user','feedback','project','reference'))
 );
-CREATE INDEX IF NOT EXISTS notes_live_idx    ON notes (owner_id, group_id) WHERE superseded_by IS NULL;
+-- notes_live_idx is built this way only while group_id is there: 069 drops the column and
+-- builds the index again on owner_id alone.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'notes'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS notes_live_idx    ON notes (owner_id, group_id) WHERE superseded_by IS NULL;
+    END IF;
+END
+$$;
 CREATE INDEX IF NOT EXISTS notes_project_idx ON notes (project)            WHERE superseded_by IS NULL;
 -- Vector index deferred (dozens-hundreds of rows; filtered seqscan is instant — 033/035 precedent).

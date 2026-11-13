@@ -320,7 +320,7 @@ def test_flow_insert_new(monkeypatch):
     assert db.inserted[0]["pref"] == "User prefers dark mode"
     assert db.inserted[0]["polarity"] == "like"
     assert db.inserted[0]["source_ref"] == "ep:5"
-    assert "group_id" not in db.inserted[0]  # the column default decides
+    assert "group_id" not in db.inserted[0]  # the write names no group
     assert db.reasserted == [] and db.superseded == []
 
 

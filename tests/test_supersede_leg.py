@@ -11,7 +11,6 @@ from __future__ import annotations
 import uuid
 
 from mcp_server.recall import Recall
-from tests.helpers.embed import GROUP
 
 DIM = 2048
 
@@ -38,15 +37,15 @@ def _mix(i: int, j: int, wi: float) -> str:
 def _seed(conn) -> None:
     conn.execute("TRUNCATE kg_relationships RESTART IDENTITY CASCADE")
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
         "  fact_embedding, t_valid, t_invalid, invalidated_by) VALUES "
         # live successor N: about the same thing as P (cosine 0.9) but not on the query's axis
-        "('n-1', 'default', %(g)s, 'a', 'b', 'USES', 'Synapse uses Postgres now', %(vn)s, "
+        "('n-1', 'default', 'a', 'b', 'USES', 'Synapse uses Postgres now', %(vn)s, "
         "  '2026-06-10T00:00:00+00:00', NULL, NULL), "
         # superseded predecessor P — on axis(1); links to n-1 via invalidated_by
-        "('p-1', 'default', %(g)s, 'a', 'b', 'USES', 'Synapse uses FalkorDB', %(v1)s, "
+        "('p-1', 'default', 'a', 'b', 'USES', 'Synapse uses FalkorDB', %(v1)s, "
         "  '2026-05-01T00:00:00+00:00', '2026-06-10T00:00:00+00:00', 'n-1')",
-        {"g": GROUP, "vn": _mix(1, 0, 0.9), "v1": _axis(1)},
+        {"vn": _mix(1, 0, 0.9), "v1": _axis(1)},
     )
 
 
@@ -82,17 +81,16 @@ def _seed_pairs(conn) -> None:
     different predicate. Only the first two are genuine predecessors."""
     conn.execute("TRUNCATE kg_relationships RESTART IDENTITY CASCADE")
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
         "  t_valid, t_invalid, invalidated_by) VALUES "
-        "('a', 'default', %(g)s, 'a', 'b', 'CORRECTED', 'User corrected the assistant on 10-08', "
+        "('a', 'default', 'a', 'b', 'CORRECTED', 'User corrected the assistant on 10-08', "
         "  '2026-10-08T00:00:00+00:00', NULL, NULL), "
-        "('linked', 'default', %(g)s, 'a', 'b', 'TOLD', 'User told the assistant X (linked)', "
+        "('linked', 'default', 'a', 'b', 'TOLD', 'User told the assistant X (linked)', "
         "  '2026-09-01T00:00:00+00:00', '2026-10-08T00:00:00+00:00', 'a'), "
-        "('same-name', 'default', %(g)s, 'a', 'b', 'CORRECTED', 'User corrected the assistant on 09-08', "
+        "('same-name', 'default', 'a', 'b', 'CORRECTED', 'User corrected the assistant on 09-08', "
         "  '2026-09-08T00:00:00+00:00', '2026-09-09T00:00:00+00:00', NULL), "
-        "('unrelated', 'default', %(g)s, 'a', 'b', 'TOLD_TO_STOP', 'User told the assistant on 08-29 to stop X', "
-        "  '2026-08-29T00:00:00+00:00', '2026-08-29T00:00:00+00:00', NULL)",
-        {"g": GROUP},
+        "('unrelated', 'default', 'a', 'b', 'TOLD_TO_STOP', 'User told the assistant on 08-29 to stop X', "
+        "  '2026-08-29T00:00:00+00:00', '2026-08-29T00:00:00+00:00', NULL)"
     )
 
 
@@ -127,13 +125,13 @@ def _seed_far_link(conn) -> dict[str, int]:
         (f"far-link-{uuid.uuid4().hex[:10]}",),
     ).fetchone()[0]
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
         "  fact_embedding, episodes, t_valid, t_invalid, invalidated_by) VALUES "
-        "('n-far', 'default', %(g)s, 'c', 'd', 'R', 'An unrelated later fact', %(v5)s, NULL, "
+        "('n-far', 'default', 'c', 'd', 'R', 'An unrelated later fact', %(v5)s, NULL, "
         "  '2026-10-09T00:00:00+00:00', NULL, NULL), "
-        "('p-far', 'default', %(g)s, 'c', 'd', 'R', 'A fact wrongly judged contradicted', %(v1)s, "
+        "('p-far', 'default', 'c', 'd', 'R', 'A fact wrongly judged contradicted', %(v1)s, "
         "  %(eps)s::jsonb, '2026-09-01T00:00:00+00:00', '2026-10-09T00:00:00+00:00', 'n-far')",
-        {"g": GROUP, "v1": _axis(1), "v5": _axis(5), "eps": f"[{eid}]"},
+        {"v1": _axis(1), "v5": _axis(5), "eps": f"[{eid}]"},
     )
     return {"episode": eid}
 

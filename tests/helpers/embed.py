@@ -1,12 +1,10 @@
-"""Shared embedding test scaffolding: a deterministic one-hot vector builder and
-the default test group id, used across the notes / preferences / KG DB-backed
-tests to assert KNN ordering without a real embedder."""
+"""Shared embedding test scaffolding: a deterministic one-hot vector builder, used across
+the notes / preferences / KG DB-backed tests to assert KNN ordering without a real
+embedder."""
 
 from __future__ import annotations
 
 from ingestion.embedding import embed_dims
-
-GROUP = "technical"
 
 _DIMS = embed_dims()
 

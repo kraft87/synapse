@@ -24,7 +24,7 @@ import psycopg
 import pytest
 
 from mcp_server import kg_pg
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 
 WORK = "work-proj"
 ELSEWHERE = "elsewhere-proj"
@@ -60,9 +60,9 @@ def _ep(conn, project: str) -> int:
 def _seed_entity(conn) -> None:
     """The entity step 3 picks: its embedding is the query, and it has live edges."""
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, summary, "
-        "  embedding) VALUES (%s, 'default', %s, 'Supernode', 'supernode', 's', %s::vector)",
-        (SEED, GROUP, kg_pg._vec_literal(onehot(0))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, summary, embedding) "
+        "VALUES (%s, 'default', 'Supernode', 'supernode', 's', %s::vector)",
+        (SEED, kg_pg._vec_literal(onehot(0))),
     )
 
 
@@ -87,11 +87,11 @@ def _edge(
         vec = kg_pg._vec_literal(v)
     src, tgt = (SEED, f"far-{uid}") if seed_is_src else (f"far-{uid}", SEED)
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
         "  fact, fact_embedding, episodes, t_valid, audience) "
-        "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
+        "VALUES (%s, 'default', %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
         "        '2026-01-01T00:00:00+00:00'::timestamptz + make_interval(days => %s), %s)",
-        (uid, GROUP, src, tgt, f"fact {uid}", vec, f"[{ep}]", day, audience),
+        (uid, src, tgt, f"fact {uid}", vec, f"[{ep}]", day, audience),
     )
 
 
