@@ -526,6 +526,23 @@ def test_a_private_session_sends_nothing_and_keeps_its_turns(plugin, server, tmp
     assert _users(body["records"]) == ["question 1", "question 2"]
 
 
+def test_the_provider_does_not_drain_what_went_private_while_it_waited(plugin, server, tmp_path):
+    """An upload that failed waits in the outbox; its session is then taken off the
+    record. The provider's drain drops it instead of sending it."""
+    home = tmp_path / "hermes-a"
+    provider = _start(_new(plugin), home)
+    server.ingest_status = 503
+    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(1))
+    outbox = Outbox(home / "synapse" / "outbox")
+    assert outbox.pending() == 1 and len(server.posts()) == 1
+    marker = tmp_path / "private" / _SID
+    marker.parent.mkdir(parents=True)
+    marker.write_text("", encoding="utf-8")
+    server.ingest_status = 200
+    provider._drain(5.0)
+    assert len(server.posts()) == 1 and outbox.pending() == 0
+
+
 def test_compression_and_session_end_upload_what_is_left(plugin, server, tmp_path):
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     assert provider.on_pre_compress(_conversation(2)) == ""

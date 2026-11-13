@@ -25,7 +25,10 @@ changed, what to do on each machine, what was proven, and what is still open.
   upload: no cursor moves, nothing is marked pending, no warning streak starts.
 - **`synapse-import` skips private sessions**, by the transcript's file name and by its
   records, prints `skipped (private session)` for each, and no longer exits nonzero when
-  the only files it did not import were private ones.
+  the only files it did not import were private ones. It reads the whole file before the
+  first batch goes, so a file is imported whole or not at all. A file skipped because a
+  marker could not be read is counted apart (`not imported: a private marker could not be
+  read`), and an import that sent nothing for that reason exits 1.
 - **One uploader in the core** (`plugin/synapse_client/upload.py`). `Uploader.send` queues
   a body ahead of its request, sends it, and removes it or keeps it as waiting; it answers
   sent, queued, lost or private. `TurnUploader` uploads a conversation's finished turns
@@ -35,8 +38,12 @@ changed, what to do on each machine, what was proven, and what is still open.
   records to `TurnUploader` and gets the check, the queue and the retry with them.
 - **A drain no longer sends what went private while it waited.** A queued upload whose
   session was taken off the record afterwards is dropped by the next drain (the server
-  would refuse it anyway). One whose marker cannot be read stays queued, unsent. The
-  drain goes on to the rest in both cases.
+  would refuse it anyway). One whose marker cannot be read stays queued, unsent, with a
+  log line, and does not count toward the 20 uploads a drain handles. The drain goes on
+  to the rest in both cases.
+- **Hermes: an upload that is lost is a warning again.** A batch that failed and could
+  not be queued either is the one thing nothing sends again; its line is logged at
+  WARNING (`could not queue a failed upload (...); it is lost`).
 - **Hermes: a session is no longer skipped because another one started at the same
   moment.** The marks lookup (`harnesses/hermes/marks.py`) asked "is anything there?"
   and then "is it a broken link?" as two steps. When another session of the same home
@@ -68,12 +75,23 @@ changed, what to do on each machine, what was proven, and what is still open.
 - The marks race: a test that creates the folder between the two looks fails on the old
   code and passes on the new. The concurrency test that failed 1 run in 12 on main passed
   40 of 40 with the fix.
+- An independent review of the change found no path by which a private session's turns
+  leave. Its follow-ups are in: the whole-file check in the import, the import's exit
+  code, the drain's count, and tests that fail when each of these is taken out (a
+  transcript marked between two of its requests keeps its cursor and resumes; a turn
+  refused at the request is sent once the session is back on the record; the Hermes
+  provider's drain goes through the check).
 
 **Still open**
 
 - Claude Code's and Codex's Stop hooks still have their own shippers (cursor files, the
   catch-up sweep). They run the shared check; they do not use `Uploader` yet.
 - The private-mode toggle is still one script per harness, and Hermes has none.
+- Hermes: a conversation that goes on under a new session id (a compression, `/branch`)
+  is not private because the id it left was. No Hermes session can be private without a
+  hand-made marker today; this has to be closed before Hermes gets a toggle.
+- Hermes: while a session's marker cannot be read, its turns are neither sent nor
+  queued, and are lost if the process exits first. One log line per attempt says so.
 
 ## 2026-11-12 — hermes: the provider works on `hermes chat`, for the owner only; failed turns and exits no longer corrupt or lose uploads (plugin 0.24.7)
 

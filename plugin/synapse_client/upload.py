@@ -37,19 +37,27 @@ Log = Callable[[str], None]
 
 class Uploader:
     """Uploads through ``client``, with ``outbox`` behind it (None: a failed upload is
-    lost). ``log`` receives a line for each upload that failed or was refused."""
+    lost). ``log`` receives a line for each upload that failed or was refused; ``warn``
+    (default: ``log``) the line for one that is lost, which nothing will send again."""
 
     def __init__(
-        self, client: Client, outbox: Outbox | None = None, *, log: Log | None = None
+        self,
+        client: Client,
+        outbox: Outbox | None = None,
+        *,
+        log: Log | None = None,
+        warn: Log | None = None,
     ) -> None:
         self.client = client
         self.outbox = outbox
         self._log = log
+        self._warn = warn or log
 
-    def _say(self, line: str) -> None:
-        if self._log is not None:
+    def _say(self, line: str, to: Log | None = None) -> None:
+        log = to or self._log
+        if log is not None:
             try:
-                self._log(line)
+                log(line)
             except Exception:
                 pass
 
@@ -110,7 +118,11 @@ class Uploader:
         try:
             self.outbox.put(payload, reason=reason)
         except (OSError, TypeError, ValueError) as err:
-            self._say(f"synapse: could not queue a failed upload ({type(err).__name__})")
+            self._say(
+                f"synapse: could not queue a failed upload ({type(err).__name__}: "
+                f"{str(err)[:160]}); it is lost",
+                self._warn,
+            )
             return LOST
         return QUEUED
 
@@ -125,7 +137,7 @@ class Uploader:
             if not isinstance(payload, Mapping):
                 raise Skip("not an ingest body", drop=True)
             try:
-                self.client.ingest(payload, timeout=timeout)
+                self.client.ingest(payload, timeout=timeout, log=self._log)
             except private.PrivateSession as refused:
                 if refused.sure:
                     raise Skip("its session is in private mode", drop=True) from None

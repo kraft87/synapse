@@ -184,14 +184,17 @@ def ship_file(path: Path, batch_size: int) -> int:
     genuinely-new turns the server ingested (dedup silently skips the rest).
 
     RAISES private.PrivateSession, with nothing sent, for the transcript of a session in
-    private mode: the file's name is its session id, as in the Stop hook. A batch whose
-    records name another such session is refused by the sender itself."""
-    state = private.state(ingest_hook._private_settings(), path.stem, ingest_hook._log)
+    private mode: the file's name is its session id, as in the Stop hook, and so is the
+    ``sessionId`` of any record in it. The whole file is looked at before its first batch
+    goes, so a file is imported whole or not at all."""
+    settings = ingest_hook._private_settings()
+    state = private.state(settings, path.stem, ingest_hook._log)
     if state != private.OPEN:
         raise private.PrivateSession(path.stem, sure=state == private.PRIVATE)
     with open(path, "rb") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
     records = ingest_hook._parse_lines(raw_lines)
+    private.check_payload(settings, {"records": records}, (), ingest_hook._log)
     ingested = 0
     for batch in batches(records, batch_size):
         reply = ingest_hook._post_records(batch, source="import")
@@ -268,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted — nothing was sent.")
             return 1
 
-    ok = failed = skipped = ingested_total = 0
+    ok = failed = skipped = unsure = ingested_total = 0
     for i, path in enumerate(files, 1):
         try:
             rel: object = path.relative_to(projects_dir)
@@ -277,8 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             n = ship_file(path, args.batch_size)
         except private.PrivateSession as refused:
-            skipped += 1
-            why = "private session" if refused.sure else "its private marker cannot be read"
+            if refused.sure:
+                skipped += 1
+                why = "private session"
+            else:
+                unsure += 1
+                why = "its private marker cannot be read"
             print(f"[{i}/{len(files)}] {rel} → skipped ({why})", flush=True)
             continue
         except Exception as e:
@@ -296,9 +303,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Done: {ingested_total} new turn(s) ingested from {ok}/{len(files)} file(s).")
     if skipped:
         print(f"{skipped} file(s) skipped: private mode keeps their sessions on this machine.")
+    if unsure:
+        print(
+            f"{unsure} file(s) not imported: a private marker could not be read "
+            f"({ingest_hook.PRIVATE_DIR}), so nothing was sent for them. Re-run once it can be."
+        )
     if failed:
         print(f"{failed} file(s) failed — re-run to retry; already-ingested turns are skipped.")
-    return 1 if failed and ok == 0 else 0
+    return 1 if (failed or unsure) and ok == 0 else 0
 
 
 if __name__ == "__main__":
