@@ -1145,6 +1145,25 @@ def test_a_held_session_is_carried_on_to_the_next(tmp_path, monkeypatch):
     ]
 
 
+def test_private_here_is_what_this_machine_knows_and_not_an_open_question(tmp_path, monkeypatch):
+    """A marker says a session is private, and so does the uploader for one it holds as
+    private with no marker. One that only waits for the server's answer is refused
+    meanwhile but not known to be private; its own marker still says it is."""
+    client, _ = _client(tmp_path)
+    up = upload.Uploader(client)
+    _mark(tmp_path, "s-marked")
+    assert up.private_here("s-marked") and not up.private_here("s-on")
+    assert up.carry_private(["s-gone"], "s-asking") is False  # the server is to be asked
+    assert up.asking("s-asking") and up.is_private("s-asking")
+    assert not up.private_here("s-asking")
+    marker = _mark(tmp_path, "s-asking")  # `synapse private on`, for the session itself
+    assert up.private_here("s-asking")
+    marker.unlink()
+    _no_marker_written(monkeypatch)
+    assert up.carry_private(["s-marked"], "s-held") is True
+    assert up.private_here("s-held") and not (tmp_path / "private" / "s-held").exists()
+
+
 def test_a_session_id_no_marker_can_be_named_by_is_held(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)

@@ -108,6 +108,14 @@ class Uploader:
         with self._holding:
             return session_id in self._asking
 
+    def private_here(self, session_id: str) -> bool:
+        """Whether ``session_id`` is known on this machine to be private: by its marker
+        (private.is_private), or held here as such by ``carry_private``. One held only
+        until the server has answered (``asking``) is not, by that alone."""
+        return self._held(session_id, asking=False) or private.is_private(
+            self.client.settings, session_id, self._log
+        )
+
     def _private_here(self, session_id: str, lines: list[str]) -> bool:
         """Whether ``session_id`` is known on this machine to be private: held here as
         such, or by its marker (one that cannot be read counts). Called with
