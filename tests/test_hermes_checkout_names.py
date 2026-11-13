@@ -87,8 +87,6 @@ _DRIVER = textwrap.dedent(
                             'reset=True, reason="new_session")'),
     }
     forks = _non_continuation_child_sql("c.", "?")
-    tui = Path("tui_gateway/methods_session_branch.py").read_text(encoding="utf-8")
-    tui = tui[tui.index("def _branch_live("):]
     print("RESULT " + json.dumps({
         "fork_keys": sorted(set(re.findall(r"[$][.](_[a-z_]+)", forks))),
         "fork_keys_name_the_parent": forks.count("!= ?"),
@@ -96,7 +94,6 @@ _DRIVER = textwrap.dedent(
             "tui_gateway/methods_session.py",
             'db.create_session(new_key, source=source, model=model, '
             'model_config={"_branched_from": parent_key}, parent_session_id=parent_key,'),
-        "tui_branch_row_first": 0 < tui.find("_persist_branch(") < tui.find("_build_branch_agent("),
         "failed_kind": failures.FAILED_TURN_DISPLAY_KIND,
         "failed_notices": notices,
         "untyped": [failures.untyped_failed_turn_display_kind("assistant", n) for n in notices],
@@ -184,25 +181,30 @@ def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[
     assert names["origins"] == list(hl._ORIGINS)
 
 
-def test_this_hermes_tells_a_copy_from_another_conversation_the_way_the_rule_does(
+def test_this_hermes_knows_no_kind_of_child_the_rule_has_not_decided_on(
     names: dict[str, Any],
 ) -> None:
     """``lineage.continues`` decides from a row whether the session holds its parent's
     turns, and so whether it is private with it: a branch and a compressed continuation
-    do, a reset and a subagent do not. Hermes's own list of the keys that make a child
-    something other than a continuation, each read only when it names the parent: a new
-    key there is a new kind of child, and someone has to say whether it carries turns."""
+    do, a reset and a subagent do not. That is not Hermes's rule, which asks whether a
+    child is the same session going on and turns a branch away. What is read here is
+    Hermes's list of the keys that mark a child as something else, each counted only
+    when it names the parent: every key on it is one ``continues`` has decided on, and a
+    new key there is a new kind of child someone has to decide on. Hermes's list also
+    turns away a child whose ``source`` is ``tool``, which ``continues`` does not read."""
     assert names["fork_keys"] == sorted({"_branched_from", *hl._OWN_CONVERSATION})
     assert names["fork_keys_name_the_parent"] >= 3
 
 
-def test_this_hermes_writes_a_tui_branchs_row_before_it_builds_its_agent(
+def test_this_hermes_writes_a_tui_branchs_row_with_the_link_the_rule_reads(
     names: dict[str, Any],
 ) -> None:
     """The TUI and Desktop build a new agent for a branch and announce no switch: the
-    row, written first with the parent link and ``_branched_from``, is all the provider
-    has to know the session holds a private parent's turns. By the source text."""
-    assert names["tui_branch_row"] == 1 and names["tui_branch_row_first"] is True
+    row, with the parent link and ``_branched_from``, is all the provider has to know
+    the session holds a private parent's turns. When the row is written is not read:
+    the provider looks at it again at each upload until it names a parent. By the
+    source text of the one call that writes it."""
+    assert names["tui_branch_row"] == 1
 
 
 def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(

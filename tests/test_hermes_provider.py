@@ -669,18 +669,21 @@ def test_another_conversation_does_not_inherit_private_mode(plugin, server, tmp_
 
 def test_turns_spoken_off_the_record_are_not_looked_back_at(plugin, server, tmp_path):
     """The new id's marker goes (`private off`, or its twelve hours): what was said
-    before stays unsent, where any other switch looks back LOOKBACK turns."""
+    before stays unsent, where any other switch looks back LOOKBACK turns. The turn that
+    ends next is the first on the record, and goes up without the one before it."""
     provider = _start(_new(plugin), tmp_path / "hermes-a")
     _private(tmp_path, _SID)
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
     provider.sync_turn("q", "a", messages=_conversation(2))
     (tmp_path / "private" / _NEXT).unlink()
     provider.sync_turn("q", "a", messages=_conversation(3))
-    assert server.posts() == []
-    provider.sync_turn("q", "a", messages=_conversation(4))
     (body,) = server.posts()
-    assert body["session_id"] == _NEXT
-    assert _users(body["records"]) == ["question 3", "question 4"]
+    assert body["session_id"] == _NEXT and _users(body["records"]) == ["question 3"]
+    provider.sync_turn("q", "a", messages=_conversation(4))
+    assert [_users(body["records"]) for body in server.posts()] == [
+        ["question 3"],
+        ["question 3", "question 4"],
+    ]
 
 
 def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tmp_path):
@@ -696,7 +699,11 @@ def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tm
     server.private_status = 200
     told = len(server.puts())
     provider.sync_turn("q", "a", messages=_conversation(2))
-    assert len(server.puts()) == told + 1 and server.posts() == []
+    assert len(server.puts()) == told + 1
+    # The server has the row now and the marker is gone: the session is as private as
+    # one `on` and then `off` were run for. Its turns are sent, and the server drops
+    # them. The turn from before the row is not sent.
+    assert [_users(body["records"]) for body in server.posts()] == [["question 2"]]
     provider.sync_turn("q", "a", messages=_conversation(3))
     assert len(server.puts()) == told + 1  # told once: not asked again
 
@@ -714,10 +721,12 @@ def test_with_no_marker_the_server_says_whether_the_new_id_is_private(
     provider.sync_turn("q", "a", messages=_conversation(3))
     assert server.asked() == [_SID] and server.puts() == [f"/private-sessions/{_NEXT}"]
     assert server.posts() == [] and (tmp_path / "private" / _NEXT).is_file()
-    # What was said before the answer is not looked back at once the marker goes.
+    # What was said before the answer is not looked back at once the marker goes, and
+    # is not sent beside the next turn either.
     (tmp_path / "private" / _NEXT).unlink()
-    provider.sync_turn("q", "a", messages=_conversation(3))
-    assert server.posts() == [] and server.asked() == [_SID]
+    provider.sync_turn("q", "a", messages=_conversation(4))
+    assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
+    assert server.asked() == [_SID]
 
 
 def test_a_second_new_id_is_private_after_the_first_ones_marker_is_gone(plugin, server, tmp_path):
@@ -755,7 +764,9 @@ def test_no_answer_about_the_new_id_holds_its_turns_back(plugin, server, tmp_pat
     provider.on_pre_compress(_conversation(1))
     assert server.posts() == [] and Outbox(home / "synapse" / "outbox").pending() == 0
     server.private_status = 200
-    provider.sync_turn("q", "a", messages=_conversation(2))
+    # The compression that was due took turn 1 out of the conversation: it was kept.
+    system, *_, question, answer = _conversation(2)
+    provider.sync_turn("q", "a", messages=[system, question, answer])
     (body,) = server.posts()
     assert _users(body["records"]) == ["question 1", "question 2"]
 

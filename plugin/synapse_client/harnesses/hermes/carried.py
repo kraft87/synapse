@@ -24,7 +24,10 @@ import hashlib
 import os
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ...upload import Uploader
 
 _DIR = ("synapse", "settled")
 
@@ -71,3 +74,18 @@ def settle(home: Any, session_id: str) -> None:
         os.close(os.open(_file(home, session_id), os.O_WRONLY | os.O_CREAT, 0o600))
     except (OSError, ValueError):
         return
+
+
+def carry(
+    uploader: Uploader, home: Any, earlier: Iterable[Any], session_id: Any, timeout: float | None
+) -> bool:
+    """Whether ``session_id`` is off the record because a session of ``earlier``, whose
+    turns it holds, is (Uploader.carry_private). With no marker to say so the server is
+    asked at the session's first upload, and the answer is False for now. Once per
+    session of ``home``: a settled one is left as it is. With ``timeout`` None no request
+    is made here, and telling the server is left to the caller or that upload."""
+    sid = str(session_id or "")
+    ids = [str(one) for one in earlier if one]
+    if not sid or not ids or settled(home, sid):
+        return False
+    return uploader.carry_private(ids, sid, timeout=timeout, settled=lambda: settle(home, sid))
