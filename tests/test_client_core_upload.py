@@ -832,6 +832,27 @@ def test_a_session_carried_again_while_its_question_is_open_tells_every_caller(t
     assert up.settle_private("s-new") is True and first == [private] and last == [private]
 
 
+def test_a_session_carried_again_before_the_server_was_told_tells_every_caller_too(tmp_path):
+    """Made private by a marker, with the server still to be told: the question is
+    open, and a second carry's note is kept with the first. Both are called once the
+    server has the row. A carry after that has nothing left to wait for, and its
+    callback is not called: the session is left as it is."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    first: list[bool] = []
+    second: list[bool] = []
+    late: list[bool] = []
+    _mark(tmp_path, "s-old")
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=first.append) is True
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=second.append) is True
+    assert first == [] and second == [] and wire.requests == []
+    assert up.settle_private("s-new") is True
+    assert first == [True] and second == [True]
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=late.append) is True
+    assert up.settle_private("s-new") is True
+    assert late == [] and first == [True] and second == [True]
+
+
 def test_carrying_without_a_timeout_tells_the_server_at_the_next_upload(tmp_path):
     client, wire = _client(tmp_path)
     lines: list[str] = []

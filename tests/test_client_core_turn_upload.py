@@ -11,8 +11,9 @@ it was moved to, a late upload for the one it left. Pinned here:
     holds more than its own exchange, or was there before any turn start was seen;
   * an upload that ends no turn notes the turns it is shown and settles nothing more,
     and one that runs late is not taken for the end of another turn;
-  * a turn begun off the record is counted once however often its session is started,
-    and until its end is seen no flush sends a turn;
+  * a turn begun off the record is counted once however often its session is started
+    and through however many ids it or its session moves, and until its end is seen no
+    flush sends a turn;
   * a session said to be new is not believed when its turn starts show otherwise, and
     the harness is told (``copied``), so that it can say so later (``keep_out``);
   * an upload acts on the server's answer only when it got the answer itself
@@ -799,6 +800,34 @@ def test_a_third_start_does_not_count_again_what_the_first_took(tmp_path):
     assert _records(wire) == [_turn(3)]
 
 
+@pytest.mark.parametrize("switch", [True, False], ids=["a switch first", "its row alone"])
+@pytest.mark.parametrize("ends_under", ["s-1", "s-2"])
+def test_a_turn_begun_off_the_record_is_counted_once_across_two_moves(tmp_path, ends_under, switch):
+    """A session moves twice. The turn begun off the record under the first id ends
+    under the second, or is moved again and ends under the third. The third id is
+    started with the whole chain (Hermes: its row names every id before it), after a
+    start that named the second alone (the switch) or with none. The first id still
+    holds its own count, and the second took it: it is the same turn, counted once.
+    Its end takes the count, and the turn after it goes up."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-0", 0)
+    marker = _mark(tmp_path, "s-0")
+    turns.begin("s-0")  # turn 2, off the record
+    marker.unlink()
+    said = _turn(1) + _turn(2)
+    turns.start("s-1", 0, continues=["s-0"])
+    if ends_under == "s-1":
+        assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    if switch:
+        turns.start("s-2", 0, continues=["s-1"])
+    turns.start("s-2", 0, continues=["s-1", "s-0"])
+    if ends_under == "s-2":
+        assert turns.upload(said, "s-2", timeout=5, finished=True) is False
+    turns.begin("s-2")
+    assert turns.upload(said + _turn(3), "s-2", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3)]
+
+
 def test_a_flush_sends_no_new_turn_while_a_turn_begun_off_the_record_is_to_end(tmp_path):
     """Turn 4 began off the record and its rows are complete: its reply was cut short
     while it came in (Hermes keeps the part that came and sends no upload), or its
@@ -1043,6 +1072,22 @@ def test_the_id_left_is_named_with_the_one_the_doubt_went_on_to(tmp_path):
     assert found == ["s-2", "s-1"]
     copies = _turn(1) + _turn(2)
     assert turns.upload(copies, "s-1", timeout=5, finished=True) is False
+    assert wire.tries == 0
+
+
+def test_every_id_the_doubt_came_through_is_named(tmp_path):
+    """Two moves before the first turn start, each new id started with the one left
+    (no order of Hermes's calls is known that does it; nothing here counts on that).
+    The copies are found under the third id. The first holds them too and is still
+    said to be new here: it is named with the second, and closed."""
+    found: list[str] = []
+    turns, wire = _turns(tmp_path, begins=True, copied=found.append)
+    turns.start("s-1")
+    turns.start("s-2", 10, continues=["s-1"])
+    turns.start("s-3", 10, continues=["s-2"])
+    turns.begin("s-3", earlier=True)
+    assert found == ["s-3", "s-1", "s-2"]
+    assert turns.upload(_turn(1) + _turn(2), "s-1", timeout=5, finished=True) is False
     assert wire.tries == 0
 
 

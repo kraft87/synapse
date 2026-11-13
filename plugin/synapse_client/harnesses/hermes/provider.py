@@ -68,7 +68,7 @@ open another conversation: nothing is carried to it. Put back on the record (``s
 private off --forget``), such a session keeps the turns from before out, under any id it
 goes on with and in agents built for it later (carried.py's record), and uploads those
 an agent sees begin there (``on_turn_start``); so does one Hermes said was new, once its
-first turn start or upload shows it holds copies (an ACP fork's), which is recorded too.
+first turn start or upload shows it holds copies (an ACP fork: carried.noter records it).
 
 Compression
 -----------
@@ -246,7 +246,7 @@ class SynapseMemoryProvider(MemoryProvider):
             source="hermes-sync",
             lookback=LOOKBACK,
             begins=True,
-            copied=lambda found: carried.note_copied(home, found),
+            copied=carried.noter(home, kwargs.get("message_count")),
         )
         # Turns spoken off the record are not looked back at.
         lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
@@ -543,8 +543,8 @@ class SynapseMemoryProvider(MemoryProvider):
         its row says it holds turns of (``continues``) is, once per id and instance.
         ``initialize`` does this for the id it is given. This is for the others: a
         session resumed in place, one Hermes moved the agent to without a call, and a
-        row written after ``initialize``. Noted only once done: a carry that raises
-        leaves the id to be read again, and no upload goes past it."""
+        row written after ``initialize``. Noted only once done: a carry that raises, and
+        a row that names no session yet, leave the id to be read at the next upload."""
         uploader, turns = self._uploader, self._turns
         with self._lock:
             known = session_id in self._followed

@@ -336,7 +336,9 @@ whose message had no text (a picture alone) can go up with the fork's first turn
 an agent built for the fork before its first turn (the ACP adapter restarted) looks
 back ten turns. A session seeded with another's messages names none either, and
 is taken for a resumed one: up to ten of the copied turns are uploaded, whatever the
-session they came from was.
+session they came from was. A chat whose first message got no reply looks like a fork
+when you open it again: the agent built then does not upload that first exchange, and
+an agent Hermes builds for the chat later does.
 `synapse private off --forget <id>` puts a session back on the record with the turns
 spoken in it. A session that was private because of the one it continues keeps those
 turns out, and uploads the turns an agent sees begin on the record from then on. That
@@ -349,7 +351,11 @@ The first turn back is left out when Hermes added a row of its own to it (a nudg
 reply to a background-process notice), when its message had no text, or when Hermes
 folded the message into an earlier one that got no reply. A message cut short off the
 record that you retry on the record is uploaded by an agent built since, as the gateway
-builds one for `/retry`, and not by the agent that saw the message begin.
+builds one for `/retry`, and not by the agent that saw the message begin. For each
+reply you stopped while such a session was off the record, one turn after
+`off --forget` is not uploaded. A turn from off the record can still go up after
+`off --forget` in a few narrow orders, such as when the uploads of the two turns before
+it were both still waiting as it began (a server that hangs).
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

@@ -32,6 +32,13 @@ turns from off the record as far as anyone can tell (``carry``). It settles noth
 row that names a session later is still asked about, since that one may be private. And
 it stands whatever is settled: the copies stay out also when the answer is "no".
 
+Only an agent built while Hermes's store held no message of the session keeps it
+(``noter``): that is the fork, whose history is written after its agent. A session with
+messages at the build and no reply among them is said to be new too, and its first turn
+start names a message before: a chat whose first message got no reply, opened again.
+Those messages are its own. The uploader treats it as a fork all the same, in memory,
+and an agent built later looks back at its turns.
+
 Nothing here raises. A record that cannot be written or read leaves the session to be
 asked about again: it is private for as long as the session it came from is, and an
 agent built once that one is back on the record looks back at its turns, as does one
@@ -43,7 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -120,6 +127,15 @@ def note_copied(home: Any, session_id: str) -> None:
         os.close(os.open(_file(home, session_id, _COPIED), os.O_WRONLY | os.O_CREAT, 0o600))
     except (OSError, ValueError):
         return
+
+
+def noter(home: Any, stored: Any) -> Callable[[str], None] | None:
+    """What the uploader of an agent is to call with a session it finds to hold copies
+    (TurnUploader's ``copied``): ``note_copied``, and nothing when Hermes's store held
+    messages of the agent's session as it built the agent (``stored``, how many).
+    Messages that were there before the agent can be the session's own, so what is
+    found of it is not kept."""
+    return None if stored else lambda found: note_copied(home, found)
 
 
 def settle(home: Any, session_id: str, made: bool = False) -> None:

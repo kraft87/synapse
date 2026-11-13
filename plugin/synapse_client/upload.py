@@ -161,15 +161,18 @@ class Uploader:
         made private here and the server has its own row (True). It is the caller's
         note that the session need not be asked about again, and of how the question
         ended: a session made private this way holds turns spoken off the record, also
-        once it is back on it. A session carried again while its question is open has
-        each call's ``settled`` called. Not called when there was nothing to ask.
-        Never raises."""
+        once it is back on it. A session carried again while its question is open (the
+        server has not answered, or is still to be told) has each call's ``settled``
+        called. Not called when there was nothing to ask, nor for a session made
+        private here whose question closed before the call. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
         failed = ""
         lines: list[str] = []
         try:
             with self._holding:
                 if session_id in self._made:
+                    if settled is not None and session_id in self._owed:
+                        self._settled.setdefault(session_id, []).append(settled)
                     return self._private_here(session_id, lines)
                 # One look at the earlier ids. Between two, a settle on another thread
                 # could make one private and drop its question, and neither would be seen.

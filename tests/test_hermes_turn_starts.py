@@ -282,6 +282,86 @@ def test_a_fork_resumed_in_place_by_a_later_agent_keeps_the_copies_out(plugin, s
     assert _posted(server) == [(_FORK, ["question 4"]), (_FORK, ["question 5"])]
 
 
+def test_a_session_served_by_an_agent_per_turn_uploads_each_turn_as_before(
+    plugin, server, tmp_path
+):
+    """A gateway with ``gateway.managed_workers`` on builds an agent for every turn and
+    tells each the session is new. From its second turn such a session is taken for one
+    that holds copies, and that is kept on disk now. The agents after it go by the
+    record where they went by the turn start: each turn still goes up as it ends,
+    alone."""
+    home = tmp_path / "hermes-a"
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    for n in range(1, 5):
+        worker = _open(plugin, home, _PARENT, platform="tui", message_count=0)
+        _say(worker, _conversation(n), _PARENT)
+        assert pl.carried.copied(home, _PARENT) is (n > 1)
+    assert _posted(server) == [(_PARENT, [f"question {n}"]) for n in range(1, 5)]
+    assert server.puts() == []
+
+
+def _unanswered(plugin: Any, home: Path) -> tuple[Any, list[dict[str, Any]]]:
+    """A chat whose first message got no reply, opened again. The TUI stores a message
+    as it is sent (tui_gateway/session_workdir.py), so one whose turn never ran (the
+    agent could not be built, the app was quit) stays in the store. The agent built
+    for the next message is told the session is new: rows, and no reply among them
+    (agent/agent_init_memory_provider.py ``_stored_transcript_kwargs``). Its first
+    turn start names the message before, and Hermes folds the two into one row."""
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    provider = _open(plugin, home, _PARENT, resumed=False, message_count=2)
+    said = [_conversation(0)[0], *_folded(1)]
+    provider.on_turn_start(1, "question 2", previous_message="question 1")
+    provider.sync_turn("question 2", "answer 2", session_id=_PARENT, messages=said)
+    return provider, said
+
+
+def test_a_chat_whose_first_message_got_no_reply_is_not_recorded_as_holding_copies(
+    plugin, server, tmp_path
+):
+    """Its first turn start looks like a fork's, and this agent takes it for one: the
+    folded first turn stays out. But Hermes held rows for the session when it built
+    the agent, and a fork's are written after its agent: nothing is kept of it on
+    disk. The agent built next is told it resumes a session and looks back, at the
+    first turn and at one whose upload had not run."""
+    home = tmp_path / "hermes-a"
+    first, said = _unanswered(plugin, home)
+    assert server.posts() == [] and not (home / "synapse" / "copied").exists()
+    said = [*said, *_conversation(3)[-2:]]
+    _say(first, said, _PARENT)
+    assert _posted(server) == [(_PARENT, ["question 3"])]
+    said = [*said, *_conversation(4)[-2:]]
+    first.on_turn_start(3, "question 4", previous_message="question 3")  # no upload runs
+    later = _open(plugin, home, _PARENT, resumed=True, message_count=7)
+    _say(later, [*said, *_conversation(5)[-2:]], _PARENT)
+    both = ["question 1\n\nquestion 2", ""]  # the folded row, and the row that marks it
+    assert _posted(server)[1:] == [(_PARENT, [*both, *_questions(3, 5)])]
+    assert server.puts() == [] and not (home / "synapse" / "copied").exists()
+
+
+def test_a_session_that_goes_on_from_such_a_chat_is_looked_back_at(plugin, server, tmp_path):
+    """A compression moves the chat to a new id. Nothing was recorded of the chat, so
+    the new id is not recorded as one that holds turns from off the record, and the
+    agent built for it later looks back at its turns."""
+    home = tmp_path / "hermes-a"
+    provider, said = _unanswered(plugin, home)
+    said = [*said, *_conversation(3)[-2:]]
+    _say(provider, said, _PARENT)
+    third = pm._THIRD
+    _store(home, third, source="tui", receipt=False, chat_id="")
+    _link(home, third, _PARENT, None)
+    provider.on_pre_compress(said)
+    provider.on_session_switch(third, parent_session_id=_PARENT, reason="compression")
+    said = [*said, *_conversation(4)[-2:]]
+    _say(provider, said, third)
+    assert pl.carried.settled(home, third) and not pl.carried.held(home, third)
+    sent = len(server.posts())
+    provider.on_turn_start(4, "question 5", previous_message="question 4")  # no upload runs
+    later = _open(plugin, home, third, resumed=True, message_count=9)
+    _say(later, [*said, *_conversation(5)[-2:], *_conversation(6)[-2:]], third)
+    assert _posted(server)[sent:] == [(third, ["question 1\n\nquestion 2", "", *_questions(3, 6)])]
+    assert server.puts() == [] and not (tmp_path / "private").exists()
+
+
 # ---------------------------------------------------------------------------
 # The first turns after `synapse private off --forget`
 # ---------------------------------------------------------------------------
@@ -365,6 +445,41 @@ def test_a_turn_begun_off_the_record_is_counted_once_when_a_compression_moves_it
     _forget(server, tmp_path, third)
     _say(provider, _conversation(5), third)
     assert _posted(server) == [(third, ["question 5"])]
+
+
+@pytest.mark.parametrize("back", [False, True], ids=["still off the record", "back on it"])
+def test_a_turn_a_compression_moved_is_not_counted_again_at_the_next_compression(
+    plugin, server, tmp_path, back
+):
+    """The turn above ended under the id the compression moved it to, and the id it
+    began under keeps its count. Hermes compresses again: the switch names the id
+    left, and the new id's row names every id before it, the first too. That one's
+    count is the same turn, which the id in between took. The first turn on the
+    record under the new id goes up, whether the session was put back on the record
+    before the second compression or after it."""
+    provider = _carried(plugin, server, tmp_path)
+    home = tmp_path / "hermes-a"
+    third, new = pm._THIRD, pm._NEW
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    _store(home, third, source="tui", receipt=False, chat_id="")
+    _link(home, third, _CHILD, None)
+    provider.on_pre_compress(_conversation(4)[:-1])
+    provider.on_session_switch(third, parent_session_id=_CHILD, reason="compression")
+    provider.sync_turn("question 4", "a", session_id=third, messages=_conversation(4))
+    n = 4
+    if back:
+        _forget(server, tmp_path, third)
+        _say(provider, _conversation(5), third)
+        n = 5
+    _store(home, new, source="tui", receipt=False, chat_id="")
+    _link(home, new, third, None)
+    provider.on_pre_compress(_conversation(n))
+    provider.on_session_switch(new, parent_session_id=third, reason="compression")
+    if not back:
+        _forget(server, tmp_path, new)
+    _say(provider, _conversation(n + 1), new)
+    sent = [(third, ["question 5"])] if back else []
+    assert _posted(server) == [*sent, (new, [f"question {n + 1}"])]
 
 
 @pytest.mark.parametrize("flush", ["on_pre_compress", "on_session_end"])

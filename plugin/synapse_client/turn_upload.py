@@ -57,7 +57,8 @@ class _Session:
         self.begun = 0
         self.began = False  # the last turn to start began on the record, its end not seen
         self.unseen = 0  # turns begun off the record whose end has not been seen
-        # The sessions it goes on from whose counts are in its own (``start``).
+        # The sessions it goes on from whose counts are in its own (``start``): the
+        # ones it was started with, and the ones those had taken.
         self.took: frozenset[str] = frozenset()
 
     def close(self) -> None:
@@ -119,19 +120,21 @@ class TurnUploader:
         of the turn now running stays, also from the sessions it goes on from (a turn
         that began under one of them ends under this id), as does a doubt not settled
         yet: whether one said to be new holds turns from before. Each of those
-        sessions is counted once, however often this id is started. A session that
-        names the ones it goes on from is not said to be new: what they are says
-        whether their turns may go up."""
+        sessions is counted once, however often this id is started and whichever
+        session in between took its counts first (a second switch, whose new id goes
+        on from both). A session that names the ones it goes on from is not said to
+        be new: what they are says whether their turns may go up."""
         with self._lock:
             ids = dict.fromkeys((session_id, *continues))
             past = {sid: self._sessions[sid] for sid in ids if sid in self._sessions}
             if any(one.was_private for one in past.values()):
                 lookback = 0
-            # Started before, this id holds the counts of the sessions it took then.
-            took = past[session_id].took if session_id in past else frozenset()
+            # A session started before holds the counts of the sessions it took then,
+            # and of the ones those had taken: none of them is counted again.
+            took = frozenset().union(*(one.took for one in past.values()))
             fresh = [one for sid, one in past.items() if sid not in took]
             state = self._sessions[session_id] = _Session(lookback, self._begins and len(ids) == 1)
-            state.took = took | (past.keys() - {session_id})
+            state.took = (took | past.keys()) - {session_id}
             state.new = state.new or (lookback != 0 and any(one.new for one in past.values()))
             state.begun = sum(one.begun for one in fresh if one.new)
             state.began = any(one.began for one in past.values())
@@ -150,9 +153,9 @@ class TurnUploader:
                 state.close()
 
     def _close(self, session_id: str, state: _Session) -> list[str]:
-        """``state``, said to be new, holds turns from before after all. So does a
-        session it took that doubt over from, which is closed with it. The ids, for
-        ``_found``. Called with the lock held."""
+        """``state``, said to be new, holds turns from before after all. So does
+        every session that doubt came from, through however many ids, which is closed
+        with it. The ids, for ``_found``. Called with the lock held."""
         found = [session_id]
         state.close()
         for sid in sorted(state.took):
@@ -181,8 +184,11 @@ class TurnUploader:
         not known here, so the count errs to private: the late upload of a turn begun off the
         record is not taken for the end of a later turn, and the late upload of the turn
         before is not taken for the end of the one begun off the record (neither goes
-        up then). One begun while the server has not said yet counts as begun on the
-        record until it says "private" (``upload``).
+        up then). One turn before is counted, not two: with the uploads of two turns
+        still to come when a turn begins off the record, the second takes that turn's
+        count, and its own upload, or a flush, can then send it. One begun while the
+        server has not said yet counts as begun on the record until it says "private"
+        (``upload``).
 
         ``earlier`` says the conversation held a turn before this one. When the first
         turn start of a session said to be new (``start``) says so, those turns are
