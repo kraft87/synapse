@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # stage does that here and only the built dist crosses into runtime (no
 # node_modules, no toolchain). `npm run build` is tsc --noEmit + the esbuild
 # script defined in web/package.json.
-FROM node:22-bookworm-slim AS webbuild
+FROM node:26-bookworm-slim AS webbuild
 WORKDIR /app/web
 # Copy manifests first so `npm ci` caches on lockfile changes, not source edits.
 COPY web/package.json web/package-lock.json ./
