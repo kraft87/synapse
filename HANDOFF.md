@@ -3,6 +3,60 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — cli: `synapse update` lets the client it installed update the harnesses (plugin 0.24.9)
+
+**What changed**
+
+- **Before, one process ran two client versions.** `synapse update` ran the installer,
+  then went on in the same process: the old CLI dropped the old `synapse_client` from the
+  interpreter (`_forget_other_core`), imported the new client's, and drove its harness
+  list. Old CLI code called new core code, and anything that had already imported the old
+  package kept it.
+- **Now the update is two processes.** The first fetches `<server>/install` and runs it,
+  as before. It then starts the CLI of the client that is now current, through the
+  launcher (`~/.synapse/bin/synapse_run.py plugin/scripts/synapse_cli.py update
+  --rewire`), and exits with its exit code. That second process updates the Claude Code
+  plugin, re-writes Codex's wiring when it is wired, and rebuilds the Hermes provider
+  folder, all with the new client's own code. `--rewire` is internal and not in `--help`.
+- **A server that serves an older client** (0.24.8 or earlier, which has no `--rewire`):
+  that client is asked for a whole `synapse update`. It installs itself once more, which
+  changes nothing, and updates the harnesses with its own code. Every managed client has
+  `update`: it arrived with the launcher in 0.20.0.
+- **No managed client to hand over to** (no launcher, or a current version whose manifest
+  cannot be read): the harnesses are updated from the running process, as before.
+- **The harness list always comes from the core beside the running CLI.** It used to
+  prefer the managed client's core. So `synapse install hermes` typed inside a Claude Code
+  session (the plugin's own `synapse`) builds the Hermes folder from the plugin's core;
+  the next `synapse update` rebuilds it if the managed client is another version.
+- **One URL rule.** `harness.py` had its own copy of `normalize_url`, kept equal to the
+  core's by a test, because importing the core there would have pinned the old package
+  during an update. It now uses the core's.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.9. This run is still done the old way (the client
+   being replaced is the one running it); updates after it use the hand-over. Nothing to
+   migrate, no setting to change, no server change.
+
+**Proven**
+
+- `tests/test_update_handover.py` runs the update as real processes for a scratch user
+  against a local server: this checkout's CLI installs a client calling itself 9.9.9,
+  and the Hermes folder is rebuilt as 9.9.9 from that client's core, after the installer
+  made it current. With an installed client from before the step, that client's `update`
+  runs, its exit code comes back, and the caller builds nothing.
+- `tests/test_synapse_cli.py`: the installer runs first and the hand-over second with
+  `SYNAPSE_HOME` set; the caller touches no harness; `update --rewire` fetches nothing
+  and runs no installer; no managed client falls back to the running process; the flag is
+  not in the help.
+- `tests/test_claude_on_core.py`: a managed client of another version on the machine
+  does not put a second `synapse_client` into the process.
+
+**Still open**
+
+- Not run on Windows. The hand-over is a child process, not an `exec`, so it does not
+  depend on one.
+
 ## 2026-11-12 — client: the private-mode check sits where a turn leaves the machine (plugin 0.24.8)
 
 **What changed**

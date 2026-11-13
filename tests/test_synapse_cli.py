@@ -1861,9 +1861,18 @@ def test_skill_retire_fails_on_an_http_or_network_error(cli, capsys, error, text
 _INSTALLER = b"print('the server's installer')\n"
 
 
-def _fake_update(cli: _Cli, *, fetch_error=None, returncode: int = 0) -> dict:
-    """Fake <url>/install and the interpreter it is piped into."""
-    seen: dict = {"requests": [], "runs": []}
+def _fake_update(
+    cli: _Cli,
+    *,
+    fetch_error=None,
+    returncode: int = 0,
+    rewire_returncode: int = 0,
+    older_returncode: int = 0,
+) -> dict:
+    """Fake <url>/install, the interpreter it is piped into, and the installed client's
+    CLI the update then hands over to (``rewire_returncode`` is what its ``update
+    --rewire`` exits with, ``older_returncode`` what an older client's ``update`` does)."""
+    seen: dict = {"requests": [], "runs": [], "envs": []}
 
     def urlopen(req, timeout=None):
         seen["requests"].append(req)
@@ -1871,8 +1880,13 @@ def _fake_update(cli: _Cli, *, fetch_error=None, returncode: int = 0) -> dict:
             raise fetch_error
         return _Resp(_INSTALLER)
 
-    def run(cmd, input=None, check=None, **_kw):
+    def run(cmd, input=None, check=None, env=None, **_kw):
         seen["runs"].append((cmd, input))
+        seen["envs"].append(env)
+        if cmd[-2:] == ["update", "--rewire"]:
+            return subprocess.CompletedProcess(cmd, rewire_returncode)
+        if cmd[-1] == "update":
+            return subprocess.CompletedProcess(cmd, older_returncode)
         return subprocess.CompletedProcess(cmd, returncode)
 
     mod = cli.load()
@@ -1895,6 +1909,99 @@ def test_update_runs_the_servers_installer_then_updates_claude_and_rewires_codex
     assert cli.wired == [("codex", _URL, False)]
     out = capsys.readouterr().out
     assert "Claude Code: plugin updated" in out and "Codex: wired" in out
+
+
+def _installed_client(version: str) -> list[str]:
+    """A managed client at ``version``, as the installer leaves it; returns the command
+    that runs its CLI through the launcher."""
+    root = _managed_client()
+    manifest = root / "plugin" / ".claude-plugin" / "plugin.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+    runner = Path(os.environ["SYNAPSE_HOME"]).resolve() / "bin" / "synapse_run.py"
+    return [sys.executable, str(runner), "plugin/scripts/synapse_cli.py"]
+
+
+def test_update_hands_the_harnesses_to_the_cli_of_the_client_it_installed(cli, capsys):
+    """This process holds the client that was just replaced: the harnesses are refreshed
+    by the new one's CLI, in its own process, and this one touches none."""
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    cli.codex_is_wired = True
+    cli.hermes_update = "Hermes: memory provider updated to 9.9.9"
+    command = _installed_client("0.24.9")
+    seen = _fake_update(cli)
+
+    assert cli.run("update") == 0
+    assert [cmd for cmd, _ in seen["runs"]] == [
+        [sys.executable, "-", _URL],
+        [*command, "update", "--rewire"],
+    ]
+    assert seen["envs"][1]["SYNAPSE_HOME"] == os.environ["SYNAPSE_HOME"]
+    assert cli.wired == [] and capsys.readouterr().out == ""
+
+
+def test_the_new_clis_exit_code_is_the_updates(cli):
+    _write_home({"url": _URL})
+    _installed_client("0.25.0")
+    _fake_update(cli, rewire_returncode=3)
+    assert cli.run("update") == 3
+
+
+def test_update_rewire_refreshes_the_harnesses_and_fetches_nothing(cli, capsys):
+    """The second half, as the new client's CLI runs it."""
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    cli.codex_is_wired = True
+    cli.hermes_update = "Hermes: memory provider updated to 9.9.9"
+    _installed_client("0.24.9")
+    seen = _fake_update(cli)
+
+    assert cli.run("update", "--rewire") == 0
+    assert seen == {"requests": [], "runs": [], "envs": []}
+    assert cli.wired == [("codex", _URL, False)]
+    assert capsys.readouterr().out.splitlines() == [
+        "Claude Code: plugin updated",
+        "Codex: wired",
+        "Hermes: memory provider updated to 9.9.9",
+    ]
+
+
+def test_a_client_from_before_the_rewire_step_is_asked_for_a_whole_update(cli, capsys):
+    """A server that serves an older client than this one: its CLI does not know the
+    step, and every client the launcher can run has `update` (both came in 0.20.0). This
+    process still builds no harness from its own, newer, code."""
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    command = _installed_client("0.24.8")
+    seen = _fake_update(cli, older_returncode=4)
+    assert cli.run("update") == 4
+    assert [cmd for cmd, _ in seen["runs"]] == [[sys.executable, "-", _URL], [*command, "update"]]
+    assert cli.wired == [] and capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("manifest", [None, "{not json", "{}"])
+def test_update_refreshes_from_this_process_when_no_installed_client_can_be_run(
+    cli, capsys, manifest
+):
+    """No launcher, or a current version whose manifest cannot be read: nothing to hand
+    over to, so the harnesses are refreshed by the client this process runs."""
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    if manifest is not None:
+        _installed_client("0.24.9")
+        root = Path(os.environ["SYNAPSE_HOME"]) / "lib" / "0.19.6"
+        (root / "plugin" / ".claude-plugin" / "plugin.json").write_text(manifest)
+    seen = _fake_update(cli)
+    assert cli.run("update") == 0
+    assert [cmd for cmd, _ in seen["runs"]] == [[sys.executable, "-", _URL]]
+    assert "Claude Code: plugin updated" in capsys.readouterr().out
+
+
+def test_update_rewire_is_not_in_the_help(cli, capsys):
+    with pytest.raises(SystemExit):
+        cli.run("update", "--help")
+    assert "--rewire" not in capsys.readouterr().out
 
 
 def test_update_leaves_codex_alone_when_it_was_never_wired(cli):

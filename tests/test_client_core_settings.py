@@ -200,14 +200,10 @@ def test_normalize_url_matches_the_cli(scratch, raw):
     assert settings_mod.normalize_url(raw) == harness.normalize_url(raw)
 
 
-def test_normalize_url_checks_the_same_pattern_as_the_cli(scratch):
-    """harness.py keeps its own copy of the rule rather than calling the core's: `synapse
-    update` normalizes the URL before the installer runs, and importing the core then
-    would leave the old client's package in sys.modules for the harnesses the update
-    builds afterwards (harness._core_registry). So the two copies are pinned equal."""
+def test_the_cli_normalizes_a_url_with_the_cores_rule(scratch):
+    """One rule, not two kept equal: harness.py's name for it is the core's function."""
     harness = load_script("harness")
-    assert settings_mod._URL_RE.pattern == harness._URL_RE.pattern
-    assert settings_mod._URL_RE.flags == harness._URL_RE.flags
+    assert harness.normalize_url is settings_mod.normalize_url
 
 
 @pytest.mark.parametrize(

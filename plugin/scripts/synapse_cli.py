@@ -23,6 +23,9 @@ an enrolled machine (`--reenroll` does that on purpose).
 `synapse config` reads and sets the saved settings; login is not a settings tool.
 `synapse install` is the wiring step alone. `synapse update` fetches the client matching
 the server's version from <server>/install, then refreshes every harness already wired.
+That second half is run by the client just installed, as `synapse update --rewire` in a
+process of its own: this one still holds the code of the client it replaced. A client from
+before that step (0.24.8 and older) is asked for a whole `synapse update` instead.
 `synapse status` says, per harness, whether it is here and whether Synapse is wired in.
 
 The same code runs from the managed client (~/.synapse/bin/synapse, put there by
@@ -589,10 +592,55 @@ def cmd_install(args) -> int:
     )
 
 
-def cmd_update(_args) -> int:
+#: The first client whose CLI has the ``update --rewire`` step.
+_REWIRE_SINCE = (0, 24, 9)
+
+
+def _installed_cli() -> tuple[list[str], bool] | None:
+    """The command that runs the managed client's CLI, through its launcher (which
+    picks the version the installer just made current), and whether that client has the
+    ``update --rewire`` step. None when there is no managed client to run."""
+    try:
+        root = harness.managed_root()
+    except Exception:
+        return None
+    if root is None:
+        return None
+    manifest = root / "plugin" / ".claude-plugin" / "plugin.json"
+    try:
+        version = str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
+    except (OSError, ValueError):
+        return None
+    if not version:
+        return None
+    runner = synapse_home.home().resolve() / "bin" / "synapse_run.py"
+    command = [sys.executable, str(runner), "plugin/scripts/synapse_cli.py"]
+    return command, harness._version_tuple(version) >= _REWIRE_SINCE
+
+
+def _update_harnesses(url: str) -> int:
+    """Refresh every harness already wired, from the client this process runs."""
+
+    def refusal() -> str:
+        held = _credential_origins()
+        return _move_refusal(url, held) if held and _origin(url) not in held else ""
+
+    for target in harness.harnesses(url, refusal):
+        try:
+            line = target.update()
+        except (RuntimeError, ValueError, OSError) as e:
+            line = f"{target.label}: not updated: {e}"
+        if line:
+            print(line)
+    return 0
+
+
+def cmd_update(args) -> int:
     url = _configured_url()
     if not url:
         return _fail("no server URL yet: run `synapse login` first")
+    if getattr(args, "rewire", False):
+        return _update_harnesses(url)
     request = urllib.request.Request(f"{url}/install", headers={"User-Agent": "synapse-cli"})
     try:
         with urllib.request.urlopen(request, timeout=60) as r:
@@ -602,20 +650,21 @@ def cmd_update(_args) -> int:
     done = subprocess.run([sys.executable, "-", url], input=script, check=False)
     if done.returncode != 0:
         return _fail("the installer failed; the previous client is still in place")
-
-    def refusal() -> str:
-        held = _credential_origins()
-        return _move_refusal(url, held) if held and _origin(url) not in held else ""
-
-    # Built now, after the installer: the core's harnesses come from the new client.
-    for target in harness.harnesses(url, refusal):
-        try:
-            line = target.update()
-        except (RuntimeError, ValueError, OSError) as e:
-            line = f"{target.label}: not updated: {e}"
-        if line:
-            print(line)
-    return 0
+    # This process holds the code of the client the installer just replaced. The
+    # harnesses are refreshed by the new client's own CLI in a process of its own, so no
+    # adapter is installed by old code driving the new core, or copies the old core.
+    installed = _installed_cli()
+    if installed is None:
+        # No managed client to hand over to: refresh from the client this process runs.
+        return _update_harnesses(url)
+    command, has_rewire = installed
+    # A client from before the step (the server serves an older one than this) does a
+    # whole update of its own: it installs itself once more, which changes nothing, then
+    # refreshes the harnesses with its own code.
+    step = ["update", "--rewire"] if has_rewire else ["update"]
+    sys.stdout.flush()
+    env = {**os.environ, "SYNAPSE_HOME": str(synapse_home.home())}
+    return subprocess.run([*command, *step], check=False, env=env).returncode
 
 
 def cmd_status(_args) -> int:
@@ -748,6 +797,8 @@ def _parser() -> argparse.ArgumentParser:
     ins.set_defaults(func=cmd_install)
 
     upd = sub.add_parser("update", help="install the client version the server serves")
+    # The second half of an update, run by the client the first half installed.
+    upd.add_argument("--rewire", action="store_true", help=argparse.SUPPRESS)
     upd.set_defaults(func=cmd_update)
 
     status = sub.add_parser("status", help="which harnesses are here, and which are wired")
