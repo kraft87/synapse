@@ -69,10 +69,11 @@ branched, or compressed with rotation on. The new session holds turns of the one
 from, so it is off the record when that one is (upload.Uploader.carry_private): by that
 one's marker, or, with no marker, by what the server answers when asked at the session's
 first upload, until when nothing is uploaded for it. That is settled where the agent
-moves to the new id (``on_session_switch``) and where Hermes builds a new agent for it
-(``initialize``, from the session store: the TUI and Desktop build one for every
-branch), and once per session (carried.py). ``/new`` and ``/resume`` open another
-conversation, and nothing is carried to it.
+moves to the new id (``on_session_switch``, from the ids Hermes names), where Hermes
+builds a new agent for it (``initialize``, from the session store: the TUI and Desktop
+build one for every branch) and before the first upload under any other id (``_follow``,
+from the store too), once per session (carried.py). ``/new`` and ``/resume`` open another
+conversation: nothing is carried to it from the one left.
 
 Compression
 -----------
@@ -208,6 +209,7 @@ class SynapseMemoryProvider(MemoryProvider):
         self._turns: TurnUploader | None = None
         self._home: str | None = None
         self._said: set[str] = set()
+        self._followed: set[str] = set()  # ids whose lineage was read here (_follow)
         self._cut: str | None = None  # the last in-place compression, for self_since
 
     # -- identity and availability -------------------------------------------------
@@ -256,10 +258,10 @@ class SynapseMemoryProvider(MemoryProvider):
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
-        lookback = LOOKBACK if kwargs.get("resumed") else None
         earlier = carried.to_ask(home, verdict.continues)
-        if mode == ACTIVE and self._carry(uploader, home, earlier, session_id, None):
-            lookback = 0  # turns spoken off the record are not looked back at
+        private_too = mode == ACTIVE and carried.carry(uploader, home, earlier, session_id, None)
+        # Turns spoken off the record are not looked back at.
+        lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
         turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=lookback)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
@@ -279,11 +281,22 @@ class SynapseMemoryProvider(MemoryProvider):
             self._block = ""
             self._home = str(home) if home else None
             self._cut = None
+            self._followed = {self._session_id} if verdict.continues else set()
         if mode == INERT:
             self._say_once(f"synapse: off for session {self._session_id}: {verdict.reason}")
         if mode != ACTIVE:
             return
+        deadline, telling = time.monotonic() + START_BUDGET, None
+        if private_too:
+            # The server is told beside the session-start request and inside its budget:
+            # until it has the row, `synapse private off --forget` is undone when it gets it.
+            telling = spawn_context_thread(
+                uploader.settle_private, name="synapse-private", args=(self._session_id,)
+            )
+            telling.start()
         self._block = self._session_start(settings, client, outbox)
+        if telling is not None:
+            telling.join(max(0.0, deadline - time.monotonic()))
         if outbox is not None:
             spawn_context_thread(self._drain, name="synapse-outbox", args=(SYNC_TIMEOUT,)).start()
 
@@ -322,23 +335,6 @@ class SynapseMemoryProvider(MemoryProvider):
             )
         )
 
-    @staticmethod
-    def _carry(
-        uploader: Uploader, home: Any, earlier: list[Any], session_id: Any, timeout: float | None
-    ) -> bool:
-        """Whether ``session_id`` is off the record because a session of ``earlier``,
-        whose turns it holds, is (Uploader.carry_private). With no marker to say so the
-        server is asked at the session's first upload, and the answer is False for now.
-        Once per session of the home (carried.py); ``timeout`` None leaves telling the
-        server to that upload too, so that binding a session makes no request for this."""
-        sid = str(session_id or "")
-        ids = [str(one) for one in earlier if one]
-        if not sid or not ids or carried.settled(home, sid):
-            return False
-        return uploader.carry_private(
-            ids, sid, timeout=timeout, settled=lambda: carried.settle(home, sid)
-        )
-
     def system_prompt_block(self) -> str:
         """The session-start block, for a session still the owner's (``_still_owner``).
         Hermes stores the prompt and restores it verbatim for a continuing session, so a
@@ -369,13 +365,17 @@ class SynapseMemoryProvider(MemoryProvider):
         _say(line)
 
     def _still_owner(self, session_id: str = "") -> bool:
-        """For an ACTIVE session, whether it is still the owner's: the session store is
-        read again (sessions.recheck), since a session renamed "Bot Chat" starts receiving
-        other agents' messages, and a switch moves the agent to another session, without
-        a new instance. A session that fails turns this instance INERT for good; a store
-        that cannot be read skips this one call. Never raises."""
+        """For an ACTIVE session, whether it is still the owner's (``_verdict``)."""
+        return self._verdict(session_id) is not None
+
+    def _verdict(self, session_id: str = "") -> hs.Verdict | None:
+        """The store's verdict for an ACTIVE session still the owner's, else None: the
+        session store is read again (sessions.recheck), since a session renamed "Bot
+        Chat" starts receiving other agents' messages, and a switch moves the agent to
+        another session, without a new instance. A session that fails turns this instance
+        INERT for good; a store that cannot be read skips this one call. Never raises."""
         if self._mode != ACTIVE:
-            return False
+            return None
         sid = str(session_id or self._session_id)
         try:
             verdict = hs.recheck(
@@ -385,13 +385,13 @@ class SynapseMemoryProvider(MemoryProvider):
             self._say_once(
                 "synapse: the session store or its marks could not be read; skipped this call"
             )
-            return False
+            return None
         if verdict.mode == ACTIVE:
-            return True
+            return verdict
         with self._lock:
             self._mode = INERT
         self._say_once(f"synapse: off for session {sid}: {verdict.reason}")
-        return False
+        return None
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
         """Note the turn's model. A turn someone else wrote (``_foreign``, from the
@@ -415,22 +415,26 @@ class SynapseMemoryProvider(MemoryProvider):
     ) -> None:
         """Rebind to ``new_session_id``. A new id or a reset forgets which turns were
         sent; the next upload then looks back at most LOOKBACK turns, as for a resume.
-        It forgets the compression cut too; a compression that keeps the id sets it."""
+        It forgets the compression cut too; a compression that keeps the id sets it.
+        A carry that raises turns the instance INERT, as a failed ``initialize`` does:
+        the new id would otherwise be uploaded to with nothing known about it."""
         try:
             new = str(new_session_id or "")
             with self._lock:
                 old = self._session_id
             goes_on = bool(new) and new != old and not reset
             # The same conversation under a new id (a compression, a /branch) stays off
-            # the record when the id it leaves is. /resume opens another conversation.
+            # the record when the id it leaves is. /resume opens another conversation,
+            # which answers for its own row at its first upload (_follow).
             # Outside the lock: telling the server is a request.
             uploader = self._uploader if self._mode == ACTIVE else None
-            private_too = (
-                goes_on
-                and kwargs.get("reason") != "resume"
-                and uploader is not None
-                and self._carry(uploader, self._home, [old, parent_session_id], new, 5)
-            )
+            carries = goes_on and kwargs.get("reason") != "resume" and uploader is not None
+            try:
+                earlier = [old, parent_session_id]
+                private_too = carries and carried.carry(uploader, self._home, earlier, new, 5)
+            except Exception:
+                self._mode = INERT  # undecided is not on the record
+                raise
             with self._lock:
                 if reset or goes_on:
                     if self._turns is not None:
@@ -469,7 +473,7 @@ class SynapseMemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-            if self._upload(messages, session_id, SYNC_TIMEOUT):
+            if self._upload(messages, session_id, SYNC_TIMEOUT, finished=True):
                 self._drain(SYNC_TIMEOUT)
         except Exception:
             _log().warning("synapse: sync_turn failed", exc_info=True)
@@ -510,22 +514,46 @@ class SynapseMemoryProvider(MemoryProvider):
             _log().warning("synapse: on_pre_compress failed", exc_info=True)
         return ""
 
-    def _upload(self, messages: Any, session_id: str, timeout: float) -> bool:
+    def _upload(
+        self, messages: Any, session_id: str, timeout: float, finished: bool = False
+    ) -> bool:
         """Send the complete turns of ``messages`` not sent yet (upload.TurnUploader).
-        True when at least one batch reached the server."""
+        True when at least one batch reached the server. ``finished``: a turn has just
+        ended. The id is the one Hermes names, which need not be one this instance was
+        moved to, so what its row says it continues is read first (``_follow``)."""
         turns = self._turns
-        if self._mode != ACTIVE or turns is None:
+        sid = str(session_id or self._session_id)
+        verdict = self._verdict(sid) if turns is not None else None
+        if turns is None or verdict is None:
             return False
-        if not self._still_owner(session_id):
-            return False
+        self._follow(sid, verdict.continues)
         return turns.upload(
             hm.to_records(messages),
-            str(session_id or self._session_id),
+            sid,
             timeout=timeout,
             project=self._project,
             cwd=self._cwd,
             model=self._model or None,
+            finished=finished,
         )
+
+    def _follow(self, session_id: str, continues: tuple[str, ...]) -> None:
+        """Before an upload for ``session_id``: keep it off the record when a session
+        its row says it holds turns of (``continues``) is, once per id and instance.
+        ``initialize`` does this for the id it is given. This is for the others: a
+        session resumed in place, one Hermes moved the agent to without a call, and a
+        row written after ``initialize``. Noted only once done: a carry that raises
+        leaves the id to be read again, and no upload goes past it."""
+        uploader, turns = self._uploader, self._turns
+        with self._lock:
+            known = session_id in self._followed
+        if known or not continues or uploader is None or turns is None:
+            return
+        earlier = carried.to_ask(self._home, continues)
+        if carried.carry(uploader, self._home, earlier, session_id, None):
+            turns.forget(0)  # turns spoken off the record are not looked back at
+        with self._lock:
+            self._followed.add(session_id)
 
     def _drain(self, timeout: float) -> None:
         uploader = self._uploader

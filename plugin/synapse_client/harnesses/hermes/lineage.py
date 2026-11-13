@@ -70,13 +70,18 @@ def continues(parent: Any, model_config: Any) -> str | None:
     after a compression. None for a row that holds no other session's turns: a first
     session, a reset, a subagent.
 
-    Hermes's own rule (hermes_state_common.py ``_non_continuation_child_sql``): a key in
-    ``model_config`` speaks of the parent only when it names it, since a continuation
-    inherits its parent's ``model_config`` whole, the keys of a reset or a branch further
-    up included. With the parent link gone (Hermes clears it when that session is
-    deleted) the copy is still there, so the session ``model_config`` names as branched
-    or compressed from is the answer. A row from before Hermes wrote ``_reset_from``
-    reads as a continuation."""
+    How a key is read is Hermes's (hermes_state_common.py
+    ``_non_continuation_child_sql``): a key in ``model_config`` speaks of the parent only
+    when it names it, since a continuation inherits its parent's ``model_config`` whole,
+    the keys of a reset or a branch further up included. The rule is not Hermes's. That
+    one asks whether a child is the same session going on after a compression, so it
+    turns a branch away, and a child whose ``source`` is ``tool``. This one asks whose
+    turns a row holds: a branch holds a copy of its parent's, and ``source`` is not read,
+    so such a child counts as holding them, which errs on the side of private.
+
+    With the parent link gone (Hermes clears it when that session is deleted) the copy is
+    still there, so the session ``model_config`` names as branched or compressed from is
+    the answer. A row from before Hermes wrote ``_reset_from`` reads as a continuation."""
     config = _config(model_config)
     if isinstance(parent, str) and parent:
         if any(config.get(key) == parent for key in _OWN_CONVERSATION):

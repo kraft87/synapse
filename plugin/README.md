@@ -312,12 +312,18 @@ private (`synapse private on <session-id>`, in a terminal; `hermes sessions list
 the id) uploads nothing. Hermes gives a conversation a new session id when it branches
 it, and when a compression starts a new session: the new id is private when a session it
 holds turns of is, and gets the marker and the server row, so what was said off the
-record stays there. A marker lasts twelve hours and `off` removes it, so when none says,
-the server is asked (`GET /private-sessions/<earlier id>`) before the new session's
-first upload, once per session; until it answers, nothing is uploaded for that session.
-`/new` and `/resume` open another conversation, which is on the record until you mark
-it. `synapse private off --forget <id>` puts a session back on the record with the turns
-it holds, copied ones included.
+record stays there. Which session that is comes from the ids Hermes names when it moves
+the agent, and from the session's row in Hermes's store, read before the first upload
+under any id. A marker lasts twelve hours and `off` removes it, so when none says, the
+server is asked (`GET /private-sessions/<earlier id>`) before the new session's first
+upload, once per session; until it answers, nothing is uploaded for that session, and
+the turns that finish are kept in memory.
+`/new` and `/resume` open another conversation: nothing is carried to it from the one
+you left, and it is on the record unless you mark it or its own row says it continues a
+private session. `synapse private off --forget <id>` puts a session back on the record
+with the turns spoken in it. For a session that was private because of the one it
+continues, the agent running it uploads only the turns that end from then on; an agent
+started for it later looks back ten turns, copied ones included.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

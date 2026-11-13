@@ -74,6 +74,10 @@ class Uploader:
             except Exception:
                 pass
 
+    def warn(self, line: str) -> None:
+        """Say ``line`` where a loss is said (``warn``)."""
+        self._say(line, self._warn)
+
     def _held(self, session_id: str, *, asking: bool = True) -> bool:
         """Whether this uploader holds ``session_id`` itself; with ``asking`` False,
         only as a session known to be private."""
@@ -100,6 +104,16 @@ class Uploader:
         with self._holding:
             return session_id in self._asking
 
+    def _private_here(self, session_id: str) -> bool:
+        """Whether ``session_id`` is known on this machine to be private: held here as
+        such, or by its marker (one that cannot be read counts). Called with
+        ``_holding`` held."""
+        return (
+            session_id in self._unmarked
+            or session_id in self._owed
+            or private.is_private(self.client.settings, session_id, self._log)
+        )
+
     def carry_private(
         self,
         earlier: Iterable[str],
@@ -115,73 +129,77 @@ class Uploader:
 
         One of them is private here (a marker, one that cannot be read, or a session
         this uploader holds as private): ``session_id`` gets the marker now, and the
-        answer is True. The server is told now, within ``timeout`` seconds, or at the
-        session's next upload when ``timeout`` is None or the request failed
-        (``settle_private``). Until it has been told this uploader holds the session
-        itself, and for as long as it lives when the marker could not be written; both
-        failures are said to ``warn``.
+        answer is True. The server is told now, within ``timeout`` seconds, or by the
+        next ``settle_private`` when ``timeout`` is None or the request failed. Until it
+        has been told this uploader holds the session itself, and for as long as it
+        lives when the marker could not be written; both failures are said to ``warn``.
 
         None of them is private here: that is not yet an answer, since a marker lasts
         twelve hours and ``off`` removes it, while the server's row stays and keeps
-        dropping that session's turns. So the server is asked, at the session's next
-        upload and not here (``settle_private``), and until it has answered nothing is
-        uploaded for ``session_id``. The answer now is False.
+        dropping that session's turns. So the server is asked, by the next
+        ``settle_private`` and not here, and until it has answered nothing is uploaded
+        for ``session_id``. A session already waiting keeps what it was asking and asks
+        about ``earlier`` as well, and an earlier id that is itself waiting passes its
+        question on. The answer now is False.
 
-        ``settled`` is called once nothing is left open for ``session_id``: the server
+        ``settled`` is called once the question is closed for ``session_id``: the server
         said no earlier id is private, or it has the session's own row. It is the
-        caller's note that the session need not be asked about again. Never raises."""
+        caller's note that the session need not be asked about again, and is not called
+        when there was nothing to ask. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
-        source = next(
-            (
-                sid
-                for sid in ids
-                if self._held(sid, asking=False)
-                or private.is_private(self.client.settings, sid, self._log)
-            ),
-            "",
-        )
-        if not session_id or session_id == source:
-            return bool(source)
+        failed = ""
         with self._holding:
+            # One look at the earlier ids. Between two, a settle on another thread could
+            # make one private and drop its question, and neither would be seen.
+            source = next((sid for sid in ids if self._private_here(sid)), "")
+            if not session_id or session_id == source:
+                return bool(source)
+            if source:
+                failed = self._hold(session_id)
+            else:
+                waiting = [asked for sid in ids for asked in self._asking.get(sid, ())]
+                asked = [*self._asking.get(session_id, ()), *ids, *waiting]
+                ask = tuple(sid for sid in dict.fromkeys(asked) if sid != session_id)
+                if not ask:
+                    return False
+                self._asking[session_id] = ask
             if settled is not None:
                 self._settled[session_id] = settled
-            # A session that is itself waiting for an answer passes its question on.
-            waiting = [asked for sid in ids for asked in self._asking.get(sid, ())]
-        if source:
-            said = self._carry(source, session_id)
-            if timeout is None:
-                self._say(
-                    f"{said}: nothing is uploaded for it, and the server is told at its next upload"
-                )
-            else:
-                self._report(said, self.settle_private(session_id, timeout=timeout))
-            return True
-        ask = tuple(sid for sid in dict.fromkeys([*ids, *waiting]) if sid != session_id)
-        if not ask:
-            self._close(session_id)
+        if not source:
             return False
-        with self._holding:
-            self._asking[session_id] = ask
-        return False
+        said = self._carried(source, session_id, failed)
+        if timeout is None:
+            self._say(f"{said}: nothing is uploaded for it, and the server is still to be told")
+        else:
+            self._finish(session_id, timeout, said)
+        return True
 
-    def _carry(self, source: str, session_id: str) -> str:
-        """Make ``session_id`` private here as ``source`` is: its marker, and a hold
-        until the server has been told. Returns how the log names the two."""
-        said = f"synapse: session {session_id} continues {source}, which is in private mode"
-        unmarked = False
+    def _hold(self, session_id: str) -> str:
+        """Make ``session_id`` private here: its marker, and a hold until the server has
+        been told. A question it was waiting on is dropped. Returns the name of what
+        kept the marker from being written, if anything did: the uploader then holds
+        the session for as long as it lives. Called with ``_holding`` held, so that no
+        upload sees the session between the question and the hold."""
+        failed = ""
         try:
             private.mark(self.client.settings, session_id)
         except (OSError, ValueError) as err:
-            unmarked = True
+            failed = type(err).__name__
+            self._unmarked.add(session_id)
+        self._owed.add(session_id)
+        self._asking.pop(session_id, None)
+        return failed
+
+    def _carried(self, source: str, session_id: str, failed: str) -> str:
+        """How the log names a session made private as ``source`` is; a marker that
+        could not be written (``failed``) is said to ``warn``."""
+        said = f"synapse: session {session_id} continues {source}, which is in private mode"
+        if failed:
             self._say(
-                f"{said}; its marker could not be written ({type(err).__name__}), so "
+                f"{said}; its marker could not be written ({failed}), so "
                 "nothing is uploaded for it until this program ends",
                 self._warn,
             )
-        with self._holding:
-            if unmarked:
-                self._unmarked.add(session_id)
-            self._owed.add(session_id)
         return said
 
     def _report(self, said: str, told: bool) -> None:
@@ -212,6 +230,16 @@ class Uploader:
             raise ValueError("the reply does not say whether the session is private")
         return answer
 
+    def _source(self, ids: Iterable[str], timeout: float) -> str:
+        """The first of ``ids`` that is private: known here, without a request, or by
+        the server's row. RAISES when the server did not say (``_row``)."""
+        for sid in ids:
+            with self._holding:
+                here = self._private_here(sid)
+            if here or self._row(sid, timeout):
+                return sid
+        return ""
+
     def _tell(self, session_id: str, timeout: float) -> bool:
         """Tell the server ``session_id`` is private, if it is still to be told."""
         with self._holding:
@@ -227,28 +255,45 @@ class Uploader:
 
     def settle_private(self, session_id: str, *, timeout: float = 5) -> bool:
         """Close what ``carry_private`` left open for ``session_id``: ask the server
-        whether a session it continues is private (a row for one makes ``session_id``
-        private, marker and row; an answer that there is none lets it go), and tell the
-        server about a private session it has not been told about. True when nothing is
-        left open for it; False when the server did not answer, and the session stays
-        held. Once the server has answered, every other session it is still to be told
-        about is told too (``settle_owed``). Never raises."""
-        with self._holding:
-            ids = self._asking.get(session_id)
+        whether a session it continues is private (a row for one, or one found private
+        here meanwhile, makes ``session_id`` private, marker and row; an answer that
+        there is none lets it go), and tell the server about a private session it has
+        not been told about. True when nothing is left open for it; False when the
+        server did not answer, and the session stays held: a session the server could
+        not be told about is said to ``warn`` each time. Once the server has answered,
+        every other session it is still to be told about is told too (``settle_owed``).
+        Never raises."""
         said = ""
-        if ids is not None:
+        while not said:
+            with self._holding:
+                ids = self._asking.get(session_id)
+            if ids is None:
+                break
             try:
-                source = next((sid for sid in ids if self._row(sid, timeout)), "")
+                source = self._source(ids, timeout)
             except Exception:
                 return False
-            if source:
-                # Before the question is dropped: the session is never left unheld.
-                said = self._carry(source, session_id)
+            failed = ""
             with self._holding:
-                self._asking.pop(session_id, None)
+                # Asked about more ids meanwhile (carry_private): those are next.
+                left = tuple(sid for sid in self._asking.get(session_id, ()) if sid not in ids)
+                if source:
+                    failed = self._hold(session_id)
+                elif left:
+                    self._asking[session_id] = left
+                else:
+                    self._asking.pop(session_id, None)
+            if source:
+                said = self._carried(source, session_id, failed)
+        return self._finish(session_id, timeout, said)
+
+    def _finish(self, session_id: str, timeout: float, said: str = "") -> bool:
+        """Tell the server about ``session_id`` if it is still to be told, say how that
+        went (``said``: the session was made private just now), and close what was
+        open for it. False when the server could not be told."""
         told = self._tell(session_id, timeout)
-        if said:
-            self._report(said, told)
+        if said or not told:
+            self._report(said or f"synapse: session {session_id} is in private mode", told)
         if not told:
             return False
         self._close(session_id)
@@ -352,6 +397,10 @@ class Uploader:
         return self.outbox.drain(send, max_items)
 
 
+#: How many turns a TurnUploader keeps in memory for a session it may not upload yet.
+KEPT_TURNS = 200
+
+
 class TurnUploader:
     """One conversation's finished turns, uploaded once each in the ``messages`` format.
 
@@ -360,7 +409,9 @@ class TurnUploader:
     dedups on span id, so a restart that re-sends a turn costs a request, not a
     duplicate. With ``lookback``, the first upload considers only the last ``lookback``
     complete turns and counts the ones before as sent: a resumed conversation's older
-    turns were sent, or not, before this process. Safe across threads."""
+    turns were sent, or not, before this process. ``lookback`` 0 is for a conversation
+    that was off the record until now: its turns from before do not go as the context
+    of a later turn either. Safe across threads."""
 
     def __init__(
         self, uploader: Uploader, *, client: str, source: str, lookback: int | None = None
@@ -371,27 +422,19 @@ class TurnUploader:
         self._lock = threading.Lock()
         self._sent: set[str] = set()
         self._lookback = lookback
-        # How many complete turns there were at the last upload held back for the
-        # server's answer (``_wait``).
-        self._waited: int | None = None
+        # Turns not handed over yet that the conversation may no longer hold when they
+        # can be (a compression in place): by key, oldest first, each with its context.
+        self._kept: dict[str, tuple[messages.Turn | None, messages.Turn]] = {}
+        self._off: set[str] = set()  # turns spoken off the record: no context either
 
     def forget(self, lookback: int | None = None) -> None:
-        """Forget which turns were sent (a new session id, a reset). The next upload
-        then looks back at most ``lookback`` complete turns."""
+        """Forget which turns were sent, and the ones kept (a new session id, a reset).
+        The next upload then looks back at most ``lookback`` complete turns."""
         with self._lock:
             self._sent.clear()
+            self._kept.clear()
+            self._off.clear()
             self._lookback = lookback
-            self._waited = None
-
-    def _wait(self, records: Sequence[messages.Record]) -> None:
-        """An upload was held back because the server has not said whether the session
-        is private: widen the first upload's window by the turns finished since the last
-        one held back, so that they are sent once it says the session is on the record."""
-        done = sum(1 for turn in messages.turns(records) if messages.complete(turn))
-        with self._lock:
-            if self._lookback is not None and self._waited is not None:
-                self._lookback += max(0, done - self._waited)
-            self._waited = done
 
     def upload(
         self,
@@ -402,46 +445,80 @@ class TurnUploader:
         project: str | None = None,
         cwd: str | None = None,
         model: str | None = None,
+        finished: bool = False,
     ) -> bool:
         """Send the complete turns of ``records`` not sent yet, oldest first, in batches.
-        True when at least one batch reached the server.
+        True when at least one batch reached the server. ``finished`` says a turn has
+        just ended, in this process: when the last turn of ``records`` is complete it is
+        that one, and never one of the turns from before that ``lookback`` leaves out.
 
         Nothing is sent, and nothing remembered, for a session in private mode or with no
         id. One the uploader holds is settled first (Uploader.settle_private): the server
         is asked or told, and the upload goes on when the session turns out to be on the
         record. When it turns out to be private, no turn from before is looked back at
-        later (``forget(0)``), as after a switch that knew; while the server does not
-        answer, nothing is sent or queued, and the turns finished meanwhile are sent
-        once it does (``_wait``). A batch whose send fails waits in the outbox and
-        counts as handled; the batches after it are queued without a request, since
-        theirs would fail the same way. A batch that could not be queued either is tried
-        again by the next upload. Never raises over a failed send."""
+        later (``forget(0)``), as after a switch that knew. While the server does not
+        answer, nothing is sent or queued: the turns this upload would send are kept in
+        memory (KEPT_TURNS at most; the oldest are given up, with a warning) and go up
+        once it says the session is on the record, also those the conversation no longer
+        holds by then. A batch whose send fails waits in the outbox and counts as
+        handled; the batches after it are queued without a request, since theirs would
+        fail the same way. A batch that could not be queued either is kept too, and
+        tried again by the next upload. Never raises over a failed send."""
         if not session_id:
             return False
+        waiting = False
         if self.uploader.is_private(session_id):
             asked = self.uploader.asking(session_id)
             self.uploader.settle_private(session_id)
             if self.uploader.is_private(session_id):
-                if asked and self.uploader.asking(session_id):
-                    self._wait(records)
-                elif asked:
-                    self.forget(0)  # the server has just said it is private
-                return False
+                waiting = asked and self.uploader.asking(session_id)
+                if not waiting:
+                    if asked:
+                        self.forget(0)  # the server has just said it is private
+                    return False
         all_turns = messages.turns(records)
+        given_up = 0
         with self._lock:
             if self._lookback is not None:
                 # The turns before the window were this session's business before this
-                # process: count them as sent, now and for every later upload. The
-                # window takes in the turns finished while uploads were held back.
+                # process: count them as sent, now and for every later upload.
                 done = [turn for turn in all_turns if messages.complete(turn)]
-                held = 0 if self._waited is None else max(0, len(done) - self._waited)
-                older = done[: max(0, len(done) - self._lookback - held)]
+                new = finished and bool(all_turns) and messages.complete(all_turns[-1])
+                older = done[: max(0, len(done) - max(self._lookback, int(new)))]
                 self._sent |= {messages.turn_key(turn) for turn in older}
+                if self._lookback == 0:
+                    self._off |= {messages.turn_key(turn) for turn in older}
                 self._lookback = None
-            self._waited = None
-            selected = messages.pending(all_turns, self._sent)
-            # Claimed before the request: a concurrent upload must not send them again.
-            self._sent |= {messages.turn_key(turn) for _, turn in selected}
+            selected = [
+                (None if before and messages.turn_key(before) in self._off else before, turn)
+                for before, turn in messages.pending(all_turns, self._sent)
+            ]
+            if waiting:
+                for pair in selected:
+                    self._kept.setdefault(messages.turn_key(pair[1]), pair)
+                while len(self._kept) > KEPT_TURNS:
+                    oldest = next(iter(self._kept))
+                    del self._kept[oldest]
+                    self._sent.add(oldest)  # given up for good, not kept again
+                    given_up += 1
+            else:
+                # Kept turns the conversation no longer holds lead: they are the older.
+                here = {messages.turn_key(turn) for _, turn in selected}
+                selected = [
+                    *(pair for key, pair in self._kept.items() if key not in here),
+                    *selected,
+                ]
+                self._kept.clear()
+                # Claimed before the request: a concurrent upload must not send them again.
+                self._sent |= {messages.turn_key(turn) for _, turn in selected}
+        if waiting:
+            if given_up:
+                self.uploader.warn(
+                    f"synapse: more than {KEPT_TURNS} turns of session {session_id} wait for "
+                    f"the server's answer; {given_up} of the oldest will not be uploaded"
+                )
+            return False
+        contexts = {messages.turn_key(turn): context for context, turn in selected}
         sent_any = failed = False
         reason = ""
         for batch, new in messages.batches(selected):
@@ -465,4 +542,8 @@ class TurnUploader:
             elif outcome in (LOST, PRIVATE):
                 with self._lock:
                     self._sent -= {messages.turn_key(turn) for turn in new}
+                    if outcome == LOST:
+                        for turn in new:
+                            key = messages.turn_key(turn)
+                            self._kept.setdefault(key, (contexts.get(key), turn))
         return sent_any
