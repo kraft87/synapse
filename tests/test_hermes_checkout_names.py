@@ -98,6 +98,23 @@ _DRIVER = textwrap.dedent(
         "on_session_end": takes("on_session_end"),
         "on_pre_compress": takes("on_pre_compress"),
     }
+    def in_order(path, *texts):
+        text = " ".join(Path(path).read_text(encoding="utf-8").split())
+        at = [text.rfind(one) for one in texts]
+        return -1 not in at and at == sorted(at)
+
+    turn_starts = {
+        "hook": takes("on_turn_start"),
+        "says_what_came_before": says("agent/turn_context.py",
+                                      "previous_message=previous_message, )"),
+        "before_the_prefetch": in_order("agent/turn_context.py",
+                                        "agent._memory_manager.on_turn_start(",
+                                        "agent._memory_manager.prefetch_all("),
+        "after_the_compaction": in_order("agent/turn_context.py",
+                                         "agent._user_turn_count += 1",
+                                         "run_turn_start_compaction(",
+                                         "else _memory_turn_start_and_prefetch("),
+    }
     forks = _non_continuation_child_sql("c.", "?")
     print("RESULT " + json.dumps({
         "fork_keys": sorted(set(re.findall(r"[$][.](_[a-z_]+)", forks))),
@@ -119,6 +136,7 @@ _DRIVER = textwrap.dedent(
         "origins": origins,
         "switches": switches,
         "named": named,
+        "turn_starts": turn_starts,
     }))
     """
 )
@@ -239,15 +257,36 @@ def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(
 
 def test_this_hermes_names_the_session_where_the_provider_reads_it(names: dict[str, Any]) -> None:
     """The flush hooks carry no session id, so a flush goes under the id Hermes named
-    last (harnesses/hermes/live.py): at the start of each turn (``prefetch``, called
-    inline with the agent's session) and at ``sync_turn``. A Hermes that stopped naming
-    it as the turn starts would leave a flush, after a move it did not announce, under
-    the session left; one whose flush hooks came to carry an id should be read there
-    instead. By the call site's source text and the base class's signatures."""
+    last (harnesses/hermes/live.py): at the start of each turn (``prefetch``, on a
+    thread Hermes waits for, with the agent's session) and at ``sync_turn``. A Hermes
+    that stopped naming it as the turn starts would leave a flush, after a move it did
+    not announce, under the session left; one whose flush hooks came to carry an id
+    should be read there instead. By the call site's source text and the base class's
+    signatures."""
     assert names["named"] == {
         "turn_start": 1,
         "prefetch": ["self", "query", "session_id"],
         "sync_turn_names_one": True,
         "on_session_end": ["self", "messages"],
         "on_pre_compress": ["self", "messages"],
+    }
+
+
+def test_this_hermes_says_when_a_turn_starts_the_way_the_provider_reads_it(
+    names: dict[str, Any],
+) -> None:
+    """A session that holds turns from before uploads a turn only when the provider saw
+    it begin on the record (``on_turn_start``, turn_upload.TurnUploader.begin). That
+    reads three things off Hermes. The hook comes after the turn-start compaction: a
+    switch the compaction makes has moved the provider by then, so the turn is counted
+    under the id it runs in. It comes before the turn's ``prefetch``. And it carries the
+    user message before this one (``previous_message``), which tells a session Hermes
+    said was new that it holds copies; without it an ACP fork is left to the count of
+    its turns alone. By the source text of the call sites and the base class's
+    signature."""
+    assert names["turn_starts"] == {
+        "hook": ["self", "turn_number", "message", "kwargs"],
+        "says_what_came_before": 1,
+        "before_the_prefetch": True,
+        "after_the_compaction": True,
     }

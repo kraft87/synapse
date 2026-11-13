@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import orjson
+from psycopg.rows import class_row
 
 from ingestion.bm25_sql import bm25_filter
 from ingestion.embedding import embed_dims
@@ -103,6 +106,69 @@ def _emb_list(v: Any) -> list[float] | None:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class EntityRow:
+    """One entity of the owner, as the dedup name index hydrates it.
+
+    ``normalized_name`` is '' for a row written before that column existed."""
+
+    uuid: str
+    name: str
+    summary: str
+    entity_supertype: str | None
+    normalized_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _NearEntityRow:
+    """An entity and its cosine distance to the query embedding."""
+
+    uuid: str
+    name: str | None
+    dist: float
+
+
+@dataclass(frozen=True, slots=True)
+class _NearEdgeRow:
+    """A live edge and its cosine distance to the fact embedding."""
+
+    uuid: str
+    fact: str | None
+    valid_at: datetime | None
+    dist: float
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchEdgeRow:
+    """A live edge near the ``i``-th embedding of a batch (``i`` counts from 1)."""
+
+    i: int
+    uuid: str
+    fact: str | None
+    dist: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PairEdgeRow:
+    """A live edge between one source and target, its embedding as pgvector text."""
+
+    uuid: str
+    fact: str | None
+    valid_at: datetime | None
+    fact_embedding: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FulltextEdgeRow:
+    """A BM25 hit: its score, and its distance to the caller's embedding when one was given."""
+
+    uuid: str
+    fact: str | None
+    valid_at: datetime | None
+    sc: float
+    dist: float | None
+
+
 class KGPostgresReader:
     """Lazily-connected reader over the Postgres KG tables.
 
@@ -145,7 +211,7 @@ class KGPostgresReader:
         conn = self._connection()
         emb_s = _vec_literal(query_embedding)
         with conn.transaction():
-            cur = conn.cursor()
+            cur = conn.cursor(row_factory=class_row(_NearEntityRow))
             cur.execute("SET LOCAL hnsw.ef_search = 200")
             # The planner costs the seq scan as cheap (it can't see the
             # per-row detoast + halfvec-cast + distance work) and skips the
@@ -161,7 +227,9 @@ class KGPostgresReader:
                 ") sub WHERE owner_id = %s LIMIT %s",
                 (emb_s, _OVERFETCH, OWNER, limit),
             )
-            return [{"uuid": u, "name": n, "score": float(d)} for u, n, d in cur.fetchall()]
+            return [
+                {"uuid": r.uuid, "name": r.name, "score": float(r.dist)} for r in cur.fetchall()
+            ]
 
     def entity_uuid_by_normalized_name(self, normalized: str) -> str | None:
         """Exact normalized-name lookup (NodeDeduper short-circuit).
@@ -189,22 +257,22 @@ class KGPostgresReader:
         cur = conn.execute("SELECT subtype, supertype FROM kg_entity_types")
         return {str(sub): str(sup) for sub, sup in cur.fetchall()}
 
-    def load_entities(self) -> list[tuple[str, str, str, str | None, str]]:
-        """(uuid, name, summary, entity_supertype, normalized_name) for every entity of the owner
-        (LSH hydrate). The stored normalized_name is '' for a row written before the column.
+    def load_entities(self) -> list[EntityRow]:
+        """Every entity of the owner (LSH hydrate).
 
         In ``SURVIVOR_ORDER``: the caller's name index keeps the first row it sees for a key
         (``dict.setdefault``), so it must be the row ``entity_uuid_by_normalized_name`` returns.
         The key is the stored normalized_name, or lower(trim(name)) when that is empty."""
         conn = self._connection()
-        cur = conn.execute(
-            "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype, "
-            "COALESCE(normalized_name, '') "
+        cur = conn.cursor(row_factory=class_row(EntityRow)).execute(
+            "SELECT uuid, COALESCE(name, '') AS name, COALESCE(summary, '') AS summary, "
+            "entity_supertype, COALESCE(normalized_name, '') AS normalized_name "
             "FROM kg_entities WHERE owner_id = %s "
             "ORDER BY " + SURVIVOR_ORDER,  # nosec B608 - a module constant
             (OWNER,),
         )
-        return [(str(u), n, s, st, nn) for u, n, s, st, nn in cur.fetchall()]
+        rows: list[EntityRow] = cur.fetchall()
+        return rows
 
     # -- edge reads ------------------------------------------------------
 
@@ -218,7 +286,7 @@ class KGPostgresReader:
         conn = self._connection()
         emb_s = _vec_literal(fact_embedding)
         with conn.transaction():
-            cur = conn.cursor()
+            cur = conn.cursor(row_factory=class_row(_NearEdgeRow))
             cur.execute("SET LOCAL hnsw.ef_search = 200")
             # The planner costs the seq scan as cheap (it can't see the
             # per-row detoast + halfvec-cast + distance work) and skips the
@@ -236,8 +304,13 @@ class KGPostgresReader:
                 (emb_s, _OVERFETCH, OWNER, distance_threshold, limit),
             )
             return [
-                {"uuid": u, "fact": f, "valid_at": _iso(v), "score": float(d)}
-                for u, f, v, d in cur.fetchall()
+                {
+                    "uuid": r.uuid,
+                    "fact": r.fact,
+                    "valid_at": _iso(r.valid_at),
+                    "score": float(r.dist),
+                }
+                for r in cur.fetchall()
             ]
 
     def nearest_live_edges(
@@ -257,7 +330,7 @@ class KGPostgresReader:
             return []
         conn = self._connection()
         with conn.transaction():
-            cur = conn.cursor()
+            cur = conn.cursor(row_factory=class_row(_BatchEdgeRow))
             cur.execute("SET LOCAL hnsw.ef_search = 200")
             cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
@@ -282,22 +355,27 @@ class KGPostgresReader:
                 ),
             )
             out: list[list[dict[str, Any]]] = [[] for _ in fact_embeddings]
-            for i, u, f, d in cur.fetchall():
-                out[i - 1].append({"uuid": u, "fact": f, "score": float(d)})
+            for r in cur.fetchall():
+                out[r.i - 1].append({"uuid": r.uuid, "fact": r.fact, "score": float(r.dist)})
             return out
 
     def find_edges_by_pair(self, source_uuid: str, target_uuid: str) -> list[dict[str, Any]]:
         """Live edges between a source/target pair (contradiction candidates)."""
         conn = self._connection()
-        cur = conn.execute(
-            "SELECT uuid, fact, valid_at, fact_embedding::text FROM kg_relationships "
-            "WHERE owner_id = %s "
+        cur = conn.cursor(row_factory=class_row(_PairEdgeRow)).execute(
+            "SELECT uuid, fact, valid_at, fact_embedding::text AS fact_embedding "
+            "FROM kg_relationships WHERE owner_id = %s "
             "  AND src_uuid = %s AND tgt_uuid = %s AND t_invalid IS NULL",
             (OWNER, source_uuid, target_uuid),
         )
         return [
-            {"uuid": u, "fact": f, "valid_at": _iso(v), "fact_embedding": _emb_list(e)}
-            for u, f, v, e in cur.fetchall()
+            {
+                "uuid": r.uuid,
+                "fact": r.fact,
+                "valid_at": _iso(r.valid_at),
+                "fact_embedding": _emb_list(r.fact_embedding),
+            }
+            for r in cur.fetchall()
         ]
 
     def find_edges_by_fulltext(
@@ -321,7 +399,7 @@ class KGPostgresReader:
         else:
             dist_sql = f"fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})"
             args = (_vec_literal(fact_embedding), safe, OWNER, limit)
-        cur = conn.execute(
+        cur = conn.cursor(row_factory=class_row(_FulltextEdgeRow)).execute(
             f"SELECT uuid, fact, valid_at, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
             "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s)"
@@ -331,11 +409,11 @@ class KGPostgresReader:
         )
         return [
             {
-                "uuid": u,
-                "fact": f,
-                "valid_at": _iso(v),
-                "score": float(sc),
-                "dist": None if d is None else float(d),
+                "uuid": r.uuid,
+                "fact": r.fact,
+                "valid_at": _iso(r.valid_at),
+                "score": float(r.sc),
+                "dist": None if r.dist is None else float(r.dist),
             }
-            for u, f, v, sc, d in cur.fetchall()
+            for r in cur.fetchall()
         ]

@@ -161,10 +161,10 @@ def _check(db_url: str, sent: list[tuple[str, Any]], n: int) -> None:
 @pytest.mark.parametrize("restricted", [False, True])
 def test_the_fact_leg(corpus, sent, db_url, restricted):
     """Three filters, seven with a restricted device's provenance and label rule."""
-    with psycopg.connect(db_url, autocommit=True) as c, c.cursor() as cur:
+    with psycopg.connect(db_url, autocommit=True) as c:
         _session(c)
         kg_pg.search_kg_postgres(
-            cur,
+            c,
             "widget",
             onehot(0),
             "default",

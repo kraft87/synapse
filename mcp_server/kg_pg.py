@@ -18,7 +18,7 @@ Every leg, and the seed degree gate, skips facts extracted from web pages
 under its own floor; as facts it rated 1 helpful / 47 noise over the 60 days to
 2026-11-06, the worst slice of the fact bucket. The rows stay in place.
 
-The caller's cursor MUST have these session GUCs set (see parity_kg_read.py):
+The caller's connection MUST have these GUCs set (see parity_kg_read.py):
   - ``hnsw.ef_search = 200``               (matches FalkorDB's efRuntime)
   - ``enable_seqscan = off``               } pgvector won't use the HNSW index when
   - ``max_parallel_workers_per_gather = 0``} an equality filter is also present --
@@ -45,7 +45,11 @@ one list over every row the owner has.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+
+from psycopg.rows import class_row
 
 from ingestion.bm25_sql import bm25_filter
 from ingestion.embedding import embed_dims
@@ -61,9 +65,40 @@ _RRF_K = 60
 # queries (2026-11-06) the fewest in-scope, non-web survivors of the 200 was 46.
 _OVERFETCH = 200
 
-# One fact-leg row: (uuid, fact, t_valid, ongoing, last_supported_at), the columns every
-# fact-returning statement here selects, in that order.
-FactRow = tuple[Any, ...]
+
+@dataclass(frozen=True, slots=True)
+class FactRow:
+    """One fact-leg row: the columns every fact-returning statement here selects.
+
+    ``t_valid`` is when the fact became true (bitemporal valid-from), surfaced as the fact's
+    "as-of" date; ``ongoing`` and ``last_supported_at`` (schema 058) say whether the claim
+    can lapse silently and when the user last restated it, so the reader can tell
+    "valid-from 2025, never confirmed since" from "restated last week".
+    """
+
+    uuid: str
+    fact: str | None
+    t_valid: datetime | None
+    ongoing: bool | None
+    last_supported_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoredFactRow(FactRow):
+    """A BM25 fact row: that statement also selects the score it orders by."""
+
+    sc: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SeedRow:
+    """One candidate hop seed: an entity, its distance to the query and its live degree."""
+
+    uuid: str
+    name: str | None
+    summary: str | None
+    dist: float
+    deg: int
 
 
 #: synapse_meta key schema 066 stamps once: the highest kg_relationships.id when 066 ran.
@@ -141,7 +176,7 @@ def fact_text_key(fact: str) -> str:
 
 
 def search_kg_postgres(
-    cur: Any,
+    conn: Any,
     query: str,
     query_emb: list[float],
     owner_id: str,
@@ -186,19 +221,15 @@ def search_kg_postgres(
     owner_sql = "  AND uuid <> ALL(%s::text[]) " if exclude_seeds else ""
     owner_args: tuple[Any, ...] = (list(exclude_seeds),) if exclude_seeds else ()
     emb_s = _vec_literal(query_emb)
-    # uuid -> (fact text, t_valid, ongoing, last_supported_at). t_valid = when the fact became
-    # true (bitemporal valid-from), surfaced as the fact's "as-of" date; ongoing +
-    # last_supported_at (schema 058) say whether the claim can lapse silently and when the
-    # user last restated it, so the reader can tell "valid-from 2025, never confirmed since"
-    # from "restated last week". Served facts are already live (t_invalid IS NULL filtered
-    # everywhere below).
-    fact_by_uuid: dict[str, tuple[str, Any, Any, Any]] = {}
+    # Served facts are already live (t_invalid IS NULL filtered everywhere below).
+    fact_by_uuid: dict[str, FactRow] = {}
 
     # 1 — fact-embedding vector KNN. Over-fetch the GLOBAL live-fact HNSW on the bare
     # partial-index predicate (no owner -> the planner keeps the kg_rel_hnsw
     # index instead of falling back to a 47K-row bitmap+sort), then filter the tenant
     # scope on the small candidate set. See module docstring for the required GUCs.
     vec_fetched: list[FactRow]
+    cur = conn.cursor(row_factory=class_row(FactRow))
     if not restricted:
         cur.execute(
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
@@ -231,11 +262,11 @@ def search_kg_postgres(
         )
         vec_fetched = cur.fetchall()
     vec_uuids: list[str] = []
-    for u, f, tv, og, sup in vec_fetched:
-        if not f:
+    for row in vec_fetched:
+        if not row.fact:
             continue
-        fact_by_uuid.setdefault(u, (f, tv, og, sup))
-        vec_uuids.append(u)
+        fact_by_uuid.setdefault(row.uuid, row)
+        vec_uuids.append(row.uuid)
 
     # 2 — BM25 full-text over fact text (ParadeDB). Same alnum/space sanitize as
     # recall._search_kg so identifiers/error strings survive. t_invalid filtered
@@ -248,6 +279,7 @@ def search_kg_postgres(
         bm25_where = ["owner_id = %s", "t_invalid IS NULL", "web_artifact_id IS NULL"]
         if restricted:
             bm25_where.append(scope_predicate(fact_audience=fact_audience))
+        cur = conn.cursor(row_factory=class_row(_ScoredFactRow))
         cur.execute(
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
             "FROM kg_relationships "
@@ -256,11 +288,11 @@ def search_kg_postgres(
             "ORDER BY sc DESC LIMIT %s",
             (safe, owner_id, *scope_args, limit * 3),
         )
-        for u, f, tv, og, sup, _sc in cur.fetchall():
-            if not f:
+        for row in cur.fetchall():
+            if not row.fact:
                 continue
-            fact_by_uuid.setdefault(u, (f, tv, og, sup))
-            bm25_uuids.append(u)
+            fact_by_uuid.setdefault(row.uuid, row)
+            bm25_uuids.append(row.uuid)
 
     # 3 — entity seed vector KNN (top 25) + live-degree gate + focus bonus -> top 8.
     # The seed KNN uses the SAME bare-predicate over-fetch trick as the fact leg
@@ -276,6 +308,7 @@ def search_kg_postgres(
     # for all 25 seeds: a per-seed correlated count with an (src OR tgt) predicate can't
     # use the btree indexes and seq-scans the whole edge table per seed. Splitting the OR
     # into two index-driven `<col> IN (seeds)` semijoins keeps it on kg_rel_src/kg_rel_tgt.
+    cur = conn.cursor(row_factory=class_row(_SeedRow))
     cur.execute(
         "WITH seeds AS ("
         "  SELECT uuid, name, summary, dist FROM ("
@@ -317,11 +350,11 @@ def search_kg_postgres(
     )
     focus_set = set(session_focus)
     connected: list[tuple[float, str, str | None, str | None]] = []
-    for uuid_, name, summary, dist, deg in cur.fetchall():
-        if not deg:
+    for seed in cur.fetchall():
+        if not seed.deg:
             continue
-        bonus = 0.3 if (name in focus_set or uuid_ in focus_set) else 0.0
-        connected.append((float(dist) - bonus, uuid_, name, summary))
+        bonus = 0.3 if (seed.name in focus_set or seed.uuid in focus_set) else 0.0
+        connected.append((float(seed.dist) - bonus, seed.uuid, seed.name, seed.summary))
         if len(connected) >= 8:
             break
     connected.sort(key=lambda x: x[0])
@@ -333,6 +366,7 @@ def search_kg_postgres(
     # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected, the 8 edges
     # nearest the query).
     hop_uuids: list[str] = []
+    cur = conn.cursor(row_factory=class_row(FactRow))
     for sd in seed_uuids:
         cur.execute(
             # The 8 are the seed's edges whose fact embedding is nearest the query (exact cosine).
@@ -364,10 +398,10 @@ def search_kg_postgres(
             "ORDER BY dist ASC NULLS LAST, t_valid DESC LIMIT 8",
             (emb_s, owner_id, sd, sd, *scope_args),
         )
-        for u, f, tv, og, sup in cur.fetchall():
-            if u and f:
-                fact_by_uuid.setdefault(u, (f, tv, og, sup))
-                hop_uuids.append(u)
+        for row in cur.fetchall():
+            if row.uuid and row.fact:
+                fact_by_uuid.setdefault(row.uuid, row)
+                hop_uuids.append(row.uuid)
 
     # 5 — RRF fuse the three ranked lists; take the top `limit`. The same fact text stored
     # as separate edges (same-batch twins: ~200 such groups were live on 2026-10-09) serves
@@ -377,20 +411,20 @@ def search_kg_postgres(
     results: list[dict[str, Any]] = []
     seen_text: set[str] = set()
     for u, _ in top:
-        if u not in fact_by_uuid:
+        served = fact_by_uuid.get(u)
+        if served is None or not served.fact:
             continue
-        fact, t_valid, ongoing, supported = fact_by_uuid[u]
-        text_key = fact_text_key(fact)
+        text_key = fact_text_key(served.fact)
         if text_key in seen_text:
             continue
         seen_text.add(text_key)
         results.append(
             {
-                "fact": fact,
+                "fact": served.fact,
                 "_uuid": u,
-                "_date": t_valid,
-                "_ongoing": ongoing,
-                "_supported": supported,
+                "_date": served.t_valid,
+                "_ongoing": served.ongoing,
+                "_supported": served.last_supported_at,
             }
         )
         if len(results) >= limit:

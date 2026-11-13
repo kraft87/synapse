@@ -11,15 +11,22 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from psycopg.pq import TransactionStatus
+from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 import dream.skills.skill_derive as SD
 import dream.skills.skill_draft as DR
+import mcp_server.skill_sync_routes as SSR
 from dream.skills.skill_doc import body_hash
+from ingestion import pg_pool
 from mcp_server.skill_sync_routes import (
     _fetch_skill,
     _list_skills,
@@ -27,6 +34,7 @@ from mcp_server.skill_sync_routes import (
     _proposal_detail,
     _publish_skill,
     _record_overwrite,
+    _routing_eval,
 )
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "plugin" / "scripts"
@@ -39,6 +47,7 @@ def _skill(name: str, desc: str, step: str) -> str:
 
 V1 = _skill("acc-backup", "Back up the demo database.", "Dump the database.")
 V2 = _skill("acc-backup", "Back up the demo database.", "Dump the database, then verify it.")
+RETUNED = _skill("acc-backup", "Back up, dump or copy the demo database.", "Dump the database.")
 
 
 @pytest.fixture()
@@ -54,14 +63,14 @@ def acc(conn):
     _clean()
 
 
-def _publish(db_url, name, body, scope="global", when=_OLD_TIME):
+def _publish(db_url, name, body, scope="global", when=_OLD_TIME, description=""):
     _publish_skill(
         db_url,
         {
             "name": name,
             "scope": scope,
             "body": body,
-            "description": "",
+            "description": description,
             "content_modified_at": when,
             "files": [],
         },
@@ -303,6 +312,193 @@ def test_detail_reports_target_scope_and_registry_body(acc, db_url):
     assert d["apply_to"] == {"skill": "acc-backup", "scope": "project:acc-proj", "exists": True}
     assert d["registry_body"] == V1 and d["proposal_body"] == V2
     assert d["base_body_hash"] == body_hash(V1) and d["apply_issues"] == []
+
+
+# ------------------------------------------------------------------ the routing check
+# Once a retune is applied, a model is asked where the phrasings the skill missed route now.
+# These run the real _routing_eval, on the connection _proposal_act hands it; only the
+# model is a stand-in.
+
+
+class _Model:
+    """Stands in for the LLM client: keeps each prompt, answers with `reply` (text, or a
+    function of the prompt)."""
+
+    def __init__(self, reply):
+        self.reply, self.prompts = reply, []
+        self.messages = self
+
+    def create(self, *, model, max_tokens, messages):
+        self.prompts.append(messages[0]["content"])
+        text = self.reply(self.prompts[-1]) if callable(self.reply) else self.reply
+        return SimpleNamespace(content=[SimpleNamespace(text=text)])
+
+
+@pytest.fixture()
+def model(monkeypatch):
+    def _install(reply):
+        fake = _Model(reply)
+        monkeypatch.setattr("ingestion.llm_client.create_llm_client", lambda *a, **k: fake)
+        return fake
+
+    return _install
+
+
+def _missed(*phrasings):
+    return [
+        {"session_id": f"acc-s{i}", "class": "judge", "signal": "under_trigger", "phrasing": p}
+        for i, p in enumerate(phrasings, 1)
+    ]
+
+
+def _retune_with_misses(acc, db_url, *phrasings, **candidate):
+    _publish(db_url, "acc-backup", V1, description="Back up the demo database.")
+    candidate = {"body": RETUNED, "base": body_hash(V1), **candidate}
+    return _candidate(acc, evidence=_missed(*phrasings), **candidate)
+
+
+def test_a_retune_accept_asks_where_the_missed_phrasings_route(acc, db_url, model):
+    _publish(db_url, "acc-restore", "# acc-restore\n", description="Restore the demo database.")
+    _publish(db_url, "acc-gone", "# acc-gone\n", description="A retired skill.")
+    acc.execute("UPDATE skills_lane.skill_registry SET status='retired' WHERE name='acc-gone'")
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", "save a copy of the database")
+    fake = model('Here it is:\n{"matches": ["acc-backup", "none"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert r["status"] == "promoted"
+    assert r["routing_eval"] == (
+        "routing-eval: 1/2 missed phrasings map to 'acc-backup' after the retune"
+    )
+    (prompt,) = fake.prompts
+    # the catalog is the active skills, each with the description it has after the retune
+    assert "- acc-backup: Back up, dump or copy the demo database.\n" in prompt
+    assert "Back up the demo database." not in prompt
+    assert "- acc-restore: Restore the demo database.\n" in prompt
+    assert "acc-gone" not in prompt
+    assert "- name: description" not in prompt
+    assert "- dump the db for me\n- save a copy of the database\n" in prompt
+    # and the model is not told which skill is hoped for: its catalog line is the one mention
+    assert prompt.count("acc-backup") == 1
+
+
+def test_the_routing_check_reads_the_description_the_reviewer_supplied(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me")
+    edited = _skill("acc-backup", "Dump the demo database to a file.", "Dump the database.")
+    fake = model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval, body=edited)
+
+    assert r["status"] == "promoted"
+    (prompt,) = fake.prompts
+    assert "- acc-backup: Dump the demo database to a file.\n" in prompt
+    assert "Back up, dump or copy" not in prompt
+
+
+def test_the_routing_check_asks_about_the_skill_the_retune_was_written_to(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", name="acc-backup-widen")
+    model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert (r["status"], r["skill"]) == ("promoted", "acc-backup")
+    assert r["routing_eval"] == (
+        "routing-eval: 1/1 missed phrasings map to 'acc-backup' after the retune"
+    )
+
+
+def test_a_refused_retune_asks_nothing(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", base=body_hash(V2))  # stale
+    fake = model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert (r["status"], r["reason"]) == ("refused", "stale")
+    assert "routing_eval" not in r and fake.prompts == []
+    assert _registry(acc, "acc-backup")[0] == V1
+
+
+def test_a_retune_with_no_missed_phrasings_asks_nothing(acc, db_url, model):
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, body=V2, base=body_hash(V1))  # judge evidence, no under-trigger
+    fake = model('{"matches": []}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert r["status"] == "promoted"
+    assert r["routing_eval"] == "routing-eval: no phrasings to eval"
+    assert fake.prompts == []
+
+
+@pytest.mark.parametrize(
+    ("reply", "note"),
+    [
+        ('{"matches": ["acc-backup"]}', "routing-eval skipped: 1 answers for 2 phrasings"),
+        ("I cannot say.", "routing-eval skipped: the answer is not JSON"),
+    ],
+)
+def test_an_answer_that_does_not_fit_the_phrasings_is_not_counted(acc, db_url, model, reply, note):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", "save a copy of the database")
+    model(reply)
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert r["status"] == "promoted" and r["routing_eval"] == note
+
+
+def test_a_failing_model_does_not_stop_the_accept(acc, db_url, model, caplog):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me")
+
+    def _boom(_prompt):
+        raise RuntimeError("no login")
+
+    model(_boom)
+    with caplog.at_level("WARNING", logger="mcp_server.skill_sync_routes"):
+        r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert r["status"] == "promoted"
+    assert r["routing_eval"] == "routing-eval skipped: RuntimeError: no login"
+    assert f"routing-eval for skill candidate {cid} failed" in caplog.text
+
+
+def test_a_slow_model_is_not_waited_for(acc, db_url, model, monkeypatch):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me")
+    release = threading.Event()
+
+    def _slow(_prompt):
+        release.wait(30)
+        return '{"matches": ["acc-backup"]}'
+
+    model(_slow)
+    monkeypatch.setattr(SSR, "_ROUTING_EVAL_BUDGET_S", 0.2)
+    started = time.monotonic()
+    try:
+        r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+        waited = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert r["status"] == "promoted"
+    assert r["routing_eval"] == "routing-eval skipped: no answer within 0.2s"
+    assert waited < 10  # the accept came back while the model was still thinking
+
+
+def test_no_transaction_is_open_while_the_model_is_asked(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me")
+    seen = []
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
+        c.execute("SELECT 1").fetchone()  # a read is open on the connection it is handed
+
+        def _answer(_prompt):
+            seen.append(c.info.transaction_status)
+            return '{"matches": ["acc-backup"]}'
+
+        model(_answer)
+        note = _routing_eval(c, cid, "acc-backup")
+        c.commit()
+
+    assert note == "routing-eval: 1/1 missed phrasings map to 'acc-backup' after the retune"
+    assert seen == [TransactionStatus.IDLE]
 
 
 # ------------------------------------------------------------------ sync delivers it

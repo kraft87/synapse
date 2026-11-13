@@ -24,7 +24,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from ingestion.kg_pg_read import KGPostgresReader
+from ingestion.kg_pg_read import EntityRow, KGPostgresReader
 from ingestion.kg_pg_write import KGPostgresWriter
 
 logger = logging.getLogger(__name__)
@@ -206,10 +206,9 @@ class KGClient:
         result: str | None = self._reader.entity_uuid_by_normalized_name(normalized)
         return result
 
-    def load_entities(self) -> list[tuple[str, str, str, str | None, str]]:
-        """(uuid, name, summary, entity_supertype, normalized_name) for every entity of the owner
-        (LSH hydrate)."""
-        result: list[tuple[str, str, str, str | None, str]] = self._reader.load_entities()
+    def load_entities(self) -> list[EntityRow]:
+        """Every entity of the owner (LSH hydrate)."""
+        result: list[EntityRow] = self._reader.load_entities()
         return result
 
     def load_type_map(self) -> dict[str, str]:

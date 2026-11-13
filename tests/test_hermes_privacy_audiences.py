@@ -312,6 +312,27 @@ def _owner_author() -> dict[str, Any]:
     return {"id": gs._owner(), "name": None, "is_bot": False}
 
 
+@pytest.mark.parametrize(
+    ("owner", "author", "expected"),
+    [
+        (None, (None, None, None), False),  # in-process: the owner at the keyboard
+        (None, (None, None, False), False),
+        ("u1", (None, None, False), False),
+        ("u1", ("u1", None, False), False),  # the gateway names the owner on every turn
+        ("u1", ("u1", "Kyle", False), False),
+        ("u1", ("u2", None, False), True),
+        ("u1", (None, "someone", False), True),
+        (None, ("u1", None, False), True),  # an author where no user was bound
+        (None, (None, "someone", None), True),
+        ("u1", ("u1", None, True), True),  # a bot, whatever id it carries
+        (None, (None, None, True), True),
+    ],
+)
+def test_whether_a_turns_author_is_someone_else(owner, author, expected):
+    """sessions.foreign, which ``on_turn_start`` and ``sync_turn`` both go by."""
+    assert hs.foreign(owner, *author) is expected
+
+
 def test_the_owners_own_turn_author_is_uploaded(plugin, server, tmp_path):
     """The owner's turn in the daemon carries the owner as its author, on
     ``on_turn_start`` (agent/turn_context.py:1061-1080) and ``sync_turn``
@@ -345,6 +366,7 @@ def test_a_turn_author_not_the_owner_is_never_uploaded(plugin, server, tmp_path,
     home = tmp_path / "hermes-a"
     _store(home)
     provider = _start_gateway(_new(plugin), home)
+    provider.on_turn_start(1, "q")
     provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1), turn_author=None)
     assert len(server.posts()) == 1
     with caplog.at_level(logging.INFO):
@@ -401,6 +423,7 @@ def test_any_author_in_process_is_someone_else(plugin, server, tmp_path, author)
     (``HERMES_TURN_AUTHOR``, tools/bot_relay.py ``delivery_env``)."""
     provider = _new(plugin)
     provider.initialize(_RESET_CHILD, hermes_home=str(tmp_path / "hermes-a"), **_in_process())
+    provider.on_turn_start(1, "q")
     provider.sync_turn("q", "a", session_id=_RESET_CHILD, messages=_conversation(1))
     assert len(server.posts()) == 1
     provider.sync_turn(

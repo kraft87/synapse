@@ -18,7 +18,12 @@ turn ending in one is still running (a harness's list may be read mid-turn). Onl
 complete turns are uploaded, each with the complete turn before it as its context.
 Synthetic rows do not count towards a turn's key either, so one added after a finished
 turn neither reopens it nor makes it look new. The reply to one does: it lands on the
-turn before, which then has a new key, and ``stems`` gives the keys it had.
+turn before, which then has a new key, as does the reply to a user row with no text.
+The row that opens a turn stays its own however the turn goes on (``opening_key``), and
+``joined`` says a turn holds more than its own exchange. For that an adapter keeps
+every user row, also one that opens no turn: left out, the reply to it would read as the
+reply of the turn before. And a row its harness folded two user messages into is
+followed by a synthetic row with no text: one row cannot show that it holds two.
 """
 
 from __future__ import annotations
@@ -66,19 +71,25 @@ def complete(turn: Sequence[Record]) -> bool:
     return bool(real) and _final(real[-1])
 
 
-def stems(turn: Sequence[Record]) -> list[str]:
-    """The keys ``turn`` had each time it was complete before it went on. No real user
-    row opened what follows such a point (the harness wrote one in the user's place, or
-    the row was left out of the records), so it landed on the turn already finished."""
-    keys: list[str] = []
-    last: Record | None = None
-    for at, record in enumerate(turn):
-        if record.get("synthetic"):
-            continue
-        if last is not None and _final(last):
-            keys.append(turn_key(turn[:at]))
-        last = record
-    return keys
+def joined(turn: Sequence[Record]) -> bool:
+    """Whether ``turn`` holds more than the exchange its first row opens: a user row
+    besides that one, or any row after its reply. Such a row began something later
+    than the turn did, which landed on it: a row written in the user's place, or a
+    user row with no text. A synthetic row counts too, also when nothing follows it:
+    the harness may have begun a turn with it that left no other row."""
+    replied = False
+    for record in turn[1:]:
+        if replied or record["role"] == "user":
+            return True
+        replied = _final(record)
+    return False
+
+
+def opening_key(turn: Sequence[Record]) -> str:
+    """A stable key for the row that opens ``turn``: its ``id``, else a hash of the row
+    (two rows that read the same are then one). ``turn_key`` changes when a turn goes
+    on; this one does not, so it says the turn is the same one, however it ends."""
+    return turn_key(turn[:1])
 
 
 def turn_key(turn: Sequence[Record]) -> str:

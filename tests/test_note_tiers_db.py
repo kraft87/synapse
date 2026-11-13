@@ -140,8 +140,8 @@ def test_personal_write_never_edits_a_matching_work_safe_note(conn, tiers, confi
 def test_a_confirm_that_cannot_answer_never_edits_the_other_tier(
     conn, tiers, confirm, monkeypatch, outage
 ):
-    """An LLM failure and SYNAPSE_NOTES_CONFIRM=0 both answer "same". Across tiers that
-    answer must still leave the other tier's note alone."""
+    """An LLM failure answers "related" and SYNAPSE_NOTES_CONFIRM=0 answers "same". Either
+    way the other tier's note must be left alone."""
     register_restricted(conn, ["alpha"])
     work = _seed(tiers, audience="work-safe")
     if outage == "llm_error":

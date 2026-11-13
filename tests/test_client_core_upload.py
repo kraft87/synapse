@@ -458,14 +458,27 @@ def test_after_a_failed_batch_the_rest_are_queued_without_a_request(tmp_path):
     assert sent.count("a20") == 2 and sent.count("a21") == 1  # 20 leads the second as context
 
 
+def test_after_a_batch_that_is_lost_the_rest_are_not_requested_either(tmp_path):
+    turns, wire = _turns(tmp_path)  # no outbox: a failed send is lost, and kept
+    records = [row for n in range(1, 22) for row in _turn(n)]  # 21 turns: two batches
+    wire.fail = urllib.error.URLError("refused")
+    assert turns.upload(records, "s-1", timeout=5) is False and wire.tries == 1
+    wire.fail = None
+    assert turns.upload(records, "s-1", timeout=5) is True
+    sent = [row["id"] for post in wire.posts for row in post["body"]["records"]]
+    assert [sent.count(f"a{n}") for n in (1, 20, 21)] == [1, 2, 1]  # 20: context too
+
+
 def test_the_turn_that_has_just_ended_goes_up_after_time_off_the_record(tmp_path):
-    """``lookback`` 0 leaves out every turn from before. The turn that ends as the
-    session comes back on the record is not one of them, and the turn before it, spoken
-    off the record, does not go along as its context."""
+    """``lookback`` 0 leaves out every turn from before. A turn seen to begin once the
+    session is back on the record (``begin``) is not one of them, and the turn before
+    it, spoken off the record, does not go along as its context."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     assert wire.posts[0]["body"]["records"] == _turn(3)
+    turns.begin("s-1")
     assert turns.upload(said + _turn(4), "s-1", timeout=5, finished=True) is True
     assert wire.posts[1]["body"]["records"] == _turn(3) + _turn(4)  # 3 was sent: context
 
@@ -477,15 +490,16 @@ def test_the_turn_that_has_just_ended_goes_up_after_time_off_the_record(tmp_path
 )
 def test_a_turn_from_before_is_not_taken_for_the_one_that_has_just_ended(tmp_path, last, finished):
     """A flush (the session ends, a compression is due) is not a turn ending, and a
-    last turn cut short is not the one before it."""
+    last turn cut short is not the one before it. Neither had a turn start before it."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + last
     assert turns.upload(said, "s-1", timeout=5, finished=finished) is False and wire.tries == 0
     done = _turn(1) + _turn(2) + _turn(3) + _turn(4) + _turn(5)
     assert turns.upload(done, "s-1", timeout=5, finished=True) is True
     sent = [r["id"] for r in wire.posts[0]["body"]["records"] if r["role"] == "user"]
-    # What the first upload left out stays out, as a turn and as a context.
-    assert sent == ["u4", "u5"]
+    # What the first upload left out stays out, as a turn and as a context: also the
+    # turn cut short, which was not seen to begin on the record.
+    assert sent == (["u5"] if finished else ["u4", "u5"])
 
 
 def test_a_turn_that_has_just_ended_adds_nothing_to_a_look_back(tmp_path):
@@ -542,12 +556,9 @@ def test_with_no_marker_to_go_by_the_server_is_asked_before_anything_is_uploaded
     client, wire = _client(tmp_path)
     box = Outbox(tmp_path / "q")
     up = upload.Uploader(client, box)
-    done: list[str] = []
+    done: list[bool] = []
     _mark(tmp_path, "s-other")
-    assert (
-        up.carry_private(["s-old", "", "s-parent"], "s-new", settled=lambda: done.append("s"))
-        is False
-    )
+    assert up.carry_private(["s-old", "", "s-parent"], "s-new", settled=done.append) is False
     # Nothing was written or asked yet: the question waits for the session's next upload.
     assert not (tmp_path / "private" / "s-new").exists() and wire.requests == [] and done == []
     assert up.is_private("s-new") and up.asking("s-new")
@@ -556,11 +567,11 @@ def test_with_no_marker_to_go_by_the_server_is_asked_before_anything_is_uploaded
     assert wire.tries == 0 and not box.directory.exists()
 
     assert up.settle_private("s-new") is True
-    assert wire.requests == [_get("s-old"), _get("s-parent")] and done == ["s"]
+    assert wire.requests == [_get("s-old"), _get("s-parent")] and done == [False]
     assert not up.is_private("s-new") and not up.asking("s-new")
     assert not (tmp_path / "private" / "s-new").exists()
     assert up.send(_body("s-new"), timeout=5) == (upload.SENT, "")
-    assert up.settle_private("s-new") is True and len(wire.requests) == 2 and done == ["s"]
+    assert up.settle_private("s-new") is True and len(wire.requests) == 2 and done == [False]
 
 
 @pytest.mark.parametrize("marker_hours", [None, 13])
@@ -571,15 +582,15 @@ def test_a_session_the_server_holds_private_is_carried_without_its_marker(tmp_pa
     client, wire = _client(tmp_path)
     lines: list[str] = []
     up = upload.Uploader(client, log=lines.append)
-    done: list[str] = []
+    done: list[bool] = []
     if marker_hours is not None:
         _mark(tmp_path, "s-old", hours=marker_hours)
     wire.rows.add("s-old")
-    assert up.carry_private(["s-old"], "s-new", settled=lambda: done.append("s")) is False
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is False
     assert up.is_private("s-new") and not (tmp_path / "private" / "s-old").exists()
     del lines[:]  # the line of private.py for a marker past its time
     assert up.settle_private("s-new") is True
-    assert wire.requests == [_get("s-old"), _put("s-new")] and done == ["s"]
+    assert wire.requests == [_get("s-old"), _put("s-new")] and done == [True]
     assert lines == [f"{_CONTINUES}: it is off the record too"]
     assert (tmp_path / "private" / "s-new").is_file() and not up.asking("s-new")
     # The marker is all there is to it now: another uploader refuses the session too.
@@ -594,8 +605,8 @@ def test_a_session_the_server_holds_private_is_carried_without_its_marker(tmp_pa
 def test_a_reply_that_does_not_say_keeps_the_session_held(tmp_path, answer):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
-    assert up.carry_private(["s-old"], "s-new", settled=lambda: done.append("s")) is False
+    done: list[bool] = []
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is False
     wire.answer = answer
     assert up.settle_private("s-new") is False
     assert up.is_private("s-new") and up.asking("s-new") and done == []
@@ -606,9 +617,9 @@ def test_a_server_that_does_not_answer_keeps_the_session_held(tmp_path):
     client, wire = _client(tmp_path)
     box = Outbox(tmp_path / "q")
     up = upload.Uploader(client, box)
-    done: list[str] = []
+    done: list[bool] = []
     wire.rows.add("s-old")
-    assert up.carry_private(["s-old"], "s-new", settled=lambda: done.append("s")) is False
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is False
     wire.fail_private = urllib.error.URLError("down")
     assert up.settle_private("s-new") is False and up.settle_private("s-new") is False
     assert up.is_private("s-new") and done == []
@@ -617,7 +628,7 @@ def test_a_server_that_does_not_answer_keeps_the_session_held(tmp_path):
     # Another session's upload is not held up by it.
     assert up.send(_body("s-on"), timeout=5) == (upload.SENT, "")
     wire.fail_private = None
-    assert up.settle_private("s-new") is True and done == ["s"]
+    assert up.settle_private("s-new") is True and done == [True]
     assert wire.requests[-2:] == [_get("s-old"), _put("s-new")]
     assert (tmp_path / "private" / "s-new").is_file()
 
@@ -698,12 +709,12 @@ def test_an_asked_session_found_private_here_is_the_answer(tmp_path):
 def test_a_second_carry_keeps_what_the_session_was_asking(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
+    done: list[bool] = []
     wire.rows.add("s-a")
-    assert up.carry_private(["s-a"], "s-b", settled=lambda: done.append("b")) is False
+    assert up.carry_private(["s-a"], "s-b", settled=done.append) is False
     assert up.carry_private(["s-x"], "s-b") is False
     assert up.settle_private("s-b") is True
-    assert wire.requests == [_get("s-a"), _put("s-b")] and done == ["b"]
+    assert wire.requests == [_get("s-a"), _put("s-b")] and done == [True]
     assert (tmp_path / "private" / "s-b").is_file()
 
 
@@ -750,12 +761,10 @@ def test_the_marker_is_written_and_the_hold_taken_in_one_step(tmp_path, monkeypa
 def test_an_earlier_session_on_the_record_everywhere_lets_the_new_one_go(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
+    done: list[bool] = []
     _mark(tmp_path, "s-stale", hours=13)
-    assert (
-        up.carry_private(["s-old", "s-stale"], "s-new", settled=lambda: done.append("s")) is False
-    )
-    assert up.settle_private("s-new") is True and done == ["s"]
+    assert up.carry_private(["s-old", "s-stale"], "s-new", settled=done.append) is False
+    assert up.settle_private("s-new") is True and done == [False]
     assert wire.requests == [_get("s-old"), _get("s-stale")]
     assert up.send(_body("s-new"), timeout=5) == (upload.SENT, "")
     assert not (tmp_path / "private" / "s-new").exists()
@@ -766,8 +775,8 @@ def test_with_nothing_earlier_there_is_nothing_to_ask(tmp_path):
     session was asked about is not written."""
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
-    assert up.carry_private(["", "s-new"], "s-new", settled=lambda: done.append("s")) is False
+    done: list[bool] = []
+    assert up.carry_private(["", "s-new"], "s-new", settled=done.append) is False
     assert not up.is_private("s-new") and wire.requests == []
     assert up.settle_private("s-new") is True and done == [] and wire.requests == []
 
@@ -777,24 +786,71 @@ def test_settled_is_not_called_before_the_server_has_the_row(tmp_path):
     still owed, a later program would find a lapsed marker and nothing else."""
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
+    done: list[bool] = []
     _mark(tmp_path, "s-old")
     wire.fail_private = urllib.error.URLError("down")
-    assert up.carry_private(["s-old"], "s-new", settled=lambda: done.append("s")) is True
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is True
     assert up.settle_private("s-new") is False and done == []
     wire.fail_private = None
-    assert up.settle_private("s-new") is True and done == ["s"]
+    assert up.settle_private("s-new") is True and done == [True]
 
 
 def test_a_settled_that_raises_changes_nothing(tmp_path):
     client, _ = _client(tmp_path)
     up = upload.Uploader(client)
 
-    def broken() -> None:
+    def broken(made: bool) -> None:
         raise RuntimeError("no disk")
 
     assert up.carry_private(["s-old"], "s-new", settled=broken) is False
     assert up.settle_private("s-new") is True and not up.is_private("s-new")
+
+
+@pytest.mark.parametrize("private", [False, True], ids=["on the record", "private"])
+def test_a_session_carried_again_while_its_question_is_open_tells_every_caller(tmp_path, private):
+    """A harness asks about one session twice before the server has said: where it
+    moves to the id, and where the id's first upload reads its row. Each call has its
+    own note to write, and the later one does not take the earlier one's place. One
+    that raises keeps none of the others from being called."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    first: list[bool] = []
+    last: list[bool] = []
+
+    def broken(made: bool) -> None:
+        raise RuntimeError("no disk")
+
+    if private:
+        wire.rows.add("s-old")
+    assert up.carry_private(["s-old"], "s-new", settled=first.append) is False
+    assert up.carry_private(["s-old"], "s-new", settled=broken) is False
+    assert up.carry_private(["s-old", "s-parent"], "s-new", settled=last.append) is False
+    assert first == [] and last == []
+    assert up.settle_private("s-new") is True
+    assert first == [private] and last == [private]
+    # Once each: a later settle has no one left to tell.
+    assert up.settle_private("s-new") is True and first == [private] and last == [private]
+
+
+def test_a_session_carried_again_before_the_server_was_told_tells_every_caller_too(tmp_path):
+    """Made private by a marker, with the server still to be told: the question is
+    open, and a second carry's note is kept with the first. Both are called once the
+    server has the row. A carry after that has nothing left to wait for, and its
+    callback is not called: the session is left as it is."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    first: list[bool] = []
+    second: list[bool] = []
+    late: list[bool] = []
+    _mark(tmp_path, "s-old")
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=first.append) is True
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=second.append) is True
+    assert first == [] and second == [] and wire.requests == []
+    assert up.settle_private("s-new") is True
+    assert first == [True] and second == [True]
+    assert up.carry_private(["s-old"], "s-new", timeout=None, settled=late.append) is True
+    assert up.settle_private("s-new") is True
+    assert late == [] and first == [True] and second == [True]
 
 
 def test_carrying_without_a_timeout_tells_the_server_at_the_next_upload(tmp_path):
@@ -829,13 +885,32 @@ def test_every_session_the_server_is_still_to_be_told_about_is_told(tmp_path):
     assert wire.rows == {"s-2", "s-3", "s-4"}
 
 
+def test_telling_the_server_stops_at_the_first_request_that_fails(tmp_path):
+    """Each try holds the caller for its timeout, and the caller is a hook on the
+    harness's worker: with the server gone again, one failed request says enough."""
+    client, wire = _client(tmp_path)
+    warned: list[str] = []
+    up = upload.Uploader(client, warn=warned.append)
+    _mark(tmp_path, "s-1")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-1"], "s-2") is True
+    assert up.carry_private(["s-2"], "s-3") is True
+    assert up.carry_private(["s-3"], "s-4") is True
+    wire.requests.clear()
+    up.settle_owed()
+    assert wire.requests == [_put("s-2")]
+    wire.fail_private = None
+    up.settle_owed()
+    assert wire.requests[1:] == [_put("s-2"), _put("s-3"), _put("s-4")]
+
+
 def test_a_delivered_upload_tells_the_server_what_it_is_still_to_be_told(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
-    done: list[str] = []
+    done: list[bool] = []
     _mark(tmp_path, "s-1")
     wire.fail_private = urllib.error.URLError("down")
-    assert up.carry_private(["s-1"], "s-2", settled=lambda: done.append("s-2")) is True
+    assert up.carry_private(["s-1"], "s-2", settled=done.append) is True
     wire.fail = urllib.error.URLError("down")
     wire.requests.clear()
     assert up.send(_body("s-on"), timeout=5)[0] == upload.LOST and wire.requests == []
@@ -843,7 +918,7 @@ def test_a_delivered_upload_tells_the_server_what_it_is_still_to_be_told(tmp_pat
     assert done == []
     assert up.send(_body("s-on"), timeout=5) == (upload.SENT, "")
     assert wire.requests == [_put("s-2")] and "s-2" in wire.rows
-    assert done == ["s-2"]  # settled, as when an upload of its own tells the server
+    assert done == [True]  # settled, as when an upload of its own tells the server
 
 
 def test_a_try_that_fails_after_a_delivered_upload_is_a_warning(tmp_path):
@@ -932,6 +1007,7 @@ def test_turns_kept_for_a_session_the_server_then_calls_private_are_dropped(tmp_
     (tmp_path / "private" / "s-new").unlink()  # `private off --forget`
     wire.rows.discard("s-new")
     said = _turn(2) + _turn(3) + _turn(4)
+    turns.begin("s-new")
     assert turns.upload(said, "s-new", timeout=5, finished=True) is True
     assert [post["body"]["records"] for post in wire.posts] == [_turn(4)]
 
