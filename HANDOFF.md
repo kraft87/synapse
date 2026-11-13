@@ -119,7 +119,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` (a child process
   killed mid-request, sessions sharing an outbox), `test_client_core_outbox_writeahead.py`,
   `test_client_core_outbox_private_dirs.py`, `test_hermes_install_selection.py`.
-  - Non-db suite: 4424 passed, 37 skipped, 2 xfailed.
+  - Non-db suite: 4444 passed, 38 skipped, 2 xfailed.
   - With `SYNAPSE_HERMES_CHECKOUT`, the integration test and
     `test_hermes_checkout_names.py` pass against Hermes `bca51750`, the columns the
     rule reads from its store and the `model_config` keys that name a copy's origin
@@ -548,6 +548,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   `systemMessage` warning, the 20 s kill, the skills sync's time on a large folder, and
   payloads Codex might send that the tests do not.
 - Claude Code's hooks are next onto the core.
+
 
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 
