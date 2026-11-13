@@ -48,11 +48,15 @@ TARGETS: dict[str, tuple[str, ...]] = {
 
 #: Cheap server-side prefilter: every redaction rule needs one of these substrings, so a
 #: row matching none of them cannot change. Keeps the scan from shipping the whole
-#: corpus over the wire.
+#: corpus over the wire. Postgres evaluates it (``~*``, so case-insensitive), not
+#: Python: no ``\b``. A rule added to ``ingestion.secret_redact`` needs its entry here
+#: (tests/test_redact_stored_secrets_db.py fails until it has one).
 _PREFILTER = (
     r"sk-|[rs]k_(live|test)_|gh[pousr]_|github_pat_|glpat-|hf_|xox[a-z]-|AKIA|ASIA|AIza|eyJ"
-    r"|PRIVATE KEY|bearer|basic|://|password|passwd|passphrase|secret|token|api.?key"
-    r"|access.?key|credential|[MN][A-Za-z0-9_-]{23,27}\."
+    r"|pylf_v|syt_|pa-[A-Za-z0-9_-]{40}|fc-[a-f0-9]{32}|sk_[a-f0-9]{40}|[0-9]{8}:AA"
+    r"|private.?key|bearer|basic|://|password|passwd|passphrase|secret|token|api.?key"
+    r"|access.?key|credential|[MNO][A-Za-z0-9_-]{23,27}\."
+    r"|/webhooks/[0-9]|hooks\.slack\.com/"
 )
 _MARK = re.compile(r"\[REDACTED:([a-z-]+)\]")
 
