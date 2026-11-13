@@ -1,12 +1,18 @@
-"""No SQL in the application names the legacy ``group_id`` column.
+"""No SQL in the application names the legacy ``group_id`` column, or reads one of the
+four tables that carried it with ``*``.
 
-The knowledge graph is one memory per owner. ``group_id`` is still a column on
-``kg_entities``, ``kg_relationships``, ``notes`` and ``preferences``, but schema 067 gave it
-a default and the application neither reads nor writes it; only ``scripts/pile_merge.py``
-(the merge and its undo) does. A new statement that selects, filters or inserts it would
-quietly bring the two-pile split back, and nothing else would fail: the column still exists,
-and after 067 every row says ``technical``. This test scans ``ingestion/`` and
-``mcp_server/`` and fails on the first such statement, naming the file and line.
+The knowledge graph is one memory per owner. Schema 069 drops ``group_id`` from
+``kg_entities``, ``kg_relationships``, ``notes`` and ``preferences``, and it is applied by
+hand after the release, so the same image runs on a database with the column and on one
+without. A statement that names it would fail on the second, and on the first a write that
+names it would quietly bring the two-pile split back. This test scans ``ingestion/``,
+``mcp_server/`` and ``dream/`` and fails on the first such statement, naming the file and
+line.
+
+``SELECT *``, ``alias.*`` and ``RETURNING *`` name no column, so the plain rule cannot see
+them, yet on those four tables they return ``group_id`` where the column is still there and
+not where it is gone: a row handed on, copied or read by position differs between the two
+databases. A literal that names one of the four tables may not select ``*`` from anything.
 
 How it tells SQL from prose. The sources are parsed with ``ast``, so comments are never
 seen. A docstring (the first statement of a module, class or function) is prose: the
@@ -36,8 +42,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SCANNED = ("ingestion", "mcp_server")
+SCANNED = ("ingestion", "mcp_server", "dream")
 _GROUP_ID = re.compile(r"\bgroup_id\b", re.IGNORECASE)
+_FOUR_TABLES = re.compile(r"\b(?:kg_entities|kg_relationships|notes|preferences)\b", re.I)
+_STAR = re.compile(
+    r"(?:\bSELECT\s+(?:DISTINCT\s+(?:ON\s*\([^)]*\)\s*)?)?|,\s*)(?:[a-z_][a-z0-9_]*\.)?\*"
+    r"|\bRETURNING\s+\*",
+    re.I,
+)
 
 #: (file relative to the repository root, the literal) -> why it is not SQL.
 ALLOWED: dict[tuple[str, str], str] = {
@@ -85,6 +97,16 @@ def _literal_text(node: ast.AST) -> str | None:
 def group_id_literals(source: str) -> list[tuple[int, str]]:
     """(line, text) of every string literal in ``source`` that names ``group_id``, outside
     docstrings."""
+    return _literals(source, _GROUP_ID.search)
+
+
+def star_reads(source: str) -> list[tuple[int, str]]:
+    """(line, text) of every string literal in ``source``, outside docstrings, that names one
+    of the four tables and selects or returns ``*``."""
+    return _literals(source, lambda text: _FOUR_TABLES.search(text) and _STAR.search(text))
+
+
+def _literals(source: str, match) -> list[tuple[int, str]]:
     tree = ast.parse(source)
     skip = _docstrings(tree)
     hits: list[tuple[int, str]] = []
@@ -94,7 +116,7 @@ def group_id_literals(source: str) -> list[tuple[int, str]]:
             return
         text = _literal_text(node)
         if text is not None:
-            if _GROUP_ID.search(text):
+            if match(text):
                 hits.append((getattr(node, "lineno", 0), text))
             return
         for child in ast.iter_child_nodes(node):
@@ -104,13 +126,13 @@ def group_id_literals(source: str) -> list[tuple[int, str]]:
     return hits
 
 
-def _scan() -> list[tuple[str, int, str]]:
+def _scan(find=group_id_literals) -> list[tuple[str, int, str]]:
     """(file, line, text) for every hit in the scanned directories."""
     out: list[tuple[str, int, str]] = []
     for directory in SCANNED:
         for path in sorted((ROOT / directory).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            out += [(rel, line, text) for line, text in group_id_literals(path.read_text())]
+            out += [(rel, line, text) for line, text in find(path.read_text())]
     return out
 
 
@@ -121,8 +143,16 @@ def test_no_statement_in_the_application_names_group_id():
         if (rel, text) not in ALLOWED
     ]
     assert not findings, (
-        "group_id is a legacy column the application must not read or write (schema 067). "
+        "group_id is a legacy column the application must not read or write (schema 069 drops it). "
         "If a literal is not SQL, add it to ALLOWED with the reason.\n" + "\n".join(findings)
+    )
+
+
+def test_no_statement_reads_the_four_tables_with_a_star():
+    findings = [f"{rel}:{line}: {text.strip()[:100]!r}" for rel, line, text in _scan(star_reads)]
+    assert not findings, (
+        "name the columns: a * read of kg_entities, kg_relationships, notes or preferences "
+        "returns group_id only where schema 069 has not run yet.\n" + "\n".join(findings)
     )
 
 
@@ -181,6 +211,36 @@ PROSE_SHAPES = {
 @pytest.mark.parametrize("source", PROSE_SHAPES.values(), ids=PROSE_SHAPES.keys())
 def test_the_scanner_ignores_prose_and_unrelated_columns(source):
     assert group_id_literals(source) == []
+
+
+STAR_SHAPES = {
+    "select star": 'q = "SELECT * FROM kg_entities WHERE uuid = %s"\n',
+    "alias star": 'q = "SELECT n.* FROM notes n"\n',
+    "star after a column": 'q = "SELECT now(), e.* FROM kg_entities e"\n',
+    "distinct on": 'q = "SELECT DISTINCT ON (uuid) * FROM kg_relationships"\n',
+    "returning": 'q = "UPDATE preferences SET value = %s RETURNING *"\n',
+    "lower case, split": 'q = ("select p.*"\n     " from preferences p")\n',
+    "a join": 'q = "SELECT q.* FROM extraction_queue q JOIN notes n ON n.id = q.id"\n',
+}
+
+
+@pytest.mark.parametrize("source", STAR_SHAPES.values(), ids=STAR_SHAPES.keys())
+def test_the_scanner_finds_a_star_read_of_the_four_tables(source):
+    assert star_reads(source)
+
+
+NOT_STAR_SHAPES = {
+    "another table": 'q = "SELECT * FROM extraction_queue RETURNING *"\n',
+    "count star": 'q = "SELECT count(*) FROM kg_entities"\n',
+    "named columns": 'q = "SELECT uuid, name FROM kg_entities"\n',
+    "multiplication": 'q = "SELECT weight * 2 FROM kg_relationships"\n',
+    "docstring": 'def f():\n    """Runs SELECT * FROM notes."""\n',
+}
+
+
+@pytest.mark.parametrize("source", NOT_STAR_SHAPES.values(), ids=NOT_STAR_SHAPES.keys())
+def test_the_scanner_lets_named_columns_and_other_tables_pass(source):
+    assert star_reads(source) == []
 
 
 def test_the_scanner_reports_the_line():

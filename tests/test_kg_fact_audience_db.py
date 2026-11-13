@@ -32,11 +32,10 @@ from mcp_server import kg_pg
 from mcp_server import recall_fact_audience as recall_fa_mod
 from mcp_server.recall import Recall
 from mcp_server.recall_warnings import warn_sink
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
 WORK = "work-proj"
-PERS = "personal"  # the legacy second pile: rows written before 067 still carry it, no read looks
 LEGS = ("v", "b", "h")  # vector, BM25, hop
 
 
@@ -96,20 +95,18 @@ def _fact(
     emb: int | None = None,
     src: str = "ent-x",
     tgt: str = "ent-y",
-    group: str = GROUP,
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
     label_version: int | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
         "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience, "
         "  label_version) "
-        "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
+        "VALUES (%s, 'default', %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
         "        '2026-01-01T00:00:00+00:00', %s, %s, %s, %s)",
         (
             uid,
-            group,
             src,
             tgt,
             fact,
@@ -123,11 +120,11 @@ def _fact(
     )
 
 
-def _entity(conn, uid: str, name: str, emb: int, group: str = GROUP) -> None:
+def _entity(conn, uid: str, name: str, emb: int) -> None:
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, summary, "
-        "  embedding) VALUES (%s, 'default', %s, %s, %s, 's', %s::vector)",
-        (uid, group, name, name.lower(), kg_pg._vec_literal(onehot(emb))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, summary, embedding) "
+        "VALUES (%s, 'default', %s, %s, 's', %s::vector)",
+        (uid, name, name.lower(), kg_pg._vec_literal(onehot(emb))),
     )
 
 
@@ -382,17 +379,17 @@ def test_the_episode_overlay_needs_both_edges_to_pass_the_label_rule(kg, cutover
 
 
 def test_a_regrouped_fact_keeps_personal_v0_and_is_served_a_restricted_request_nothing(kg, db_url):
-    """067 moves every personal-pile fact into the one group and keeps its 'personal' label (it
-    was stamped on insert until then), so naming no pile at all is still no way round the
-    label, whatever the fact's provenance says."""
+    """067 moved every personal-pile fact into the one memory and kept its 'personal' label (it
+    was stamped on insert until then), so the label alone keeps it from a restricted request,
+    whatever the fact's provenance says."""
     ep = _ep(kg)
     _entity(kg, "p-seed", "PSeed", 0)
     _fact(kg, "p-vec", "alpha", ep, audience="personal", label_version=0, emb=0)
     _fact(kg, "p-bm25", "widget thing", ep, audience="personal", label_version=0)
     _fact(kg, "p-hop", "epsilon", ep, audience="personal", label_version=0, src="p-seed")
     assert kg.execute(
-        "SELECT DISTINCT group_id, audience, label_version FROM kg_relationships"
-    ).fetchall() == [(GROUP, "personal", 0)]
+        "SELECT DISTINCT audience, label_version FROM kg_relationships"
+    ).fetchall() == [("personal", 0)]
     r = Recall(db_url, "")
     assert _restricted_kg(r) == set()
     facts, _ = r._search_kg("widget", onehot(0), [], 20)
@@ -543,18 +540,17 @@ def test_a_legacy_fact_relabelled_personal_drops_out_of_every_leg(kg, cutover, d
 # ---------------------------------------------------------------------------
 
 
-def _owner_world(conn, group: str = GROUP) -> None:
+def _owner_world(conn) -> None:
     """Two entities at the query: the owner's and another's. Each has one fact only the
     hop reaches; the owner also has a vector fact and a BM25 fact."""
     ep = _ep(conn)
-    own, other = f"own-{group}", f"oth-{group}"
-    _entity(conn, own, "Owner", 0, group)
-    _entity(conn, other, "Other", 0, group)
-    kw: dict[str, Any] = {"audience": "work-safe", "group": group}
-    _fact(conn, f"hop-own-{group}", f"zeta {group}", ep, src=own, **kw)
-    _fact(conn, f"hop-oth-{group}", f"eta {group}", ep, src=other, **kw)
-    _fact(conn, f"vec-own-{group}", f"alpha beta {group}", ep, emb=0, src=own, **kw)
-    _fact(conn, f"bm-own-{group}", f"widget gizmo {group}", ep, src=own, **kw)
+    _entity(conn, "own", "Owner", 0)
+    _entity(conn, "oth", "Other", 0)
+    kw: dict[str, Any] = {"audience": "work-safe"}
+    _fact(conn, "hop-own", "zeta", ep, src="own", **kw)
+    _fact(conn, "hop-oth", "eta", ep, src="oth", **kw)
+    _fact(conn, "vec-own", "alpha beta", ep, emb=0, src="own", **kw)
+    _fact(conn, "bm-own", "widget gizmo", ep, src="own", **kw)
 
 
 def _flag(conn, uid: str) -> None:
@@ -570,47 +566,32 @@ def _read(r: Recall, allowed: list[str] | None = None) -> set[str]:
 def test_the_flagged_owner_is_never_a_hop_seed_but_its_facts_still_serve(kg, db_url, allowed):
     _owner_world(kg)
     r = Recall(db_url, "")
-    everything = {f"hop-own-{GROUP}", f"vec-own-{GROUP}", f"bm-own-{GROUP}", f"hop-oth-{GROUP}"}
+    everything = {"hop-own", "vec-own", "bm-own", "hop-oth"}
     assert _read(r, allowed=allowed) == everything
-    _flag(kg, f"own-{GROUP}")
+    _flag(kg, "own")
     r = Recall(db_url, "")  # a new engine: nothing cached
-    assert _read(r, allowed=allowed) == everything - {f"hop-own-{GROUP}"}
+    assert _read(r, allowed=allowed) == everything - {"hop-own"}
 
 
 def test_a_cleared_flag_leaves_the_read_as_it_was(kg, db_url):
     _owner_world(kg)
     before = _read(Recall(db_url, ""))
-    _flag(kg, f"own-{GROUP}")
+    _flag(kg, "own")
     kg.execute("UPDATE kg_entities SET is_self = false")
     assert _read(Recall(db_url, "")) == before
-
-
-def test_every_flagged_owner_row_is_excluded_as_a_seed(kg, db_url):
-    """Rows from before 067 can leave the owner a node in each legacy group, both flagged:
-    neither is a hop seed, and the other entities' facts in either group still serve."""
-    _owner_world(kg, GROUP)
-    _owner_world(kg, PERS)
-    _flag(kg, f"own-{GROUP}")
-    served = _read(Recall(db_url, ""))
-    assert f"hop-own-{GROUP}" not in served
-    assert f"hop-own-{PERS}" in served
-    _flag(kg, f"own-{PERS}")
-    served = _read(Recall(db_url, ""))
-    assert f"hop-own-{GROUP}" not in served and f"hop-own-{PERS}" not in served
-    assert {f"hop-oth-{GROUP}", f"hop-oth-{PERS}"} <= served
 
 
 def test_the_flagged_set_is_cached_for_its_ttl(kg, db_url, monkeypatch):
     _owner_world(kg)
     monkeypatch.setattr(recall_fa_mod, "_OWNER_SEEDS_TTL_S", 3600.0)
     r = Recall(db_url, "")
-    assert f"hop-own-{GROUP}" in _read(r)
-    _flag(kg, f"own-{GROUP}")
-    assert f"hop-own-{GROUP}" in _read(r), "inside the TTL the engine keeps the set it read"
+    assert "hop-own" in _read(r)
+    _flag(kg, "own")
+    assert "hop-own" in _read(r), "inside the TTL the engine keeps the set it read"
     monkeypatch.setattr(recall_fa_mod, "_OWNER_SEEDS_TTL_S", 0.0)
-    assert f"hop-own-{GROUP}" not in _read(r)
+    assert "hop-own" not in _read(r)
     kg.execute("UPDATE kg_entities SET is_self = false")
-    assert f"hop-own-{GROUP}" in _read(r), "a cleared flag is honoured on the next read"
+    assert "hop-own" in _read(r), "a cleared flag is honoured on the next read"
 
 
 def test_a_failed_owner_lookup_excludes_nothing_and_is_not_cached():

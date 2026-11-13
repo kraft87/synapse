@@ -144,7 +144,8 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         logger.warning(
             "Database is at schema %s, behind this build's schema %s, but every newer "
             "migration is marked optional (this build keeps its pre-migration behaviour "
-            "without them); continuing. Run scripts/apply_schema.sh to apply them.",
+            "without them); continuing. Apply them one at a time, in order (see "
+            "docs/install.md > Upgrading).",
             applied,
             expected,
         )
@@ -156,8 +157,8 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
     )
     logger.critical(
         "Database %s but this build expects schema %s. "
-        "Run scripts/apply_schema.sh against your database to upgrade it "
-        "(see README > Upgrading), then restart. "
+        "Apply the schema files above its stamp to it, one at a time, in order "
+        "(see docs/install.md > Upgrading), then restart. "
         "To skip this check: SYNAPSE_SCHEMA_CHECK=0.",
         state,
         expected,

@@ -1,7 +1,7 @@
 -- 067_kg_one_memory.sql
 -- One knowledge graph, not two. The 'personal' and 'technical' group_id piles are merged
 -- into one: every personal entity, fact, note and preference becomes 'technical' (the
--- stored value stays; the column and its old indexes stay until a later cleanup), and a
+-- stored value stays; 069 later drops the column and its old indexes), and a
 -- personal entity that has a same-name technical twin is folded into that twin.
 --
 -- REQUIRED. This file carries no optional marker, so ingestion/schema_check.py makes a
@@ -9,11 +9,10 @@
 -- first, then release; the release must carry the change that stops naming group_id (one
 -- pile for reads and writes). A build that required 067 and still routed a project to
 -- 'personal' would write a new pile whose facts miss the personal stamp the 066 trigger
--- gave them (the trigger is dropped below), and pile_merge.py --health would fail until a
--- re-run folded it.
+-- gave them (the trigger is dropped below), and that pile would stay until a re-run of
+-- this file folded it.
 --
--- THE TWIN RULE (computed from the live rows on every run; pile_merge.py --preview prints
--- the same text's counts without writing):
+-- THE TWIN RULE (computed from the live rows on every run):
 --   key  COALESCE(NULLIF(normalized_name, ''), lower(trim(name))), within one owner_id:
 --        the key upsert_node compares a node's name by, and the one entity_uuid_by_
 --        normalized_name looks a name up by.
@@ -24,7 +23,7 @@
 --        first of them by SURVIVOR_ORDER (ingestion/kg_pg_read.py): is_self DESC, id. Type,
 --        supertype and embedding are ignored, as Stage 4's exact-name match ignores them.
 --        An entity listed in public.kg_pile_merge_067_exclude (owner_id, uuid; created by
---        `pile_merge.py --exclude FILE --apply`, never by this file) is never folded this
+--        hand, never by this file, and dropped by 069) is never folded this
 --        way: it is regrouped as it is, with its edges untouched, and then ranks among the
 --        technical rows of its key by SURVIVOR_ORDER like any other.
 --   (c)  every other personal entity is regrouped as it is (uuid, id and columns kept).
@@ -52,7 +51,7 @@
 --      ledger row; the indexes are then built only where one is missing, which a fresh
 --      install does on its empty tables under SHARE, and a database that has them does not
 --      do at all. A folded uuid that a writer wrote again after its survivor was deleted
---      is not something to merge: it counts as nothing. (pm_ghost's other conditions, a
+--      is not something to merge: it counts as nothing. (The ghost query's other conditions, a
 --      flagged entity, another owner, a survivor a later run folded too, a returned uuid
 --      in a third group, are only tested under the lock; while a row they reject exists,
 --      every re-run takes it, finds nothing to do and returns.) A re-run with only notes
@@ -104,19 +103,17 @@
 -- new run; restart the pollers after it, because a poller keeps a deleted uuid in its name
 -- index for up to 900 s and would write it again.
 --
--- UNDO. Every run is written to kg_pile_merge_067_* in the same transaction: the before
--- image of each row it changes (full rows, so a deleted twin can be re-created), the twin
--- map, and counts. `scripts/pile_merge.py --undo [--run N|all] [--apply]` reverses it:
--- revert the code first, because an image that requires 067 exits on a database stamped
--- 066. Undo leaves the three indexes and the column defaults, which are additive.
+-- THE LEDGER. Every run is written to kg_pile_merge_067_* in the same transaction: the
+-- before image of each row it changes (full rows), the twin map, and counts. The script
+-- that previewed, checked and undid a run went with schema 069, which drops these tables:
+-- the merge is this file alone, and it has no undo.
 -- Restores that write group_id, src_uuid or tgt_uuid from an older backup table must not
--- run after this file unless it is undone first: `repair_numbered_entity_magnets.py
--- --restore 20261106` (its backup names entities this file deletes) and a restore from
--- kg_fact_tzfix_20261011.
+-- run after this file: `repair_numbered_entity_magnets.py --restore` refuses a backup that
+-- carries group_id once 067 is applied, and a restore from kg_fact_tzfix_20261011 must not
+-- be run.
 --
--- Needs 066 (audience, label_version, is_self). scripts/pile_merge.py --health checks the
--- result; pile_merge.py reads the marked regions below (pm_ghost, pm_map, pm_fx, pm_counts)
--- so its --preview runs exactly the text this file runs.
+-- Needs 066 (audience, label_version, is_self). The tail checks the merged graph before it
+-- stamps 067.
 
 BEGIN;
 -- txn-a:begin
@@ -161,6 +158,14 @@ DECLARE
     v_kg      boolean;
     v_np      boolean;
 BEGIN
+    -- Past 069 the four tables have no group_id: there is no pile left to merge.
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) < 4 THEN
+        RETURN;
+    END IF;
+
     -- Folded entities of the runs not undone, and the survivor each stood for. A writer
     -- whose name index still held a deleted uuid writes it again; those rows are folded by
     -- rule (d). Filled below, under the lock.
@@ -171,9 +176,10 @@ BEGIN
     -- Nothing to merge anywhere: a fresh install, CI, a re-run on a merged database. No
     -- lock beyond these reads, no ledger table, no run row. A folded uuid written again is
     -- work only while its survivor is in technical; with the survivor gone there is nothing
-    -- to fold it into (pm_ghost below needs the same). This asks for less than pm_ghost does
-    -- (not the flag, the owner, the group of the returned uuid or the chain of runs), so it
-    -- can say yes to a row pm_ghost then rejects; the check under the lock settles that.
+    -- to fold it into (the ghost query below needs the same). This asks for less than the
+    -- ghost query does (not the flag, the owner, the group of the returned uuid or the chain
+    -- of runs), so it can say yes to a row the ghost query then rejects; the check under the
+    -- lock settles that.
     v_kg := EXISTS (SELECT 1 FROM kg_entities WHERE group_id = 'personal')
          OR EXISTS (SELECT 1 FROM kg_relationships WHERE group_id = 'personal');
     IF NOT v_kg AND v_ledger THEN
@@ -194,7 +200,6 @@ BEGIN
         LOCK TABLE kg_entities, kg_relationships IN SHARE ROW EXCLUSIVE MODE;
         IF v_ledger THEN
             INSERT INTO _pm_ghost
-            -- pm_ghost:begin
             SELECT DISTINCT ON (m.loser_uuid) e.owner_id, e.uuid, m.survivor_uuid
               FROM kg_pile_merge_067_entity_map m
               JOIN kg_pile_merge_067_runs r ON r.run_id = m.run_id AND r.undone_at IS NULL
@@ -208,7 +213,6 @@ BEGIN
                                    ON xr.run_id = x.run_id AND xr.undone_at IS NULL
                                 WHERE x.loser_uuid = m.survivor_uuid)
              ORDER BY m.loser_uuid, m.run_id DESC
-            -- pm_ghost:end
             ;
         END IF;
         -- A concurrent apply may have merged everything while this one waited for the lock.
@@ -314,7 +318,6 @@ BEGIN
         END IF;
 
         CREATE TEMP TABLE _pm_map ON COMMIT DROP AS
-        -- pm_map:begin
         WITH pk AS (
             SELECT e.id, e.uuid, e.owner_id, e.is_self, e.group_id,
                    COALESCE(NULLIF(e.normalized_name, ''), lower(trim(e.name))) AS k,
@@ -354,7 +357,6 @@ BEGIN
           LEFT JOIN tname n ON p.group_id = 'personal' AND NOT p.excluded
                            AND n.owner_id = p.owner_id AND n.k = p.k
          WHERE f.uuid IS NOT NULL OR g.uuid IS NOT NULL OR n.uuid IS NOT NULL
-        -- pm_map:end
         ;
         CREATE UNIQUE INDEX ON _pm_map (loser_uuid);
         ANALYZE _pm_map;
@@ -362,7 +364,6 @@ BEGIN
         -- Every fact the merge touches: personal ones, and any fact (whatever its group) on a
         -- folded entity, with the endpoints it will have afterwards.
         CREATE TEMP TABLE _pm_fx ON COMMIT DROP AS
-        -- pm_fx:begin
         SELECT r.id, r.uuid, r.owner_id, r.group_id, r.src_uuid, r.tgt_uuid,
                COALESCE(ms.survivor_uuid, r.src_uuid) AS src2,
                COALESCE(mt.survivor_uuid, r.tgt_uuid) AS tgt2,
@@ -371,14 +372,12 @@ BEGIN
           LEFT JOIN _pm_map ms ON ms.loser_uuid = r.src_uuid
           LEFT JOIN _pm_map mt ON mt.loser_uuid = r.tgt_uuid
          WHERE r.group_id = 'personal' OR ms.loser_uuid IS NOT NULL OR mt.loser_uuid IS NOT NULL
-        -- pm_fx:end
         ;
         CREATE UNIQUE INDEX ON _pm_fx (id);
         ANALYZE _pm_fx;
 
-        -- ---- counts, taken before anything is written (pile_merge.py --preview prints these)
+        -- ---- counts, taken before anything is written
         SELECT
-        -- pm_counts:begin
         jsonb_build_object(
             'entities_total',        (SELECT count(*) FROM kg_entities),
             'entities_personal',     (SELECT count(*) FROM kg_entities WHERE group_id = 'personal'),
@@ -545,7 +544,6 @@ BEGIN
                                                             AND (t.is_self AND NOT e.is_self
                                                                  OR t.is_self = e.is_self AND t.id < e.id)))
         )
-        -- pm_counts:end
         INTO v_counts;
         UPDATE kg_pile_merge_067_runs SET counts = v_counts WHERE run_id = v_run;
 
@@ -749,6 +747,14 @@ DECLARE
     stamped   text;
     bad       text;
 BEGIN
+    -- Past 069 there is no group_id to give a default, and 066 builds no trigger to drop.
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) < 4 THEN
+        RETURN;
+    END IF;
+
     -- The two retry settings, before any lock. A count of 0 or less would skip the loop
     -- without an error, and a huge count or an endless pause would keep SHARE ROW EXCLUSIVE
     -- for as long as the loop runs (statement_timeout is 0 here); neither may reach it.

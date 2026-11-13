@@ -170,26 +170,14 @@ def test_type_check_rejects_invalid(conn, db_url):
     _wipe(conn)
 
 
-def test_find_live_notes_scopes_by_owner_not_by_legacy_group(conn, db_url):
+def test_find_live_notes_scopes_by_owner(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
-    technical = _insert(db, hook="Mine, technical", slot=6)
-    personal = _insert(db, hook="Mine, personal", slot=6)
-    conn.execute("UPDATE notes SET group_id = 'personal' WHERE id = %s", (personal,))
+    first = _insert(db, hook="Mine, first", slot=6)
+    second = _insert(db, hook="Mine, second", slot=6)
     _insert(db, hook="Someone else's", owner_id="other", slot=6)
     hits = db.find_live_notes(_OWNER, onehot(6), limit=5)
-    assert {h["id"] for h in hits} == {technical, personal}
-    db.close()
-    _wipe(conn)
-
-
-def test_new_note_takes_the_column_default_group(conn, db_url):
-    _wipe(conn)
-    db = Database(db_url)
-    nid = _insert(db, hook="Left to the default", slot=7)
-    assert conn.execute("SELECT group_id FROM notes WHERE id = %s", (nid,)).fetchone()[0] == (
-        "technical"
-    )
+    assert {h["id"] for h in hits} == {first, second}
     db.close()
     _wipe(conn)
 
@@ -389,7 +377,7 @@ def test_reconcile_creates_when_no_candidates(monkeypatch):
     }
     assert len(db.inserted) == 1 and db.updated == [] and db.superseded == []
     assert db.inserted[0]["source_ref"] == "ep:9"
-    assert "group_id" not in db.inserted[0]  # the column default decides
+    assert "group_id" not in db.inserted[0]  # the write names no group
     assert llm_calls == []  # no candidate -> no confirm call
 
 
@@ -528,17 +516,17 @@ def test_reconcile_rejects_invalid_type():
 
 
 # ---------------------------------------------------------------------------
-# reconcile_note against the real store — a live note filed under either legacy
-# group is the same pool as a fresh write
+# reconcile_note against the real store — the owner's live notes are one pool for a
+# fresh write, whatever its project
 # ---------------------------------------------------------------------------
 
 
-def _seed_note(conn, *, group_id, slot):
+def _seed_note(conn, *, slot):
     return conn.execute(
-        "INSERT INTO notes (owner_id, group_id, type, hook, body, embedding, embed_model) "
-        f"VALUES (%s, %s, 'user', 'User prefers dark mode', 'Old body.', "
+        "INSERT INTO notes (owner_id, type, hook, body, embedding, embed_model) "
+        f"VALUES (%s, 'user', 'User prefers dark mode', 'Old body.', "
         f"%s::halfvec({_EMBED_DIMS}), 'test') RETURNING id",
-        (_OWNER, group_id, _vector_literal(onehot(slot))),
+        (_OWNER, _vector_literal(onehot(slot))),
     ).fetchone()[0]
 
 
@@ -555,19 +543,17 @@ def _write_note(db, slot, project):
     )
 
 
-# (group the live note is filed under, project of the new write). Each pair is one the
-# old per-group lookup missed: a project-less write looked only in 'technical', a write
-# for a personal-leaning project only in 'personal'.
-_ACROSS_GROUPS = [("personal", None), ("technical", "jobs")]
+# The project of the new write: none, and one the old per-group lookup sent elsewhere.
+_PROJECTS = [None, "jobs"]
 
 
-@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
-def test_restated_note_updates_the_live_note_in_the_other_group(
-    conn, db_url, monkeypatch, legacy_group, project
+@pytest.mark.parametrize("project", _PROJECTS)
+def test_restated_note_updates_the_live_note_whatever_the_project(
+    conn, db_url, monkeypatch, project
 ):
     _wipe(conn)
     db = Database(db_url)
-    old = _seed_note(conn, group_id=legacy_group, slot=20)
+    old = _seed_note(conn, slot=20)
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
     result = _write_note(db, 20, project)
     assert result["outcome"] == "updated" and result["note_id"] == old
@@ -577,13 +563,13 @@ def test_restated_note_updates_the_live_note_in_the_other_group(
     _wipe(conn)
 
 
-@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
-def test_contradicting_note_supersedes_the_live_note_in_the_other_group(
-    conn, db_url, monkeypatch, legacy_group, project
+@pytest.mark.parametrize("project", _PROJECTS)
+def test_contradicting_note_supersedes_the_live_note_whatever_the_project(
+    conn, db_url, monkeypatch, project
 ):
     _wipe(conn)
     db = Database(db_url)
-    old = _seed_note(conn, group_id=legacy_group, slot=21)
+    old = _seed_note(conn, slot=21)
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "contradicts")
     result = _write_note(db, 21, project)
     assert result["outcome"] == "superseded" and result["prev_id"] == old
@@ -593,16 +579,5 @@ def test_contradicting_note_supersedes_the_live_note_in_the_other_group(
     )
     live = conn.execute("SELECT id FROM notes WHERE superseded_by IS NULL").fetchall()
     assert live == [(new,)]
-    db.close()
-    _wipe(conn)
-
-
-def test_reconciled_note_gets_the_default_group_whatever_the_project(conn, db_url):
-    _wipe(conn)
-    db = Database(db_url)
-    result = _write_note(db, 22, "jobs")
-    assert result["outcome"] == "created"
-    row = conn.execute("SELECT group_id FROM notes WHERE id = %s", (result["note_id"],)).fetchone()
-    assert row[0] == "technical"
     db.close()
     _wipe(conn)

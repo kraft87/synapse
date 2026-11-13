@@ -100,13 +100,11 @@ def _episode(
     ).fetchone()[0]
 
 
-def _entity(
-    conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0, group_id="technical"
-):
+def _entity(conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0):
     return conn.execute(
-        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, summary, degree, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
-        (uuid, group_id, name, entity_type, summary, degree, _t(0)),
+        "INSERT INTO kg_entities (uuid, name, entity_type, summary, degree, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (uuid, name, entity_type, summary, degree, _t(0)),
     ).fetchone()[0]
 
 
@@ -118,7 +116,6 @@ def _rel(
     tgt,
     name="uses",
     fact="x uses y",
-    group_id="technical",
     episodes=None,
     t_valid=None,
     t_invalid=None,
@@ -127,11 +124,10 @@ def _rel(
 ):
     return conn.execute(
         "INSERT INTO kg_relationships "
-        "(uuid, group_id, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
-        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "(uuid, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
+        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
-            group_id,
             src,
             tgt,
             name,
@@ -176,19 +172,19 @@ def _event(
     ).fetchone()[0]
 
 
-def _note(conn, *, hook="User prefers X", group_id="technical", source_ref=None):
+def _note(conn, *, hook="User prefers X", source_ref=None):
     return conn.execute(
-        "INSERT INTO notes (owner_id, group_id, type, hook, body, source_ref) "
-        "VALUES ('default',%s,'user',%s,'body',%s) RETURNING id",
-        (group_id, hook, source_ref),
+        "INSERT INTO notes (owner_id, type, hook, body, source_ref) "
+        "VALUES ('default','user',%s,'body',%s) RETURNING id",
+        (hook, source_ref),
     ).fetchone()[0]
 
 
-def _pref(conn, *, pref="User prefers bullet lists", group_id="technical", source_ref=None):
+def _pref(conn, *, pref="User prefers bullet lists", source_ref=None):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity, source_ref) "
-        "VALUES ('default',%s,%s,'like',%s) RETURNING id",
-        (group_id, pref, source_ref),
+        "INSERT INTO preferences (owner_id, pref, polarity, source_ref) "
+        "VALUES ('default',%s,'like',%s) RETURNING id",
+        (pref, source_ref),
     ).fetchone()[0]
 
 
@@ -314,8 +310,8 @@ def test_catalog_counts(clean, conn, db_url):
     _episode(conn, session="a", seq=1, project="synapse", source="claude-code")
     _episode(conn, session="a", seq=2, project="synapse", source="claude-code")
     _episode(conn, session="b", seq=1, project=None, source="cursor")
-    _entity(conn, "e1", name="Widget", group_id="personal")
-    _rel(conn, "r1", src="e1", tgt="e1", group_id="technical")
+    _entity(conn, "e1", name="Widget")
+    _rel(conn, "r1", src="e1", tgt="e1")
     _event(conn, source_ref="tb:c1", domain="technical")
     _event(conn, source_ref="tb:c2", domain="technical")
     _event(conn, source_ref="tb:c3", domain="personal")
@@ -327,7 +323,7 @@ def test_catalog_counts(clean, conn, db_url):
     assert {"name": "claude-code", "count": 2} in body["sources"]
     assert {"name": "cursor", "count": 1} in body["sources"]
     # domains: the distinct timeline domains only, as a plain string list; the knowledge
-    # graph's own group_id column no longer reaches the catalog.
+    # graph has no group to add to it.
     assert body["domains"] == ["personal", "technical"]
     assert "group_ids" not in body
 
@@ -1469,7 +1465,6 @@ def _pref_row(
     *,
     pref,
     polarity="like",
-    group_id="technical",
     assert_count=1,
     first_seen=None,
     last_asserted=None,
@@ -1477,11 +1472,10 @@ def _pref_row(
     superseded_by=None,
 ):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity, assert_count, "
+        "INSERT INTO preferences (owner_id, pref, polarity, assert_count, "
         " first_seen, last_asserted, t_invalid, superseded_by) "
-        "VALUES ('default',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "VALUES ('default',%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
-            group_id,
             pref,
             polarity,
             assert_count,
@@ -1505,9 +1499,9 @@ def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name
     entity_type — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
-        "(uuid, group_id, name, normalized_name, entity_type, entity_supertype, summary, "
+        "(uuid, name, normalized_name, entity_type, entity_supertype, summary, "
         " degree, created_at) "
-        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             name,
@@ -2004,6 +1998,33 @@ def test_graph_neighborhood_depth_1_vs_2(clean, conn, db_url):
         # depth 2 pulls in the second ring via g-pg / g-cc.
         assert {"g-nuc", "g-far", "g-sse"} <= d2_nodes
         assert d2["truncated"] is False
+
+
+def test_an_entitys_edges_are_read_under_its_own_owner(clean, conn, db_url):
+    """The dossier and the graph read one entity's edges under that entity's owner: every
+    index on the edge table leads with the owner (after schema 069 there is no other kind),
+    so that is what keeps these reads off a table scan. An edge is filed under its endpoints'
+    owner, so one filed under another owner is not this entity's edge."""
+    for uid in ("own-main", "own-near", "own-far"):
+        _entity(conn, uid, name=uid)
+    ep = _episode(conn, session="own", seq=1, content="near", created_at=_t(1))
+    other = _episode(conn, session="own", seq=2, content="far", created_at=_t(2))
+    _rel(conn, "own-e1", src="own-main", tgt="own-near", episodes=[ep], retrieval_count=2)
+    _rel(conn, "own-e2", src="own-far", tgt="own-main", episodes=[other], retrieval_count=5)
+    _rel(conn, "own-e3", src="own-near", tgt="own-main", episodes=[other], retrieval_count=7)
+    conn.execute(
+        "UPDATE kg_relationships SET owner_id = 'someone-else' WHERE uuid IN ('own-e2', 'own-e3')"
+    )
+    with _client(db_url) as client:
+        dossier = client.get("/dash/api/entity/own-main", headers=_H).json()
+        assert [f["uuid"] for f in dossier["facts"]] == ["own-e1"]
+        assert dossier["stats"] == {"edges": 1, "facts": 1, "served": 2}
+        assert [m["episode_id"] for m in dossier["mentions"]["items"]] == [ep]
+        assert dossier["mentions"]["total"] == 1
+        url = "/dash/api/graph/neighborhood?entity=own-main&depth=2"
+        graph = client.get(url, headers=_H).json()
+        assert {n["uuid"] for n in graph["nodes"]} == {"own-main", "own-near"}
+        assert [e["uuid"] for e in graph["edges"]] == ["own-e1"]
 
 
 def test_graph_neighborhood_as_of_filter(clean, conn, db_url):

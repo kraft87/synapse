@@ -1,4 +1,4 @@
-"""schema/067_kg_one_memory.sql and scripts/pile_merge.py against a real database.
+"""schema/067_kg_one_memory.sql against a real database.
 
 067 folds the 'personal' KG pile into 'technical'. What only a database shows:
 
@@ -11,23 +11,19 @@
     re-run takes none; B (the tail) takes it only where the catalog says it is needed, retries
     a lock timeout, and a failure there leaves the merged data and the 066 stamp
   * a re-run folds what old code wrote in between, and changes nothing otherwise
-  * ``pile_merge.py``: --preview counts equal the applied run's, --health fails on a
-    straggler, --undo restores the exact rows (and reports drift instead of overwriting it),
-    --exclude lists twins, and none of them prints fact or entity text
 
-Fixtures put the shared test database back to the 066 state, and leave it merged (the state
-the rest of the suite expects) afterwards.
+The suite's database is past 069, which dropped the group column 067 merges by. Fixtures
+build the 066 state again in place (tests/helpers/one_memory_states.py) and put the database
+back past 069 afterwards, the state the rest of the suite expects.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -40,20 +36,15 @@ import pytest
 from ingestion import schema_check
 from ingestion.kg_pg_read import SURVIVOR_ORDER, KGPostgresReader
 from mcp_server.recall import Recall
+from tests.helpers import one_memory_states as states
 from tests.helpers.kg import _axis_list
 
 _ROOT = Path(__file__).resolve().parent.parent
-_SQL_066 = _ROOT / "schema" / "066_kg_fact_audience.sql"
-_SQL_067 = _ROOT / "schema" / "067_kg_one_memory.sql"
-
-_SPEC = importlib.util.spec_from_file_location("pile_merge", _ROOT / "scripts" / "pile_merge.py")
-pm = importlib.util.module_from_spec(_SPEC)
-sys.modules["pile_merge"] = pm
-_SPEC.loader.exec_module(pm)
+_SQL_067 = states.SQL_067
 
 OWNER = "default"  # what the readers under test scope to
-KG_TABLES = ("kg_entities", "kg_relationships", "notes", "preferences")
-INDEXES = ("kg_rel_pair_any", "kg_rel_tgt_any", "kg_entities_norm_any")
+KG_TABLES = states.TABLES
+INDEXES = states.ANY_INDEXES
 
 pytestmark = pytest.mark.skipif(shutil.which("psql") is None, reason="psql not installed")
 
@@ -62,56 +53,28 @@ pytestmark = pytest.mark.skipif(shutil.which("psql") is None, reason="psql not i
 # Plumbing
 # ---------------------------------------------------------------------------
 
-
-def _psql(db_url: str, path: Path, *, check: bool = True) -> subprocess.CompletedProcess:
-    """Pipe a file to psql on stdin, the way the migration is applied to a real database."""
-    with path.open() as f:
-        return subprocess.run(
-            ["psql", db_url, "-q", "-v", "ON_ERROR_STOP=1"],
-            stdin=f,
-            check=check,
-            capture_output=True,
-            text=True,
-        )
+_psql = states.psql
 
 
 def _wipe(conn) -> None:
-    conn.execute(
-        "TRUNCATE kg_relationships, kg_entities, notes, preferences RESTART IDENTITY CASCADE"
-    )
+    states.wipe(conn)
     conn.execute("TRUNCATE episodes, recall_feedback RESTART IDENTITY CASCADE")
-    for (t,) in conn.execute(
-        "SELECT tablename FROM pg_tables WHERE tablename LIKE 'kg_pile_merge_067_%'"
-    ).fetchall():
-        conn.execute(f'DROP TABLE IF EXISTS "{t}"')
 
 
 def _to_066(conn, db_url: str) -> None:
-    """The database as it was before 067: the insert trigger, no column defaults, no owner-only
-    indexes, stamped 066."""
     _wipe(conn)
-    _psql(db_url, _SQL_066)
-    for t in KG_TABLES:
-        conn.execute(f"ALTER TABLE {t} ALTER COLUMN group_id DROP DEFAULT")
-    for ix in INDEXES:
-        conn.execute(f"DROP INDEX IF EXISTS {ix}")
-    conn.execute("UPDATE synapse_meta SET value = '066' WHERE key = 'schema_version'")
+    states.to_066(conn, db_url)
 
 
 @pytest.fixture()
 def piles(conn, db_url):
-    """A database at 066, empty. Afterwards: wiped and merged (067 applied), as the suite expects,
-    and stamped as it was before: 067 only ever raises the stamp to 067, and the suite's database
-    may carry a later migration's."""
-    before = conn.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()
+    """A database at 066, empty. Afterwards: wiped, with 067 and 069 applied, as the suite
+    expects, and stamped as it was before."""
+    before = states.stamp(conn)
     _to_066(conn, db_url)
     yield conn
     _wipe(conn)
-    _psql(db_url, _SQL_067)
-    if before and before[0] > "067":
-        conn.execute(
-            "UPDATE synapse_meta SET value = %s WHERE key = 'schema_version'", (before[0],)
-        )
+    states.to_069(conn, db_url, before)
 
 
 def _vec(slot: int) -> str:
@@ -560,7 +523,6 @@ def test_a_null_audience_fact_is_stamped_personal_v0_before_it_is_regrouped(seed
     seeded.execute(
         "UPDATE kg_relationships SET audience = NULL, label_version = NULL WHERE uuid = 'f-p1'"
     )
-    assert run_counts_preview(db_url)["stragglers_to_stamp"] == 1
     merge(db_url)
     f = fact_row(seeded, "f-p1")
     assert (f["audience"], f["label_version"], f["group_id"]) == ("personal", 0, "technical")
@@ -568,10 +530,6 @@ def test_a_null_audience_fact_is_stamped_personal_v0_before_it_is_regrouped(seed
         seeded,
         "SELECT audience FROM kg_pile_merge_067_relationships WHERE uuid = 'f-p1' AND image = 'before'",
     ) == [(None,)]  # the before image keeps what was there
-
-
-def run_counts_preview(db_url: str) -> dict[str, Any]:
-    return pm.preview(pm._connect(db_url, read_only=True))["counts"]
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +603,6 @@ def test_a_rerun_folds_and_regroups_what_old_code_wrote_after_the_merge(merged, 
         and ent_row(merged, "p-alpha") is None
     )
     assert one(merged, "SELECT group_id FROM notes WHERE hook = 'late-note'") == "technical"
-    assert pm.health(pm._connect(db_url, read_only=True))["ok"] is True
 
 
 def test_a_folded_uuid_minted_again_under_another_name_still_folds_into_its_survivor(
@@ -661,7 +618,6 @@ def test_a_folded_uuid_minted_again_under_another_name_still_folds_into_its_surv
     f = fact_row(merged, "f-ghost")
     assert (f["src_uuid"], f["group_id"]) == ("t-alpha", "technical")
     assert ent_row(merged, "p-alpha") is None
-    assert pm.health(pm._connect(db_url, read_only=True))["ok"] is True
 
 
 def test_a_folded_uuid_written_again_as_technical_is_folded_by_a_rerun(merged, db_url):
@@ -669,16 +625,11 @@ def test_a_folded_uuid_written_again_as_technical_is_folded_by_a_rerun(merged, d
     re-run must still look at it."""
     ent(merged, "p-alpha", "Alpha Again")
     fact(merged, "f-ghost", "technical", "p-alpha", "t-delta", "from a group-free writer")
-    bad = pm.health(pm._connect(db_url, read_only=True))
-    gone = bad["checks"]["every folded entity is gone"]
-    assert bad["ok"] is False and gone["still_present"]["uuids"] == ["p-alpha"]
-    assert "apply 067 again" in gone["remedy"]
     merge(db_url)
     assert fold_map(merged, 2) == {"p-alpha": ("t-alpha", "ghost")}
     f = fact_row(merged, "f-ghost")
     assert (f["src_uuid"], f["group_id"]) == ("t-alpha", "technical")
     assert ent_row(merged, "p-alpha") is None
-    assert pm.health(pm._connect(db_url, read_only=True))["ok"] is True
 
 
 def test_a_ghost_whose_survivor_is_gone_is_left_alone_and_makes_no_run(merged, db_url):
@@ -689,30 +640,6 @@ def test_a_ghost_whose_survivor_is_gone_is_left_alone_and_makes_no_run(merged, d
     merge(db_url)
     assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs") == 1
     assert ent_row(merged, "p-alpha")["group_id"] == "technical"
-
-
-def test_the_preview_counts_a_ghost_the_way_the_rerun_records_it(merged, db_url):
-    ent(merged, "p-alpha", "Reborn", group="personal")
-    ent(merged, "p-newbie", "Newbie", group="personal")
-    c = run_counts_preview(db_url)
-    assert (c["losers"], c["losers_ghost"], c["losers_by_name"], c["regrouped"]) == (1, 1, 0, 1)
-    merge(db_url)
-    applied = run_counts(merged, 2)
-    applied.pop("applied")
-    assert applied == c
-
-
-def test_undoing_a_ghost_run_puts_the_ghost_back_in_the_group_it_was_written_in(merged, db_url):
-    ent(merged, "p-alpha", "Alpha Again")  # technical
-    fact(merged, "f-ghost", "technical", "p-alpha", "t-delta", "from a group-free writer")
-    merge(db_url)
-    out = _undo(db_url, run="2")
-    assert out["drift"]["folded entity uuid already exists"]["count"] == 0
-    row = ent_row(merged, "p-alpha")
-    assert (row["group_id"], row["name"]) == ("technical", "Alpha Again")
-    f = fact_row(merged, "f-ghost")
-    assert (f["src_uuid"], f["group_id"]) == ("p-alpha", "technical")
-    assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NULL") == 1
 
 
 def test_a_rerun_with_only_a_personal_note_flips_it_and_leaves_the_graph_tables_alone(
@@ -741,22 +668,24 @@ def test_a_rerun_with_only_a_personal_note_flips_it_and_leaves_the_graph_tables_
         one(merged, "SELECT md5(string_agg(x::text, '|' ORDER BY id)) FROM kg_entities x"),
         one(merged, "SELECT md5(string_agg(x::text, '|' ORDER BY id)) FROM kg_relationships x"),
     )
-    assert pm.health(pm._connect(db_url, read_only=True))["ok"] is True
-    out = _undo(db_url, run=str(run))
-    assert out["notes restored"] == 1
-    assert one(merged, "SELECT group_id FROM notes WHERE hook = 'late-note'") == "personal"
+    assert (
+        one(
+            merged,
+            "SELECT group_id FROM kg_pile_merge_067_notes "
+            "WHERE run_id = %s AND image = 'before' AND hook = 'late-note'",
+            run,
+        )
+        == "personal"
+    )  # the before image keeps the group it was written in
 
 
-def test_health_skips_the_graph_baselines_when_the_first_run_only_flipped_notes(piles, db_url):
-    """Such a run records no graph counts; a graph that already had an edge without an endpoint
-    must not read as damage the merge did."""
+def test_a_first_run_that_only_flipped_notes_records_no_graph_counts(piles, db_url):
+    """It never read the graph, so it has no graph counts to record, and an edge that already
+    had no endpoint is not counted as one the merge made."""
     fact(piles, "f-dangling", "technical", "nowhere-a", "nowhere-b")
     _note(piles, "late-note", "personal")
     merge(db_url)
     assert "facts_total" not in run_counts(piles, 1)
-    report = pm.health(pm._connect(db_url, read_only=True))
-    assert report["ok"] is True
-    assert "no new edges with a missing endpoint" not in report["checks"]
 
 
 def test_an_empty_database_gets_no_ledger_and_is_stamped(piles, db_url):
@@ -766,212 +695,6 @@ def test_an_empty_database_gets_no_ledger_and_is_stamped(piles, db_url):
         == []
     )
     assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
-    assert pm.health(pm._connect(db_url, read_only=True))["ok"] is True
-
-
-# ---------------------------------------------------------------------------
-# pile_merge.py: preview, health, undo (cases 23-28)
-# ---------------------------------------------------------------------------
-
-
-def test_preview_counts_equal_the_applied_runs_counts_and_it_writes_nothing(seeded, db_url):
-    before = table_md5(seeded)
-    out = pm.preview(pm._connect(db_url, read_only=True))
-    assert table_md5(seeded) == before
-    assert (
-        rows(seeded, "SELECT tablename FROM pg_tables WHERE tablename LIKE 'kg_pile_merge_067_%'")
-        == []
-    )
-    counts = out["counts"]
-    assert counts["losers"] == 7 and counts["survivors"] == 6 and counts["regrouped"] == 4
-    assert out["gates"]["self_loops_created is 0"] is False  # the world has one
-    merge(db_url)
-    applied = run_counts(seeded)
-    applied.pop("applied")
-    assert applied == counts
-
-
-def test_the_preview_connection_refuses_writes(db_url):
-    conn = pm._connect(db_url, read_only=True)
-    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        conn.execute("CREATE TEMP TABLE nope (a int)")
-    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        conn.execute("UPDATE kg_entities SET degree = degree")
-
-
-def test_the_preview_reports_twin_supertypes_row_10b(seeded, db_url):
-    c = run_counts_preview(db_url)
-    assert c["supertype_pairs"] == {"Concept | Tool": 1, "Person | Tool": 1}
-    assert c["supertype_differ_person"] == 1
-    assert c["twin_shapes"] == {"1:1": 3, "1:n": 1, "n:1": 1, "n:0": 1}
-
-
-def test_health_passes_after_the_merge_and_fails_on_a_straggler(merged, db_url):
-    ok = pm.health(pm._connect(db_url, read_only=True))
-    assert ok["ok"] is True and ok["runs_not_undone"] == [1]
-    assert set(ok["retired_restores (do not run unless the merge is undone first)"]) == set(
-        pm.RETIRED_RESTORES
-    )
-    ent(merged, "p-late", "Late", group="personal")
-    bad = pm.health(pm._connect(db_url, read_only=True))
-    assert bad["ok"] is False and bad["checks"]["no personal rows"]["ok"] is False
-    assert pm.main(["--health", "--db-url", db_url]) == 1
-
-
-def test_health_fails_on_a_missing_index_and_on_a_folded_entity_that_came_back(merged, db_url):
-    merged.execute("DROP INDEX kg_rel_tgt_any")
-    assert (
-        pm.health(pm._connect(db_url, read_only=True))["checks"][
-            "owner-only indexes exist and are valid"
-        ]["ok"]
-        is False
-    )
-    merged.execute("CREATE INDEX kg_rel_tgt_any ON kg_relationships (owner_id, tgt_uuid)")
-    ent(merged, "p-alpha", "Alpha")  # a folded loser's uuid, back in technical
-    assert (
-        pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"][
-            "ok"
-        ]
-        is False
-    )
-
-
-def test_health_stays_green_when_a_fact_is_deleted_after_the_merge_and_shows_the_counts(
-    merged, db_url
-):
-    """An episode delete removes facts for good: the count falls below the one recorded before
-    the merge, and that is the graph moving on, not damage."""
-    before = run_counts(merged)["facts_total"]
-    merged.execute("DELETE FROM kg_relationships WHERE uuid = 'f-old-p'")
-    report = pm.health(pm._connect(db_url, read_only=True))
-    assert report["ok"] is True
-    assert report["reported_not_checked"]["fact_count"] == {
-        "now": before - 1,
-        "before_merge": before,
-    }
-
-
-def test_health_stays_green_when_a_survivor_is_swept_after_the_merge_and_lists_it(merged, db_url):
-    """A survivor whose edges all went with deleted episodes is removed by the orphan sweep."""
-    assert fold_map(merged)["p-omega"][0] == "t-omega"
-    merged.execute(
-        "DELETE FROM kg_relationships WHERE src_uuid = 't-omega' OR tgt_uuid = 't-omega'"
-    )
-    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-omega'")
-    report = pm.health(pm._connect(db_url, read_only=True))
-    assert report["ok"] is True
-    assert report["reported_not_checked"]["survivors_no_longer_in_technical"] == {
-        "count": 1,
-        "uuids": ["t-omega"],
-    }
-
-
-def test_health_names_undo_not_a_rerun_for_a_returned_uuid_whose_survivor_is_gone(merged, db_url):
-    merged.execute(
-        "DELETE FROM kg_relationships WHERE src_uuid = 't-delta' OR tgt_uuid = 't-delta'"
-    )
-    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-delta'")
-    ent(merged, "p-delta", "Delta Again")  # a stale name index wrote the folded uuid again
-    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
-    assert gone["ok"] is False and gone["still_present"]["uuids"] == ["p-delta"]
-    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
-    assert "apply_again_folds" not in gone
-    assert "apply 067 again" not in gone["remedy"] and "--undo" in gone["remedy"]
-    merge(db_url)  # and a re-run indeed leaves it alone
-    assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs") == 1
-    assert ent_row(merged, "p-delta")["group_id"] == "technical"
-    # one whose survivor is alive is still the re-run's work, and keeps its remedy
-    ent(merged, "p-alpha", "Alpha Again")
-    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
-    assert gone["apply_again_folds"]["uuids"] == ["p-alpha"]
-    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
-    assert "apply 067 again, then restart the pollers" in gone["remedy"]
-
-
-def test_health_does_not_say_a_rerun_folds_a_returned_personal_uuid_it_would_only_regroup(
-    merged, db_url
-):
-    """The survivor is gone, so the ghost rule rejects the uuid; the name rule has no twin for
-    it either. A re-run regroups it, which is not a fold, and afterwards it is a stranded
-    uuid like any other."""
-    merged.execute(
-        "DELETE FROM kg_relationships WHERE src_uuid = 't-delta' OR tgt_uuid = 't-delta'"
-    )
-    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-delta'")
-    ent(merged, "p-delta", "Delta Again", group="personal")
-    report = pm.health(pm._connect(db_url, read_only=True))
-    gone = report["checks"]["every folded entity is gone"]
-    assert gone["ok"] is False and gone["still_present"]["uuids"] == ["p-delta"]
-    assert "apply_again_folds" not in gone and "apply_again_leaves_alone" not in gone
-    assert "apply 067 again, then restart the pollers" in gone["remedy"]
-    personal = report["checks"]["no personal rows"]
-    assert personal["ok"] is False and "apply 067 again" in personal["remedy"]
-    merge(db_url)
-    assert fold_map(merged, 2) == {}  # regrouped, not folded
-    assert ent_row(merged, "p-delta")["group_id"] == "technical"
-    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
-    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
-    assert "apply_again_folds" not in gone
-
-
-def test_health_just_merged_fails_on_a_lost_fact_or_a_survivor_and_says_which(
-    merged, db_url, capsys
-):
-    """Right after the merge nothing deletes a fact or a survivor, so both figures must hold
-    exactly. Without the flag the same graph is green and the numbers are only reported."""
-    before = run_counts(merged)["facts_total"]
-    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 0
-    cap = capsys.readouterr()
-    report = json.loads(cap.out)
-    assert cap.err == "" and report["ok"] is True
-    assert report["checks"][pm._JM_FACTS] == {"ok": True, "now": before, "before_merge": before}
-    assert report["checks"][pm._JM_SURVIVORS] == {"ok": True, "count": 0, "uuids": []}
-    assert report["reported_not_checked"] == {}  # they are checks now
-
-    merged.execute("DELETE FROM kg_relationships WHERE uuid = 'f-old-p'")
-    assert pm.main(["--health", "--db-url", db_url]) == 0  # an episode delete later on: fine
-    capsys.readouterr()
-    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 1
-    cap = capsys.readouterr()
-    report = json.loads(cap.out)
-    assert report["ok"] is False
-    assert report["checks"][pm._JM_FACTS] == {
-        "ok": False,
-        "now": before - 1,
-        "before_merge": before,
-    }
-    assert report["checks"][pm._JM_SURVIVORS]["ok"] is True
-    assert f"fact_count.now is {before - 1}, before_merge is {before}" in cap.err
-    assert "survivors_no_longer_in_technical" not in cap.err
-
-    merged.execute(
-        "DELETE FROM kg_relationships WHERE src_uuid = 't-omega' OR tgt_uuid = 't-omega'"
-    )
-    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-omega'")
-    assert pm.main(["--health", "--db-url", db_url]) == 0
-    capsys.readouterr()
-    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 1
-    cap = capsys.readouterr()
-    survivors = json.loads(cap.out)["checks"][pm._JM_SURVIVORS]
-    assert survivors == {"ok": False, "count": 1, "uuids": ["t-omega"]}
-    assert "survivors_no_longer_in_technical.count is 1, not 0" in cap.err
-
-
-def test_health_just_merged_adds_no_fact_count_check_when_the_run_only_flipped_notes(piles, db_url):
-    _note(piles, "late-note", "personal")
-    merge(db_url)
-    assert "facts_total" not in run_counts(piles, 1)
-    report = pm.health(pm._connect(db_url, read_only=True), just_merged=True)
-    assert report["ok"] is True and pm._JM_FACTS not in report["checks"]
-
-
-def test_just_merged_belongs_to_health(db_url):
-    with pytest.raises(SystemExit):
-        pm.main(["--preview", "--just-merged", "--db-url", db_url])
-
-
-def _undo(db_url: str, *, run: str = "all", write: bool = True) -> dict[str, Any]:
-    return pm.undo(pm._connect(db_url, read_only=False), run=run, write=write)
 
 
 def _in_thread(fn) -> tuple[threading.Thread, dict[str, Any]]:
@@ -1002,288 +725,6 @@ def _wait_until_blocked_by(probe, pid: int, *, seconds: float = 20) -> None:
             return
         time.sleep(0.02)
     pytest.fail(f"nothing waits for a lock held by backend {pid}")
-
-
-def test_undo_restores_the_exact_rows_the_trigger_and_the_066_stamp(seeded, db_url):
-    seeded.execute(
-        "UPDATE kg_relationships SET audience = NULL, label_version = NULL WHERE uuid = 'f-p1'"
-    )  # a straggler
-    before = table_md5(seeded)
-    trigger = one(
-        seeded,
-        "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'",
-    )
-    merge(db_url)
-    assert table_md5(seeded) != before
-    dry = _undo(db_url, write=False)  # a dry run rolls back
-    assert dry["stamped 066"] is True and dry["written"] is False
-    assert one(seeded, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
-    assert (
-        one(seeded, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NOT NULL") == 0
-    )
-    out = _undo(db_url)
-    assert all(not d["count"] for d in out["drift"].values() if "count" in d)
-    assert table_md5(seeded) == before
-    assert (
-        one(
-            seeded,
-            "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'",
-        )
-        == trigger
-    )
-    assert one(seeded, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
-    assert (
-        one(seeded, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NOT NULL") == 1
-    )
-    # the indexes and the column defaults are additive and stay
-    assert (
-        pm.health(pm._connect(db_url, read_only=True))["checks"][
-            "owner-only indexes exist and are valid"
-        ]["ok"]
-        is True
-    )
-    with pytest.raises(SystemExit):
-        _undo(db_url)  # nothing left to undo
-    merge(db_url)  # and the merge can be applied again, under a new run
-    assert rows(seeded, "SELECT run_id FROM kg_pile_merge_067_runs ORDER BY run_id")[-1] == (2,)
-
-
-def test_undo_reports_drift_and_keeps_what_was_written_since(merged, db_url):
-    merged.execute("UPDATE kg_entities SET summary = 'edited since' WHERE uuid = 't-gamma1'")
-    fact(merged, "f-after", "technical", "t-alpha", "t-delta", "written after the merge")
-    ent(
-        merged, "p-delta", "Reborn", group="technical"
-    )  # a folded loser's uuid, taken by something else
-    merged.execute("UPDATE kg_relationships SET src_uuid = 't-eps-moved' WHERE uuid = 'f-p4'")
-    out = _undo(db_url)
-    drift = out["drift"]
-    assert drift["survivor edited since the merge"]["uuids"] == ["t-gamma1"]
-    assert drift["folded entity uuid already exists"]["uuids"] == ["p-delta"]
-    assert drift["fact changed since the merge, or gone"]["uuids"] == ["f-p4"]
-    assert ent_row(merged, "t-gamma1")["summary"] == "edited since"  # not overwritten
-    assert ent_row(merged, "p-delta")["name"] == "Reborn"
-    assert fact_row(merged, "f-after")["group_id"] == "technical"
-    assert fact_row(merged, "f-p4")["src_uuid"] == "t-eps-moved"
-    # everything else went back
-    assert (
-        ent_row(merged, "p-alpha")["group_id"] == "personal"
-        and ent_row(merged, "p-gamma") is not None
-    )
-    assert (
-        fact_row(merged, "f-p1")["src_uuid"] == "p-alpha"
-        and fact_row(merged, "f-p1")["group_id"] == "personal"
-    )
-    assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
-
-
-def test_undo_of_two_runs_goes_latest_first_and_stamps_066_only_when_all_are_undone(merged, db_url):
-    ent(merged, "p-alpha", "Alpha", group="personal")  # old code's ghost of a folded twin
-    ent(merged, "p-newbie", "Newbie", group="personal")
-    fact(merged, "f-ghost", "personal", "p-alpha", "p-newbie", "from the ghost")
-    merge(db_url)
-    assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs") == 2
-    with pytest.raises(SystemExit, match="later runs"):
-        _undo(db_url, run="1")
-    out = _undo(db_url, run="2")
-    assert out["stamped 066"] is False
-    assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
-    assert ent_row(merged, "p-newbie")["group_id"] == "personal"
-    ghost = fact_row(merged, "f-ghost")
-    assert (ghost["group_id"], ghost["src_uuid"], ghost["audience"]) == (
-        "personal",
-        "p-alpha",
-        None,
-    )  # unstamped again
-    out = _undo(db_url, run="1")
-    assert out["stamped 066"] is True
-    # one by one, the ghost row run 2 gave back is in the way of run 1's original: reported, not overwritten
-    assert out["drift"]["folded entity uuid already exists"]["uuids"] == ["p-alpha"]
-    assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
-    assert one(merged, "SELECT count(*) FROM kg_relationships WHERE group_id = 'personal'") == 10
-    assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NULL") == 0
-
-
-def test_undo_all_across_two_runs_restores_the_original_twin_rows(merged, db_url):
-    original_id = one(
-        merged,
-        "SELECT id FROM kg_pile_merge_067_entities WHERE uuid = 'p-alpha' AND image = 'before'",
-    )
-    ent(merged, "p-alpha", "Alpha", group="personal")
-    merge(db_url)
-    out = _undo(db_url)
-    assert out["runs"] == [1, 2] and out["stamped 066"] is True
-    row = ent_row(merged, "p-alpha")
-    assert (
-        row["group_id"] == "personal" and row["id"] == original_id
-    )  # run 1's image, not the ghost's
-
-
-def test_undo_all_judges_each_run_by_its_own_map(merged, db_url):
-    """Run 1 folded p-alpha into t-alpha. That survivor is gone, and the uuid comes back: run 2
-    folds it into the other technical Alpha. An undo that reads one map for both runs expects
-    the ghost's fact on t-alpha, does not find it there and leaves it on the wrong entity."""
-    original_id = one(
-        merged,
-        "SELECT id FROM kg_pile_merge_067_entities WHERE uuid = 'p-alpha' AND image = 'before'",
-    )
-    ent(merged, "t-alpha-b", "Alpha")
-    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-alpha'")
-    ent(merged, "p-alpha", "Alpha", group="personal")
-    fact(merged, "f-ghost", "personal", "p-alpha", "t-delta", "from the ghost")
-    merge(db_url)
-    assert fold_map(merged, 2) == {"p-alpha": ("t-alpha-b", "name")}
-    assert fact_row(merged, "f-ghost")["src_uuid"] == "t-alpha-b"
-    out = _undo(db_url)
-    assert out["runs"] == [1, 2]
-    ghost = fact_row(merged, "f-ghost")
-    assert (ghost["group_id"], ghost["src_uuid"]) == ("personal", "p-alpha")
-    assert "f-ghost" not in out["drift"]["fact changed since the merge, or gone"]["uuids"]
-    assert ent_row(merged, "p-alpha")["id"] == original_id  # run 1's row, not the ghost's
-    assert fact_row(merged, "f-p1")["src_uuid"] == "p-alpha"  # run 1's own facts, as before
-
-
-def test_undo_all_keeps_what_was_written_to_a_survivor_between_two_runs(merged, db_url):
-    """A mention of t-alpha at the new image rewrites its summary, then the re-run folds a
-    straggler into it again. Undoing both runs must not take that edit back to run 1's image."""
-    merged.execute(
-        "UPDATE kg_entities SET summary = 'written by the new image' WHERE uuid = 't-alpha'"
-    )
-    ent(merged, "p-alpha", "Alpha", group="personal")
-    merge(db_url)
-    out = _undo(db_url)
-    assert ent_row(merged, "t-alpha")["summary"] == "written by the new image"
-    assert out["drift"]["survivor edited since the merge"]["uuids"] == ["t-alpha"]
-    assert ent_row(merged, "p-alpha")["group_id"] == "personal"  # everything else went back
-
-
-def test_undo_refuses_when_a_later_migration_has_raised_the_stamp_and_changes_nothing(
-    merged, db_url
-):
-    """A full undo stamps 066; with 068 applied that would put the version below 068's objects."""
-    merged.execute("UPDATE synapse_meta SET value = '068' WHERE key = 'schema_version'")
-    try:
-        before = table_md5(merged)
-        for write in (False, True):
-            with pytest.raises(SystemExit, match="above 067"):
-                _undo(db_url, write=write)
-        assert table_md5(merged) == before
-        assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "068"
-        assert (
-            one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NOT NULL")
-            == 0
-        )
-        assert (
-            one(merged, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'")
-            == 0
-        )  # the 066 trigger was not put back either
-    finally:
-        # 067's own stamp never moves down, so the fixture's re-apply would leave 068 behind
-        merged.execute("UPDATE synapse_meta SET value = '067' WHERE key = 'schema_version'")
-
-
-def test_undo_reads_the_open_runs_only_after_it_has_the_lock(merged, db_url):
-    """An apply that holds the lock when undo starts has committed its run by the time undo
-    reads the runs, so undo takes that run too instead of stamping 066 over it."""
-    apply_ = psycopg.connect(db_url)
-    probe = psycopg.connect(db_url, autocommit=True)
-    try:
-        apply_.execute("LOCK TABLE kg_entities, kg_relationships IN SHARE ROW EXCLUSIVE MODE")
-        apply_.execute(
-            "INSERT INTO kg_pile_merge_067_runs (schema_version_before, counts) VALUES ('066', '{}')"
-        )
-        t, box = _in_thread(lambda: _undo(db_url, write=False))
-        _wait_until_blocked_by(probe, apply_.info.backend_pid)
-        apply_.commit()
-        t.join(30)
-    finally:
-        apply_.close()
-        probe.close()
-    assert "error" not in box, box
-    assert box["result"]["runs"] == [1, 2]
-
-
-def test_the_undo_help_says_a_dry_run_holds_writers_off_too(capsys):
-    with pytest.raises(SystemExit):
-        pm.main(["--help"])
-    assert "stop the pollers first" in " ".join(capsys.readouterr().out.split())
-    assert "with the pollers stopped too" in " ".join(pm.__doc__.split())
-
-
-def test_undo_reports_a_regrouped_entity_that_got_edges_since_and_still_moves_it_back(
-    merged, db_url
-):
-    fact(merged, "f-since", "technical", "p-eps", "t-delta", "written after the merge")
-    out = _undo(db_url)
-    key = "regrouped entity moved back has edges the merge never touched"
-    assert out["drift"][key] == {"count": 1, "uuids": ["p-eps"]}
-    assert ent_row(merged, "p-eps")["group_id"] == "personal"  # moved back all the same
-    assert fact_row(merged, "f-since")["group_id"] == "technical"  # and the edge is left alone
-
-
-def test_undo_reports_a_regrouped_entity_that_got_an_edge_pointing_at_it_since(merged, db_url):
-    fact(merged, "f-since", "technical", "t-delta", "p-eps", "written after the merge")
-    out = _undo(db_url)
-    key = "regrouped entity moved back has edges the merge never touched"
-    assert out["drift"][key] == {"count": 1, "uuids": ["p-eps"]}
-    assert ent_row(merged, "p-eps")["group_id"] == "personal"
-
-
-def test_undo_is_not_cut_off_by_a_statement_timeout_set_on_the_role(merged, db_url):
-    """A writer holds the undo's lock request for longer than the session's timeout; the undo
-    sets statement_timeout to 0 for its own transaction, as 067 does, and goes on to finish."""
-    writer = psycopg.connect(db_url)
-    writer.execute("LOCK TABLE kg_relationships IN ROW EXCLUSIVE MODE")
-    probe = psycopg.connect(db_url, autocommit=True)
-    conn = pm._connect(db_url, read_only=False)
-    conn.execute("SET statement_timeout = '300ms'")
-    try:
-        t, box = _in_thread(lambda: pm.undo(conn, run="all", write=False))
-        _wait_until_blocked_by(probe, writer.info.backend_pid)
-        time.sleep(1)
-        writer.rollback()
-        t.join(30)
-    finally:
-        writer.close()
-        probe.close()
-        conn.close()
-    assert "error" not in box, box
-    assert box["result"]["runs"] == [1]
-
-
-def test_undo_re_creates_an_entity_into_a_column_a_later_migration_made_not_null(seeded, db_url):
-    """Run 2 syncs a column added after run 1 into the ledger. Run 1's rows must hold the live
-    default there, not NULL, or putting a folded twin back violates the live NOT NULL."""
-    merge(db_url)
-    seeded.execute("ALTER TABLE kg_entities ADD COLUMN pm_req text NOT NULL DEFAULT 'dflt'")
-    try:
-        ent(seeded, "p-late", "Late", group="personal")
-        merge(db_url)
-        out = _undo(db_url)
-        assert out["folded entities re-created"] == 7  # run 1's seven folded twins
-        assert ent_row(seeded, "p-alpha")["pm_req"] == "dflt"
-    finally:
-        seeded.execute("ALTER TABLE kg_entities DROP COLUMN IF EXISTS pm_req")
-
-
-def test_no_report_prints_fact_or_entity_text(seeded, db_url, capsys):
-    secret = [
-        "Alpha",
-        "Gamma",
-        "Overlord",
-        "Narrator",
-        "Epsilon",
-        "Zeta",
-        "alpha is owned",
-        "Delta uses Gamma",
-    ]
-    assert pm.main(["--preview", "--db-url", db_url]) == 0
-    merge(db_url)
-    assert pm.main(["--health", "--db-url", db_url]) == 0
-    assert pm.main(["--undo", "--db-url", db_url]) == 0  # a dry run
-    assert pm.main(["--undo", "--apply", "--db-url", db_url]) == 0
-    out = capsys.readouterr().out
-    assert len(out) > 500
-    assert not [s for s in secret if s.lower() in out.lower()]
 
 
 # ---------------------------------------------------------------------------
@@ -1358,19 +799,10 @@ def test_the_name_lookup_is_answered_from_the_normalized_name_index(piles):
 def test_the_survivor_order_the_lookups_use_is_the_one_the_merge_uses():
     text = _SQL_067.read_text()
     assert f"ORDER BY owner_id, k, {SURVIVOR_ORDER}" in text
-    assert f"ORDER BY owner_id, k, {SURVIVOR_ORDER}" in pm.shared_sql()["map"]
     from ingestion import kg_pg_read
 
     src = Path(kg_pg_read.__file__).read_text()
     assert src.count('"ORDER BY " + SURVIVOR_ORDER') == 2  # the name lookup and load_entities
-
-
-def test_the_shared_text_is_read_from_067_and_the_preview_runs_it():
-    parts = pm.shared_sql()
-    assert parts["map"].startswith("WITH pk AS") and "_pm_excl" in parts["map"]
-    assert "_pm_map" in parts["fx"] and parts["counts"].startswith("jsonb_build_object(")
-    sql = pm.preview_sql(with_exclude_table=False)
-    assert parts["map"] in sql and parts["fx"] in sql and parts["counts"] in sql
 
 
 def _schema_through_067(tmp_path: Path) -> Path:
@@ -1866,8 +1298,6 @@ def test_the_ledger_follows_a_live_table_that_gains_or_loses_a_column(seeded, db
             )
             == "kept"
         )
-        out = _undo(db_url, run="2")  # undo copes with the columns that differ too
-        assert out["drift"]["folded entity uuid already exists"]["count"] == 0
     finally:
         seeded.execute("ALTER TABLE kg_entities DROP COLUMN IF EXISTS pm_old")
         seeded.execute("ALTER TABLE kg_entities DROP COLUMN IF EXISTS pm_new")
@@ -1929,11 +1359,6 @@ def test_an_invalid_owner_only_index_stops_the_file_before_anything_is_written(s
         res = _psql(db_url, _SQL_067, check=False)
         assert res.returncode != 0 and "INVALID" in res.stderr
         assert one(seeded, "SELECT count(*) FROM kg_entities WHERE group_id = 'personal'") == 11
-        health = pm.health(pm._connect(db_url, read_only=True))
-        assert (
-            "kg_rel_tgt_any"
-            in health["checks"]["owner-only indexes exist and are valid"]["missing_or_invalid"]
-        )
     finally:
         seeded.execute("DROP INDEX kg_rel_tgt_any")
 
@@ -1979,46 +1404,21 @@ def _exclusion_world(c) -> None:
     fact(c, "f-x2", "personal", "p-xeno", "t-xeno", "kept apart")
 
 
-def _exclude_file(tmp_path: Path, *lines: str) -> str:
-    p = tmp_path / "exclude.tsv"
-    p.write_text("\n".join(lines) + "\n")
-    return str(p)
+def _list(conn, *uuids: str) -> None:
+    """The owner's exclusion list: a table 067 reads when it exists and never creates."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS public.kg_pile_merge_067_exclude "
+        "(owner_id text NOT NULL, uuid text NOT NULL, PRIMARY KEY (owner_id, uuid))"
+    )
+    for u in uuids:
+        conn.execute(
+            "INSERT INTO kg_pile_merge_067_exclude (owner_id, uuid) VALUES (%s, %s)", (OWNER, u)
+        )
 
 
-def test_an_excluded_twin_is_regrouped_not_folded_and_its_edges_are_untouched(
-    piles, db_url, tmp_path, capsys
-):
+def test_an_excluded_twin_is_regrouped_not_folded_and_its_edges_are_untouched(piles, db_url):
     _exclusion_world(piles)
-    path = _exclude_file(
-        tmp_path,
-        "# reviewed by hand",
-        f"{OWNER}\tp-xeno",
-        f"{OWNER}\tp-root",
-        f"{OWNER}\tnot-there",
-        "",
-    )
-    # a dry run reads the file and writes nothing
-    assert pm.main(["--exclude", path, "--db-url", db_url]) == 0
-    dry = json.loads(capsys.readouterr().out)
-    assert (
-        dry["pairs in file"] == 3
-        and dry["exist as personal entities"] == 2
-        and dry["written"] is False
-    )
-    assert (
-        dry["of those, personal twins (would have been folded)"] == 1
-    )  # p-root has no same-name twin
-    # but it is flagged, and the owner already has a flagged technical entity: it folds anyway
-    folded = dry["of those, still folded: the owner-flag rule ignores the listing"]
-    assert folded["uuids"] == ["p-root"] and "rule a" in dry["warnings"][0]
-    assert one(piles, "SELECT to_regclass('public.kg_pile_merge_067_exclude')") is None
-    assert pm.main(["--exclude", path, "--apply", "--db-url", db_url]) == 0
-    assert json.loads(capsys.readouterr().out)["newly listed"] == 3
-    assert pm.main(["--exclude", path, "--apply", "--db-url", db_url]) == 0  # idempotent
-    assert json.loads(capsys.readouterr().out)["newly listed"] == 0
-    c = run_counts_preview(db_url)
-    assert (c["exclude_listed"], c["exclude_personal"], c["exclude_twins"]) == (3, 2, 1)
-    assert (c["exclude_owner_flag"], c["exclude_outranks_twin"]) == (1, 0)
+    _list(piles, "p-xeno", "p-root", "not-there")
     before, kept = fact_row(piles, "f-x"), fact_row(piles, "f-x2")
     merge(db_url)
     m = fold_map(piles)
@@ -2037,69 +1437,46 @@ def test_an_excluded_twin_is_regrouped_not_folded_and_its_edges_are_untouched(
     # the owner-flag rule is not an exclusion's to override: two flagged rows cannot coexist
     assert m["p-root"] == ("t-root", "owner-flag")
     applied = run_counts(piles)
+    # three listed, two of them personal entities, one of those a same-name twin (p-root has
+    # none), and the flagged one folded all the same
     assert (applied["exclude_listed"], applied["exclude_personal"], applied["exclude_twins"]) == (
         3,
         2,
         1,
     )
+    assert (applied["exclude_owner_flag"], applied["exclude_outranks_twin"]) == (1, 0)
 
 
-def test_a_listed_entity_with_a_lower_id_than_its_twin_is_reported_as_first_for_its_name(
-    piles, db_url, tmp_path, capsys, monkeypatch
+def test_a_listed_entity_with_a_lower_id_than_its_twin_is_counted_as_first_for_its_name(
+    piles, db_url, monkeypatch
 ):
     """Kept apart, it is still a technical row of that name, and the oldest: every later mention
     resolves to it, the Person where the mentions were about the tool."""
     ent(piles, "p-first", "Jordan", group="personal", supertype="Person")
     ent(piles, "t-jordan", "Jordan", supertype="Tool")
-    path = _exclude_file(tmp_path, f"{OWNER}\tp-first")
-    assert pm.main(["--exclude", path, "--db-url", db_url]) == 0
-    cap = capsys.readouterr()
-    out = json.loads(cap.out)
-    first = out["of those, kept apart but first for their name by SURVIVOR_ORDER"]
-    assert first["uuids"] == ["p-first"] and "outrank" in out["warnings"][0]
-    assert "warning:" in cap.err and "Jordan" not in cap.out + cap.err
-    assert pm.main(["--exclude", path, "--apply", "--db-url", db_url]) == 0
-    capsys.readouterr()
-    c = run_counts_preview(db_url)
-    assert (c["exclude_outranks_twin"], c["exclude_twins"]) == (1, 1)
-    gates = pm.preview(pm._connect(db_url, read_only=True))["gates"]
-    assert (
-        gates["exclude_outranks_twin is 0 (no listed entity becomes first for its name)"] is False
-    )
+    _list(piles, "p-first")
     merge(db_url)
     assert fold_map(piles) == {}
+    c = run_counts(piles)
+    assert (c["exclude_outranks_twin"], c["exclude_twins"]) == (1, 1)
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
     assert KGPostgresReader().entity_uuid_by_normalized_name("jordan") == "p-first"
 
 
-def test_a_listed_twin_that_is_newer_than_its_twin_is_not_reported_as_first(
-    piles, db_url, tmp_path, capsys
-):
+def test_a_listed_twin_that_is_newer_than_its_twin_is_not_counted_as_first(piles, db_url):
     ent(piles, "t-jordan", "Jordan", supertype="Tool")
     ent(piles, "p-second", "Jordan", group="personal", supertype="Person")
-    assert (
-        pm.main(["--exclude", _exclude_file(tmp_path, f"{OWNER}\tp-second"), "--db-url", db_url])
-        == 0
-    )
-    cap = capsys.readouterr()
-    out = json.loads(cap.out)
-    assert out["of those, kept apart but first for their name by SURVIVOR_ORDER"]["count"] == 0
-    assert "warnings" not in out and cap.err == ""
+    _list(piles, "p-second")
+    merge(db_url)
+    assert fold_map(piles) == {}
+    c = run_counts(piles)
+    assert (c["exclude_outranks_twin"], c["exclude_twins"]) == (0, 1)
 
 
 def test_the_exclusion_table_is_optional_and_067_never_creates_it(seeded, db_url):
     merge(db_url)
     assert one(seeded, "SELECT to_regclass('public.kg_pile_merge_067_exclude')") is None
     assert run_counts(seeded)["exclude_listed"] == 0
-
-
-def test_the_exclusion_file_must_be_owner_tab_uuid(tmp_path):
-    with pytest.raises(SystemExit, match=r":2:"):
-        pm.read_exclude_file(_exclude_file(tmp_path, "a\tb", "only-one-field"))
-    assert pm.read_exclude_file(_exclude_file(tmp_path, "a\tb", "", "# c", "a\tb", "c\td")) == [
-        ("a", "b"),
-        ("c", "d"),
-    ]
 
 
 def test_two_applies_racing_record_one_run(seeded, db_url):

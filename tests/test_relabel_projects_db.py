@@ -201,19 +201,19 @@ def _seed(conn, w: World) -> None:
         ("strids", [str(e["tickets"]), str(e["acme"])]),
     ):
         conn.execute(
-            "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, name, fact, "
-            "  episodes, t_valid) VALUES (%s, %s, 'ent-x', 'ent-y', 'RELATES', 'a fact', %s, "
+            "INSERT INTO kg_relationships (uuid, src_uuid, tgt_uuid, name, fact, "
+            "  episodes, t_valid) VALUES (%s, 'ent-x', 'ent-y', 'RELATES', 'a fact', %s, "
             "  '2026-01-01T00:00:00+00:00')",
-            (f"{w.prefix}-{uid}", w.prefix, Jsonb(episodes)),
+            (f"{w.prefix}-{uid}", Jsonb(episodes)),
         )
     for uid, project in (("ent-1", w.win + r"\tickets"), ("ent-2", w.alpha)):
         conn.execute(
-            "INSERT INTO kg_entities (uuid, group_id, project, name) VALUES (%s, %s, %s, 'x')",
-            (f"{w.prefix}-{uid}", w.prefix, project),
+            "INSERT INTO kg_entities (uuid, project, name) VALUES (%s, %s, 'x')",
+            (f"{w.prefix}-{uid}", project),
         )
     conn.execute(
-        "INSERT INTO notes (owner_id, group_id, project, type, hook, body) "
-        "VALUES ('default', %s, %s, 'project', 'a hook', 'a body')",
+        "INSERT INTO notes (owner_id, project, type, hook, body) "
+        "VALUES (%s, %s, 'project', 'a hook', 'a body')",
         (w.prefix, w.big.lower()),
     )
     conn.execute(
@@ -222,8 +222,8 @@ def _seed(conn, w: World) -> None:
         (f"{w.prefix}-tl-1", w.win_lc),
     )
     conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, project, pref, polarity) "
-        "VALUES ('default', %s, %s, 'prefers tabs', 'like')",
+        "INSERT INTO preferences (owner_id, project, pref, polarity) "
+        "VALUES (%s, %s, 'prefers tabs', 'like')",
         (w.prefix, w.twin),
     )
     # A table outside public (the script finds tables by catalog, so prod-only tables are
@@ -262,8 +262,8 @@ def _wipe(conn, w: World) -> None:
     conn.execute("DELETE FROM kg_relationships WHERE uuid LIKE %s", (like,))
     conn.execute("DELETE FROM kg_entities WHERE uuid LIKE %s", (like,))
     conn.execute("DELETE FROM episodes WHERE session_id LIKE %s", (like,))
-    conn.execute("DELETE FROM notes WHERE group_id = %s", (w.prefix,))
-    conn.execute("DELETE FROM preferences WHERE group_id = %s", (w.prefix,))
+    conn.execute("DELETE FROM notes WHERE owner_id = %s", (w.prefix,))
+    conn.execute("DELETE FROM preferences WHERE owner_id = %s", (w.prefix,))
     conn.execute("DELETE FROM timeline_events WHERE source_ref LIKE %s", (like,))
     conn.execute("DELETE FROM surfaces WHERE surface_id LIKE %s", (like,))
     conn.execute("DELETE FROM skills_lane.skill_registry WHERE name LIKE %s", (like,))
@@ -307,12 +307,12 @@ def _snapshot(conn, w: World) -> dict[str, list]:
             "SELECT uuid, project FROM kg_entities WHERE uuid LIKE %s ORDER BY uuid",
             (like,),
         ),
-        "notes": ("SELECT project FROM notes WHERE group_id = %s", (w.prefix,)),
+        "notes": ("SELECT project FROM notes WHERE owner_id = %s", (w.prefix,)),
         "timeline_events": (
             "SELECT project FROM timeline_events WHERE source_ref LIKE %s",
             (like,),
         ),
-        "preferences": ("SELECT project FROM preferences WHERE group_id = %s", (w.prefix,)),
+        "preferences": ("SELECT project FROM preferences WHERE owner_id = %s", (w.prefix,)),
         "jobs": (f'SELECT id, project FROM "{w.schema}".jobs ORDER BY id', ()),
         "registry": (f'SELECT project FROM "{w.schema}".registry', ()),
         "surfaces": (

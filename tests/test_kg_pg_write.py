@@ -15,7 +15,6 @@ from __future__ import annotations
 import pytest
 
 from ingestion.kg_pg_write import KGPostgresWriter, _ts, _vec
-from tests.helpers.embed import GROUP
 from tests.helpers.kg import _axis_list, make_edge_row
 
 
@@ -91,11 +90,11 @@ class TestUpsertNode:
             embedding=_axis_list(0),
         )
         row = conn.execute(
-            "SELECT owner_id, group_id, name, normalized_name, entity_type, summary, "
+            "SELECT owner_id, name, normalized_name, entity_type, summary, "
             "created_at, embedding IS NOT NULL FROM kg_entities WHERE uuid = 'e-1'"
         ).fetchone()
-        assert row[:6] == ("default", GROUP, "Synapse", "synapse", "Tool", "memory layer")
-        created_at_first, has_emb = row[6], row[7]
+        assert row[:5] == ("default", "Synapse", "synapse", "Tool", "memory layer")
+        created_at_first, has_emb = row[5], row[6]
         assert has_emb
 
         # Update: a casing variant of the same name + longer summary, NO embedding
@@ -158,9 +157,8 @@ class TestUpsertNode:
         # Rows written before normalized_name existed carry ''; a same-name merge
         # still fills it in, a merge under another name leaves the row's name alone.
         conn.execute(
-            "INSERT INTO kg_entities (uuid, group_id, name, normalized_name) "
-            "VALUES ('e-pr', %s, 'Legacy Widget', '')",
-            (GROUP,),
+            "INSERT INTO kg_entities (uuid, name, normalized_name) "
+            "VALUES ('e-pr', 'Legacy Widget', '')"
         )
         self._upsert(kg_writer, "widget pipeline", "widget pipeline", "s", axis=0)
         assert self._name_row(conn)[:2] == ("Legacy Widget", "")
@@ -186,17 +184,17 @@ class TestCreateEdges:
             ],
         )
         rows = conn.execute(
-            "SELECT uuid, owner_id, group_id, src_uuid, tgt_uuid, fact, episodes, "
+            "SELECT uuid, owner_id, src_uuid, tgt_uuid, fact, episodes, "
             "retrieval_count, fact_embedding IS NOT NULL, web_artifact_id, t_invalid "
             "FROM kg_relationships ORDER BY uuid"
         ).fetchall()
         assert len(rows) == 2
         r1, r2 = rows
-        assert r1[:5] == ("r-1", "default", GROUP, "e-s", "e-t")
-        assert r1[6] == [1, 2]  # episodes jsonb round-trip
-        assert r1[7] == 0 and r1[8] and r1[9] is None and r1[10] is None
-        assert not r2[8]  # no embedding
-        assert r2[9] == 42  # web-lane provenance
+        assert r1[:4] == ("r-1", "default", "e-s", "e-t")
+        assert r1[5] == [1, 2]  # episodes jsonb round-trip
+        assert r1[6] == 0 and r1[7] and r1[8] is None and r1[9] is None
+        assert not r2[7]  # no embedding
+        assert r2[8] == 42  # web-lane provenance
 
     def test_recreate_is_retry_noop(self, kg_writer, conn):
         kg_writer.create_edges([self._row("r-1")])
@@ -408,42 +406,29 @@ class TestEvidenceCurrency:
 
 
 class TestDeleteOrphanEntities:
-    def _entity(self, conn, uuid: str, age_hours: int, group: str = GROUP) -> None:
+    def _entity(self, conn, uuid: str, age_hours: int) -> None:
         conn.execute(
-            "INSERT INTO kg_entities (uuid, group_id, name, created_at) "
-            "VALUES (%s, %s, %s, now() - make_interval(hours => %s))",
-            (uuid, group, uuid, age_hours),
+            "INSERT INTO kg_entities (uuid, name, created_at) "
+            "VALUES (%s, %s, now() - make_interval(hours => %s))",
+            (uuid, uuid, age_hours),
         )
 
-    def _edge(self, conn, uuid: str, src: str, tgt: str, *, retired: bool = False, group=GROUP):
+    def _edge(self, conn, uuid: str, src: str, tgt: str, *, retired: bool = False):
         conn.execute(
-            "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, t_invalid) "
-            "VALUES (%s, %s, %s, %s, 'f', CASE WHEN %s THEN now() END)",
-            (uuid, group, src, tgt, retired),
+            "INSERT INTO kg_relationships (uuid, src_uuid, tgt_uuid, fact, t_invalid) "
+            "VALUES (%s, %s, %s, 'f', CASE WHEN %s THEN now() END)",
+            (uuid, src, tgt, retired),
         )
 
     def test_only_old_entities_without_any_edge_go(self, kg_writer, conn):
-        for name in ("src", "tgt", "retired-only", "cross-group", "orphan-old"):
+        for name in ("src", "tgt", "retired-only", "linked", "orphan-old", "other"):
             self._entity(conn, name, age_hours=48)
         self._entity(conn, "orphan-new", age_hours=1)
-        self._entity(conn, "other", age_hours=48, group="personal")
-        self._edge(conn, "r1", "src", "other", group="personal")
-        self._edge(conn, "r2", "other", "tgt", group="personal")
-        self._edge(conn, "r3", "retired-only", "other", retired=True, group="personal")
-        # an edge in either legacy group counts, whichever group the entity sits in
-        self._edge(conn, "r4", "other", "cross-group", group="personal")
+        self._edge(conn, "r1", "src", "other")
+        self._edge(conn, "r2", "other", "tgt")
+        self._edge(conn, "r3", "retired-only", "other", retired=True)
+        self._edge(conn, "r4", "other", "linked")
         assert kg_writer.delete_orphan_entities(24) == 1
         left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
-        assert left == {"src", "tgt", "retired-only", "cross-group", "orphan-new", "other"}
+        assert left == {"src", "tgt", "retired-only", "linked", "orphan-new", "other"}
         assert kg_writer.delete_orphan_entities(24) == 0  # idempotent
-
-    def test_an_entity_whose_only_edge_is_in_the_other_legacy_group_stays(self, kg_writer, conn):
-        """A regression guard on the outcome only. The orphan sweep's candidate list already
-        counted an edge in any group, so this passes on the code before one-memory too and is
-        not evidence that the group scoping was removed."""
-        self._entity(conn, "legacy", age_hours=48, group="personal")
-        self._entity(conn, "linked", age_hours=48)
-        self._edge(conn, "r1", "legacy", "linked", group=GROUP)
-        assert kg_writer.delete_orphan_entities(24) == 0
-        left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
-        assert left == {"legacy", "linked"}

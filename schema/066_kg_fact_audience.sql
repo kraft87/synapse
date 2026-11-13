@@ -16,7 +16,7 @@
 --                                   'error:<model id>' marks a 'personal' fallback written
 --                                   for a fact the labeller could not get a verdict on.
 --   kg_entities.is_self             the install owner's own entity: never a hop seed.
---                                   At most one per (owner_id, group_id). Set only by
+--                                   At most one per owner (069). Set only by
 --                                   `synapse-admin owner set <uuid>`, never by name.
 --
 -- Legacy clause. synapse_meta 'fact_audience_legacy_max_id' records the highest
@@ -64,9 +64,9 @@ INSERT INTO synapse_meta (key, value)
 SELECT 'fact_audience_legacy_max_id', COALESCE(max(id), 0)::text FROM kg_relationships
 ON CONFLICT (key) DO NOTHING;
 
--- Facts still written to the personal pile (until writes go one-group) are personal
--- on insert, like the seeded rows below: the labeller never sees them, and a restricted
--- caller that names group 'personal' is served nothing from that pile.
+-- While two piles existed, facts written to the personal pile were personal on insert,
+-- like the seeded rows below: the labeller never saw them. 067 merged the piles and drops
+-- the trigger and this function.
 CREATE OR REPLACE FUNCTION kg_relationships_personal_audience_trg()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -78,23 +78,52 @@ BEGIN
 END
 $$;
 DROP TRIGGER IF EXISTS kg_rel_personal_audience ON kg_relationships;
-CREATE TRIGGER kg_rel_personal_audience
-    BEFORE INSERT ON kg_relationships
-    FOR EACH ROW
-    WHEN (NEW.group_id = 'personal' AND NEW.audience IS NULL)
-    EXECUTE FUNCTION kg_relationships_personal_audience_trg();
+-- The trigger, the seed and the one-self index below name group_id, which 069 drops: each
+-- runs only while the column exists. The trigger needs it on all four tables, the test 067
+-- skips its work by: once 069 has begun, 067 would not drop a trigger built here, so none is
+-- built, and the function just created is dropped rather than left behind.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) = 4 THEN
+        CREATE TRIGGER kg_rel_personal_audience
+            BEFORE INSERT ON kg_relationships
+            FOR EACH ROW
+            WHEN (NEW.group_id = 'personal' AND NEW.audience IS NULL)
+            EXECUTE FUNCTION kg_relationships_personal_audience_trg();
+    ELSE
+        DROP FUNCTION IF EXISTS kg_relationships_personal_audience_trg();
+    END IF;
+END
+$$;
 
 -- Seed: every personal-pile fact, live and retired, is personal. The trigger is in
 -- place first, so nothing inserted while this runs is missed.
-UPDATE kg_relationships
-   SET audience = 'personal', label_version = 0
- WHERE group_id = 'personal' AND audience IS NULL;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_relationships'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        UPDATE kg_relationships
+           SET audience = 'personal', label_version = 0
+         WHERE group_id = 'personal' AND audience IS NULL;
+    END IF;
+END
+$$;
 
 ALTER TABLE kg_entities ADD COLUMN IF NOT EXISTS is_self BOOLEAN NOT NULL DEFAULT false;
--- One flagged entity per (owner_id, group_id): an install whose facts still sit in two
--- piles flags the owner's node in each.
-CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self
-    ON kg_entities (owner_id, group_id) WHERE is_self;
+-- One flagged entity per (owner_id, group_id) while two piles existed; 069 builds the
+-- index again on owner_id alone.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_entities'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self
+            ON kg_entities (owner_id, group_id) WHERE is_self;
+    END IF;
+END
+$$;
 
 -- The seed touches too few rows to trigger autovacuum's analyze, so without this `audience`
 -- has no statistics until the labeller has written many rows, and the planner guesses

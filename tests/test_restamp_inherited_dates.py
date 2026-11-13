@@ -60,9 +60,9 @@ def db(conn):
 
     def edge(t_valid: str, episode_ids: list[int] | None, mention_count: int = 1) -> int:
         rid = conn.execute(
-            "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, "
+            "INSERT INTO kg_relationships (uuid, src_uuid, tgt_uuid, fact, "
             "episodes, t_valid, valid_at, mention_count) "
-            "VALUES (%s, 'technical', 'restamp-src', 'restamp-tgt', 'restamp test fact', "
+            "VALUES (%s, 'restamp-src', 'restamp-tgt', 'restamp test fact', "
             "%s, %s, %s, %s) RETURNING id",
             (
                 f"restamp-{uuid.uuid4().hex}",

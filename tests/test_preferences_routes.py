@@ -142,8 +142,6 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         embed_model="test",
         source_ref="ep:7",
     )
-    # A row still filed under the retired personal group reads in the same block.
-    conn.execute("UPDATE preferences SET group_id = 'personal' WHERE id = %s", (strong,))
     db.reassert_preference(strong)  # assert_count 2 -> ranks above weak
     retired = db.insert_preference(
         owner_id=_OWNER,
@@ -171,8 +169,8 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
 
 
 # ---------------------------------------------------------------------------
-# The gate against the real store — a live preference filed under either legacy
-# group is the same pool as a fresh write
+# The gate against the real store — the owner's live preferences are one pool for a
+# fresh turn, whatever its project
 # ---------------------------------------------------------------------------
 
 
@@ -194,12 +192,12 @@ class _VecEmb:
         return [self._vec for _ in texts]
 
 
-def _seed_pref(conn, *, group_id, slot, polarity):
+def _seed_pref(conn, *, slot, polarity):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity, embedding, embed_model) "
-        f"VALUES (%s, %s, 'User prefers dark mode', %s, %s::vector({_EMBED_DIMS}), 'test') "
+        "INSERT INTO preferences (owner_id, pref, polarity, embedding, embed_model) "
+        f"VALUES (%s, 'User prefers dark mode', %s, %s::vector({_EMBED_DIMS}), 'test') "
         "RETURNING id",
-        (_OWNER, group_id, polarity, _vector_literal(onehot(slot))),
+        (_OWNER, polarity, _vector_literal(onehot(slot))),
     ).fetchone()[0]
 
 
@@ -211,19 +209,17 @@ def _run_gate(db, monkeypatch, vec, *, polarity, project):
     gate.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": project})
 
 
-# (group the live preference is filed under, project of the new turn). Each pair is one the
-# old per-group lookup missed: a project-less turn looked only in 'technical', a turn for a
-# personal-leaning project only in 'personal'.
-_ACROSS_GROUPS = [("personal", None), ("technical", "jobs")]
+# The project of the new turn: none, and one the old per-group lookup sent elsewhere.
+_PROJECTS = [None, "jobs"]
 
 
-@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
-def test_restated_preference_reasserts_the_live_one_in_the_other_group(
-    conn, db_url, monkeypatch, legacy_group, project
+@pytest.mark.parametrize("project", _PROJECTS)
+def test_restated_preference_reasserts_the_live_one_whatever_the_project(
+    conn, db_url, monkeypatch, project
 ):
     _wipe(conn)
     db = Database(db_url)
-    old = _seed_pref(conn, group_id=legacy_group, slot=30, polarity="like")
+    old = _seed_pref(conn, slot=30, polarity="like")
     _run_gate(db, monkeypatch, onehot(30), polarity="like", project=project)
     rows = conn.execute("SELECT id, assert_count FROM preferences WHERE t_invalid IS NULL")
     assert rows.fetchall() == [(old, 2)]
@@ -231,45 +227,17 @@ def test_restated_preference_reasserts_the_live_one_in_the_other_group(
     _wipe(conn)
 
 
-@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
-def test_reversed_preference_supersedes_the_live_one_in_the_other_group(
-    conn, db_url, monkeypatch, legacy_group, project
+@pytest.mark.parametrize("project", _PROJECTS)
+def test_reversed_preference_supersedes_the_live_one_whatever_the_project(
+    conn, db_url, monkeypatch, project
 ):
     _wipe(conn)
     db = Database(db_url)
-    old = _seed_pref(conn, group_id=legacy_group, slot=31, polarity="like")
+    old = _seed_pref(conn, slot=31, polarity="like")
     _run_gate(db, monkeypatch, _tilted(31, 0.85), polarity="dislike", project=project)
     live = conn.execute("SELECT id FROM preferences WHERE t_invalid IS NULL").fetchall()
     assert len(live) == 1 and live[0][0] != old
     retired = conn.execute("SELECT superseded_by FROM preferences WHERE id = %s", (old,))
     assert retired.fetchone()[0] == live[0][0]
-    db.close()
-    _wipe(conn)
-
-
-def test_new_preference_takes_the_column_default_group(conn, db_url):
-    _wipe(conn)
-    db = Database(db_url)
-    pid = db.insert_preference(
-        owner_id=_OWNER,
-        project=None,
-        pref="User prefers plain text",
-        polarity="like",
-        embedding=onehot(32),
-        embed_model="test",
-        source_ref="ep:32",
-    )
-    row = conn.execute("SELECT group_id FROM preferences WHERE id = %s", (pid,)).fetchone()
-    assert row[0] == "technical"
-    db.close()
-    _wipe(conn)
-
-
-def test_gated_preference_gets_the_default_group_whatever_the_project(conn, db_url, monkeypatch):
-    _wipe(conn)
-    db = Database(db_url)
-    _run_gate(db, monkeypatch, onehot(33), polarity="like", project="jobs")
-    rows = conn.execute("SELECT group_id FROM preferences WHERE owner_id = %s", (_OWNER,))
-    assert rows.fetchall() == [("technical",)]
     db.close()
     _wipe(conn)

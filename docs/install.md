@@ -250,13 +250,21 @@ containers and volumes.
 
 ## Upgrading
 
-First-boot init never re-runs on an existing data volume. To bring an existing database up
-to date, run [`scripts/apply_schema.sh`](../scripts/apply_schema.sh) (the single source of
-truth for migration order) against it — see the script's header for caveats.
+First-boot init never re-runs on an existing data volume.
+[`scripts/apply_schema.sh`](../scripts/apply_schema.sh) lists the migrations in order, but
+it is for an empty database: on one that already has a schema it stops at the first file
+that cannot be applied twice (001, 004 and 023 cannot). To bring an existing database up to
+date, read its stamp (`SELECT value FROM synapse_meta WHERE key = 'schema_version'`) and
+apply the files above it one at a time, in that order, each with
+`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/<file>.sql` (`-X` so a `~/.psqlrc`
+that turns autocommit off cannot wrap a file in one transaction); for 067 and 069, the
+commands in their sections below. Files from 067 on stamp the version they bring; when the
+last file applied is older, stamp its number yourself:
+`INSERT INTO synapse_meta (key, value) VALUES ('schema_version', 'NNN') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`.
 
-Every service verifies at boot that the database schema matches the code (the script
-stamps the applied version; a mismatch refuses to start with instructions rather than
-failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
+Every service verifies at boot that the database schema matches the code (the stamp records
+the applied version; a mismatch refuses to start with instructions rather than failing
+mid-request). So the upgrade order is: pull, apply the files above the stamp, restart.
 `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
@@ -271,39 +279,26 @@ two transactions of its own, so apply it by itself and never wrap it in `BEGIN` 
 
 1. Stop the pollers (`docker compose stop poller poller-drain`), so nothing writes graph
    rows during the merge.
-2. Preview, read-only. It prints counts (and uuids where it lists entities), never fact text
-   or entity names. The script runs from a checkout of this repository, in its Python
-   environment (the image does not ship `scripts/`), and takes the database from `--db-url`
-   or `$SYNAPSE_DB_URL`:
-   `python scripts/pile_merge.py --preview`
-3. Apply: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
+2. Apply: `psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
    It takes minutes on a large graph (graph writers wait while it runs; the merge itself
    does not block readers) and does nothing when there is nothing left to merge, so a
-   re-run is safe.
-4. Check, right after the merge: `python scripts/pile_merge.py --health --just-merged`
-   prints a JSON report and exits non-zero if any entry under `checks` fails: no personal
-   rows left, every folded entity gone and no edge on one, no new edge with a missing
-   endpoint or a dangling `invalidated_by`, at most one flagged owner entity per owner, the
-   066 insert trigger gone, `group_id` defaulting to `technical`, the three owner-only
-   indexes valid, the stamp at 067. `--just-merged` adds two checks that are exact only
-   while the pollers are stopped and no dashboard fact or episode delete has run: no
-   survivor has left `technical`, and the fact count equals the count before the merge. A
-   line on stderr says which of the two failed. A folded uuid that a poller wrote again
-   names its remedy (apply 067 again, then restart the pollers). Once the graph has moved on
-   (the pollers run, an episode is deleted) leave the flag off: the same two numbers then sit
-   in the `reported_not_checked` block and never fail the run, because they move for good
-   when the graph changes (an episode delete lowers the fact count). Read them; do not gate
-   on them.
-5. Deploy the release and start the pollers.
+   re-run is safe. It stamps 067 only once the graph holds no personal row and no
+   owner-only index is missing or the 066 insert trigger left.
+3. Deploy the release and start the pollers.
 
-To go back: revert the code first (a build that requires 067 exits on a database stamped
-066), stop the pollers (even the dry run holds writers off the graph tables while it runs),
-then `python scripts/pile_merge.py --undo` for a dry run and `--undo --apply` to write it.
-Undo restores the folded entities and the groups from the before-images the merge recorded;
-a row changed since the merge is reported and left alone. It refuses, changing nothing, once
-a later migration has been applied. `--exclude FILE` lists personal twins that 067 must not
-fold (a dry run unless `--apply`); read `python scripts/pile_merge.py --help` before using
-it. A fresh install needs none of this: its first boot applies 067 with nothing to merge.
+The merge's preview, health check and undo (`scripts/pile_merge.py`) are retired, and so is
+the ledger they read. A fresh install needs none of this: its first boot applies 067 with
+nothing to merge.
+
+**Schema 069, the cleanup.** Optional: no service needs it, so apply it by hand to the
+running system, nothing stopped, once 068 is in place:
+`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql` (under
+autocommit; never `-1`; after a failed step, run the whole file again). It drops `group_id` from the knowledge graph, notes and
+preferences, the indexes that lead with it, and the `kg_pile_merge_067_*` tables. A
+preflight refuses, changing nothing, below 068, on a row whose `group_id` is not
+`technical`, on a missing owner-only index, and on anything else that depends on the column;
+each refusal names what to look at. Each step waits at most 5 s for its lock and the file is
+safe to run again.
 
 Clients follow the server: `synapse update` on each machine fetches the client version the
 server now serves (the same `/install`), updates the Claude Code plugin, keeps Codex's
@@ -375,8 +370,8 @@ env var says so in its HANDOFF.md entry.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
   Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
-- **A service refuses to start, complaining about the schema version.** Run
-  `scripts/apply_schema.sh` against the database, then restart. See
+- **A service refuses to start, complaining about the schema version.** Apply the schema
+  files above the database's stamp, one at a time, then restart. See
   [Upgrading](#upgrading).
 
 ## Next
