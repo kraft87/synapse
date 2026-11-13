@@ -189,34 +189,62 @@ on cortex while other work was running: read the ratio, not the milliseconds.
   session id when it branches it, and when a compression starts a new session (rotation;
   a compression in place keeps the id). Private mode is kept per session id, so the
   turns spoken off the record were uploaded under the new id at its first finished turn,
-  up to ten of them. Now the new id is private when the session it continues is: it gets
-  the marker and the server row, and no turn from before is looked back at. `/new` and
-  `/resume` open another conversation and inherit nothing.
-- **Hermes says "new id" in two ways, and both are covered.** The classic CLI moves its
-  agent to the new id (`on_session_switch`): a switch that is neither a reset nor a
-  resume checks the id it leaves and the parent Hermes names. The TUI, the desktop app
-  and the gateway build a new agent for a branch, so the provider only sees `initialize`
-  with an id it has never met. There it reads the session's row in Hermes's store, by
-  Hermes's own rule (`hermes_state_common.py`, `_non_continuation_child_sql`): a row with
-  a parent holds that parent's turns, unless its `model_config` names the parent as what
-  it was reset or delegated from. The rule is followed up the store, since a branch of a
-  branch holds the turns of both.
+  up to ten of them. Now the new id is private when a session it holds turns of is: it
+  gets the marker and the server row, and no turn from before is looked back at. `/new`
+  and `/resume` open another conversation, and nothing is carried to it from the one
+  left.
+- **The provider meets a new id in three ways, and each is covered.**
+  - Hermes moves the agent to it (`on_session_switch`). A switch that is neither a reset
+    nor a resume checks the id it leaves and the parent Hermes names. At Hermes bca51750
+    the callers that reach a provider are a compression and the TUI's rewind. The classic
+    CLI's `/branch` and `/resume` make the call too, but its agent holds no memory
+    manager there.
+  - Hermes builds a new agent for it (`initialize`). The TUI, the desktop app and the
+    gateway do that for a branch. The provider reads the session's row in Hermes's store.
+  - Hermes names it at an upload and nowhere before (`sync_turn(session_id=...)`): a
+    session resumed in place, an agent Hermes pointed at a compression's new id after
+    it waited on another holder of the session, and a row written only after the agent
+    was built. So the row is read before the first upload under any id, once per id
+    (`_follow`).
+- **What a row says.** A row with a parent holds that parent's turns, unless its
+  `model_config` names the parent as what it was reset or delegated from. A key counts
+  only when it names the parent, which is how Hermes reads them
+  (`hermes_state_common.py`, `_non_continuation_child_sql`). The rule itself is not
+  Hermes's: that one asks whether a child is the same session after a compression, and so
+  leaves a branch out. The rule is followed up the store, since a branch of a branch
+  holds the turns of both.
 - **The marker is not the only thing asked.** A marker lasts twelve hours and `off`
   removes it, while the server's row stays and keeps dropping that session's turns. So
   when no marker says an earlier session is private, the server is asked
   (`GET /private-sessions/<earlier id>`) at the new session's first upload. Until it has
-  answered, nothing is uploaded or queued for that session. Turns finished in the
-  meantime go up once it says the earlier session is on the record.
+  answered, nothing is uploaded or queued for that session.
+- **Turns that finish while the server does not answer are kept in memory**, 200 at
+  most. They go up once it says the earlier sessions are on the record, also the ones a
+  compression in place has taken out of the conversation by then. They are dropped when
+  it says private.
 - **Asked once per session.** The answer is recorded as an empty file under
-  `$HERMES_HOME/synapse/settled/`, named by a hash of the session id. So
-  `synapse private off --forget` on a branch holds, and a branch made before its parent
-  went private stays on the record. A session with a recorded answer speaks for the ones
-  above it, so the chain is asked about only as far up as the first such session.
+  `$HERMES_HOME/synapse/settled/`, named by a hash of the session id. So a branch that
+  had its answer before its parent went private stays on the record, and
+  `synapse private off --forget` on a branch holds once the server has had its row. A
+  session with a recorded answer speaks for the ones above it, so the chain is asked
+  about only as far up as the first such session.
+- **The server is told when the session is bound.** A branch of a session with a marker
+  gets its own marker at `initialize`, and the server is told there, beside the
+  session-start requests and inside their 5 seconds. The row used to be written at the
+  branch's first upload, which undid an `off --forget` run before the first turn.
+- **The first turn back on the record goes up when it ends.** After `off --forget` on a
+  session that was carried, the turn that ends next is uploaded alone: the turn before
+  it was spoken off the record and does not go along as its context. It used to wait
+  for the turn after it, and was never sent when the session ended there.
 - **When a write fails**, the uploader refuses the new session itself and says so as a
   WARNING in Hermes's log. No marker could be written: for as long as that agent lives
   (the next one for the session asks again). The server could not be told (a 5-second
-  request): until it has the row; the request is made again each time that session
-  finishes a turn, and after any upload that is delivered, for every session still owed.
+  request): until it has the row. The request is made again each time that session
+  finishes a turn, and after any upload that is delivered, for every session still owed;
+  each try that fails is a WARNING line.
+- **A switch that cannot find out turns the provider off.** If checking the new id
+  raises, the instance uploads nothing more (inert), as after an `initialize` that
+  raised. It used to drop the switch and upload under the new id unchecked.
 - **Hermes has no command of its own for private mode.** It is `synapse private
   on|off|status <session-id>` in a terminal, the command the other two harnesses use
   (`hermes sessions list` shows the id). That was already so; the README now says it.
@@ -225,7 +253,8 @@ on cortex while other work was running: read the ratio, not the milliseconds.
 
 1. `synapse update` for plugin 0.24.10. Nothing to migrate, no setting to change, no
    server change. A Hermes session that continues another is asked about once, at its
-   next upload: one `GET /private-sessions/<id>`.
+   next upload: one `GET /private-sessions/<id>` for each session up its chain, as far
+   as the first one with a recorded answer.
 
 **Proven**
 
@@ -238,50 +267,75 @@ on cortex while other work was running: read the ratio, not the milliseconds.
 - `tests/test_client_core_upload.py`: a session that continues a private one is private
   for any uploader; with no marker to go by the server is asked before anything is
   uploaded, and a reply that does not say, or no reply, keeps the session held; a server
-  row alone carries; a session still waiting passes its question on to the next id; the
-  turns finished while it waited are sent when the answer is "on the record" and never
-  when it is "private"; a marker that cannot be written, and an id no marker can be named
-  by, are held by the uploader, queued uploads included; every session the server is
-  still to be told about is told once it answers.
+  row alone carries; a session still waiting passes its question on to the next id, and
+  keeps it when it is carried a second time or asked about more while the server is
+  being asked; a settle on a second thread cannot slip into a carry; the turns kept
+  while it waited are sent when the answer is "on the record", the ones the conversation
+  has dropped included, and never when it is "private"; the turn that has just ended
+  goes up alone after time off the record, and a flush does not take a turn from before
+  for it; a marker that cannot be written, and an id no marker can be named by, are held
+  by the uploader, queued uploads included; every session the server is still to be told
+  about is told once it answers, and each failed try is a warning.
 - `tests/test_hermes_provider.py`: a compression or a branch from a private session
   uploads nothing under the new id, at a turn, before a compression or at exit; a
-  private parent is enough, by marker or by server row; `/resume` and `/new` do not
-  inherit; an inert session writes nothing.
+  private parent is enough, by marker or by server row; `/resume` and `/new` carry
+  nothing over from the session left; an inert session writes nothing.
 - `tests/test_hermes_private_lineage.py` (new): the rule over rows built like Hermes's
   (19 cases), and a new agent for a branch or a compressed continuation of a private
-  session: nothing is uploaded, no request is made while the session is bound, the
-  answer is recorded once, a reset or a subagent is not carried, a branch of a branch is
-  private with the session at the top, and with the server down nothing leaves and the
-  next agent asks again.
-- Each of those fails with its line of the change taken out (31 changes tried).
+  session: nothing is uploaded, the server is told as the session is bound (a WARNING
+  when it cannot be), the answer is recorded once, a reset or a subagent is not carried,
+  a branch of a branch is private with the session at the top, and with the server down
+  nothing leaves and the next agent asks again. A session resumed in place, an upload
+  for an id the agent was never moved to, and a row written after the agent was built
+  are private with the session they continue, by marker or by server row. `off --forget`
+  before a branch's first turn holds, and a flush after it sends no turn from before. An
+  id is read once, also when its answer could not be recorded. A switch or an upload
+  whose check raises sends nothing. Turns compressed away while the server did not
+  answer go up when it does.
+- Each of those rules was taken out of the code in turn (64 changes, one at a time);
+  the tests failed every time.
 - In a real Hermes checkout (bca51750): `tests/test_hermes_integration.py` marks a
   session private and makes the calls a compression makes on Hermes's own
   `MemoryManager`; the child id gets the marker and the row and nothing is uploaded
   under either id, in-process and in Hermes's plugin host. `tests/test_hermes_checkout_names.py`
   reads the call sites that announce a switch (compression and branch pass
   `reset=False`, resume passes `reason="resume"`, `/new` passes `reset=True`), the keys
-  Hermes's own rule tells a copy from another conversation by, and that the TUI writes a
-  branch's row before it builds the branch's agent.
+  by which Hermes marks a child as something other than a continuation, and that the TUI
+  writes a branch's row with the parent link and `_branched_from`.
+- Reviewed twice by a separate agent that tried to make private turns leave. The first
+  review found two ways; the second found ten defects, four of them ways under narrow
+  conditions. Each has a test here that fails without its fix.
 
 **Still open**
 
-- Turns of a continued session finished while the server cannot be reached are not
-  queued: another process's drain would send them without knowing the question is open.
-  If Hermes exits before the server answers, they are not uploaded. A later resume looks
-  back ten turns.
+- Turns kept for a session the server has not answered about are in memory only. They
+  are not queued: another process's drain would send them without knowing the question
+  is open. They are lost if Hermes exits before the server answers, dropped at a switch
+  to a new id (which looks back ten turns of its own), and past 200 the oldest are given
+  up with a WARNING.
 - While the server is down, each upload for a session it has not answered about, or has
   not been told about, waits up to 5 seconds per request, on Hermes's background worker.
+  One it has not been told about writes a WARNING line each turn.
 - A session from before this version is asked about once too, up its whole chain (one
   request per session in it). A branch made before a session above it went private then
-  turns private. `synapse private off --forget <id>` puts it back, and that holds.
+  turns private, as does one bound but not yet answered about when its parent goes
+  private. `synapse private off --forget <id>` puts it back, and that holds.
 - `off --forget` puts a session back on the record whole, as it does everywhere: a later
   agent for a branch looks back ten turns, the copied ones included. The agent that
-  carried it does not look back, but the last turn from before can go along as the
-  context that leads its first upload after.
-- `off --forget` on a session the server has not been told about yet is undone when it
-  is told. Run it again after the WARNING line stops.
-- Errs private: any switch reason but `resume` carries, and a reset child from a Hermes
-  that did not yet write `_reset_from` reads as a continuation.
+  carried it does not look back.
+- `off --forget` in the moment between a branch's marker and the server getting its row
+  is undone when the row is written. That moment is the session start (5 seconds at
+  most) and, while the server cannot be told, every turn until it is; the WARNING lines
+  say so. Run it again after they stop.
+- A flush cannot tell a turn from before `off --forget` from one after. When no turn
+  ends between the command and the end of the session (the last one was interrupted),
+  nothing of that session is sent.
+- An upload for an id the agent was not moved to goes by that id's row in Hermes's
+  store. With no store to read (`hermes_home` not passed) or no row, nothing says what
+  it continues, and it is uploaded.
+- Errs private: any switch reason but `resume` carries; a reset child from a Hermes that
+  did not yet write `_reset_from` reads as a continuation; so does a child with a parent
+  whose `source` is `tool`.
 - Not seen in a live Hermes session: the switch was driven through Hermes's own
   manager in tests, not by a real compression or a TUI branch with a real model. Not run
   on Windows.
