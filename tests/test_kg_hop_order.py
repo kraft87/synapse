@@ -17,22 +17,28 @@ from mcp_server import kg_pg
 
 OWNER = "owner"
 QUERY_EMB = [0.25, 0.5]
-SEEDS = [("s1", "One", None, 0.1, 5), ("s2", "Two", None, 0.2, 5)]
+SEEDS = [kg_pg._SeedRow("s1", "One", None, 0.1, 5), kg_pg._SeedRow("s2", "Two", None, 0.2, 5)]
 
 
 class _RecordingCursor:
-    """Records every statement; the seed statement answers with ``SEEDS``, the rest with no rows."""
+    """Records every statement; the seed statement answers with ``SEEDS``, the rest with no rows.
+
+    It stands in for the connection too: every cursor asked of it is itself.
+    """
 
     def __init__(self) -> None:
         self.statements: list[tuple[str, Any]] = []
-        self._rows: list[tuple[Any, ...]] = []
+        self._rows: list[Any] = []
+
+    def cursor(self, **_kw: Any) -> _RecordingCursor:
+        return self
 
     def execute(self, sql: str, params: Any = None) -> _RecordingCursor:
         self.statements.append((sql, params))
         self._rows = SEEDS if "WITH seeds" in sql else []
         return self
 
-    def fetchall(self) -> list[tuple[Any, ...]]:
+    def fetchall(self) -> list[Any]:
         return list(self._rows)
 
     def hops(self) -> list[tuple[str, Any]]:

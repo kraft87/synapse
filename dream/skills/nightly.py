@@ -34,8 +34,9 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from dataclasses import dataclass
 
-from psycopg.rows import dict_row
+from psycopg.rows import class_row, dict_row
 
 from . import (
     autoreview,
@@ -68,6 +69,22 @@ def _cosine(a, b):
 
 
 # ------------------------------------------------- 1. consolidate pass (registry-based)
+@dataclass(frozen=True, slots=True)
+class _UnembeddedSkillRow:
+    """One active skill with a description and no description embedding yet."""
+
+    name: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillEmbeddingRow:
+    """One active skill's description embedding (pgvector text, `[x,y,...]`)."""
+
+    name: str
+    description_embedding: str
+
+
 def consolidate_pass(conn, seen_ids):
     """Server-side: embed any active-skill descriptions that lack an embedding (Voyage), then
     nominate near-duplicate skill pairs as consolidate candidates for human review. Reads the
@@ -75,28 +92,38 @@ def consolidate_pass(conn, seen_ids):
     cur = conn.cursor()
 
     # (1) backfill description embeddings for active skills missing one.
-    cur.execute(
-        "SELECT name, description FROM skills_lane.skill_registry "
-        "WHERE status='active' AND description IS NOT NULL AND description <> '' "
-        "AND description_embedding IS NULL"
+    missing = (
+        conn.cursor(row_factory=class_row(_UnembeddedSkillRow))
+        .execute(
+            "SELECT name, description FROM skills_lane.skill_registry "
+            "WHERE status='active' AND description IS NOT NULL AND description <> '' "
+            "AND description_embedding IS NULL"
+        )
+        .fetchall()
     )
-    missing = cur.fetchall()
     if missing:
-        vecs = L.embed([d for _, d in missing], "document")
-        for (name, _), v in zip(missing, vecs, strict=False):
+        vecs = L.embed([m.description for m in missing], "document")
+        for m, v in zip(missing, vecs, strict=False):
             cur.execute(
                 "UPDATE skills_lane.skill_registry SET description_embedding=%s::halfvec, "
                 "updated_at=now() WHERE name=%s",
-                (L.vec_literal(v), name),
+                (L.vec_literal(v), m.name),
             )
         conn.commit()
 
     # (2) overlap detection -> consolidate candidates (top-K most-similar pairs above threshold).
-    cur.execute(
-        "SELECT name, description_embedding FROM skills_lane.skill_registry "
-        "WHERE status='active' AND description_embedding IS NOT NULL"
+    embedded = (
+        conn.cursor(row_factory=class_row(_SkillEmbeddingRow))
+        .execute(
+            "SELECT name, description_embedding FROM skills_lane.skill_registry "
+            "WHERE status='active' AND description_embedding IS NOT NULL"
+        )
+        .fetchall()
     )
-    rows = [(n, [float(x) for x in str(e).strip("[]").split(",")]) for n, e in cur.fetchall()]
+    rows = [
+        (r.name, [float(x) for x in str(r.description_embedding).strip("[]").split(",")])
+        for r in embedded
+    ]
     cand = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
@@ -346,19 +373,30 @@ def _session_scopes(conn, views) -> None:
         v["scope"] = _evidence_scope(cur, [{"session_id": v["session"]}])
 
 
+@dataclass(frozen=True, slots=True)
+class _LedgerCountsRow:
+    """How many candidate rows the run created and merged into."""
+
+    new: int
+    merged: int
+
+
 def _ledger_counts(conn, since) -> dict:
     """Candidate rows the run created, merged into, and raised to proposed (schema 062's
     proposed_at; absent before it is applied)."""
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT count(*) FILTER (WHERE created_at >= %s), "
-        "count(*) FILTER (WHERE created_at < %s AND last_seen >= %s) "
-        "FROM skills_lane.skill_gap_candidates",
-        (since, since, since),
+    counts = (
+        conn.cursor(row_factory=class_row(_LedgerCountsRow))
+        .execute(
+            "SELECT count(*) FILTER (WHERE created_at >= %s) AS new, "
+            "count(*) FILTER (WHERE created_at < %s AND last_seen >= %s) AS merged "
+            "FROM skills_lane.skill_gap_candidates",
+            (since, since, since),
+        )
+        .fetchone()
     )
-    new, merged = cur.fetchone()
-    out = {"candidates_new": new, "candidates_merged": merged}
+    out = {"candidates_new": counts.new, "candidates_merged": counts.merged}
     if L.queue_ready(conn):
+        cur = conn.cursor()
         cur.execute(
             "SELECT count(*) FROM skills_lane.skill_gap_candidates WHERE proposed_at >= %s",
             (since,),

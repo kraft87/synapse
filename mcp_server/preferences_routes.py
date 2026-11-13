@@ -27,9 +27,11 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -47,6 +49,16 @@ _MAX_LIMIT = 50
 BLOCK_LINES = 7
 _HEADER = "[Synapse preferences]"
 _MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
+
+
+@dataclass(frozen=True, slots=True)
+class _PreferenceRow:
+    """One standing preference, as the route serves it."""
+
+    pref: str
+    polarity: str
+    assert_count: int
+    since: str
 
 
 def _top_preferences(
@@ -74,10 +86,8 @@ def _top_preferences(
     params.append(limit)
     with pg_pool.connection(db_url) as conn:
         try:
-            rows = conn.execute(sql, params).fetchall()
-            return [
-                {"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows
-            ]
+            cur = conn.cursor(row_factory=class_row(_PreferenceRow))
+            return [asdict(r) for r in cur.execute(sql, params).fetchall()]
         except psycopg.errors.UndefinedTable:
             return []
 

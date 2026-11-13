@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Any
 
 import psycopg
-from psycopg.rows import tuple_row
 
 from ingestion.surfaces import FACT_AUDIENCE_PROBE
 from mcp_server.kg_pg import _vec_literal, fact_text_key, search_kg_postgres
@@ -228,14 +227,11 @@ class RecallSourcesMixin:
         try:
             with self._pg() as conn:
                 with conn.transaction():
-                    # kg_pg indexes rows positionally; recall borrows dict-row
-                    # connections, so override at the cursor.
-                    cur = conn.cursor(row_factory=tuple_row)
-                    cur.execute("SET LOCAL enable_seqscan = off")
-                    cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    conn.execute("SET LOCAL enable_seqscan = off")
+                    conn.execute("SET LOCAL max_parallel_workers_per_gather = 0")
                     audience_on = self._fact_audience_on(conn, allowed_projects is not None)
                     return search_kg_postgres(
-                        cur,
+                        conn,
                         query,
                         query_emb,
                         settings._KG_OWNER,

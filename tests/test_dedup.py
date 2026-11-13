@@ -24,6 +24,7 @@ from ingestion.dedup import (
     _shingles,
     has_high_entropy,
 )
+from ingestion.kg_pg_read import EntityRow
 from tests.helpers.llm import mock_llm_client
 
 # ---------------------------------------------------------------------------
@@ -82,10 +83,13 @@ class _FakeKGClient:
     def entity_uuid_by_normalized_name(self, normalized: str) -> str | None:
         return self._graph_obj._exact_match.get(normalized)
 
-    def load_entities(self) -> list[tuple[str, ...]]:
-        # The reader's rows are (uuid, name, summary, supertype, stored normalized_name); the
-        # tests preset (uuid, name, summary[, supertype]) and every row is an old one.
-        return [(*e, *(None,) * (4 - len(e)), "") for e in self._graph_obj._entities]
+    def load_entities(self) -> list[EntityRow]:
+        # The tests preset (uuid, name, summary[, supertype]) and every row is an old one: no
+        # stored normalized_name.
+        return [
+            EntityRow(*e, *(None,) * (4 - len(e)), normalized_name="")
+            for e in self._graph_obj._entities
+        ]
 
     def load_type_map(self) -> dict[str, str]:
         return dict(self._graph_obj._type_map)

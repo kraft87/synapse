@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from psycopg.rows import class_row
+
 logger = logging.getLogger(__name__)
 
 GATE_MIN_CHARS = 200
@@ -99,6 +101,18 @@ ORDER BY a.id, c.idx
 
 _CANDIDATES_SQL_LIMITED = _CANDIDATES_SQL + "\nLIMIT %s"
 
+
+@dataclass(frozen=True, slots=True)
+class _CandidateRow:
+    """One web chunk the enqueue pass considers, with its artifact's session."""
+
+    web_chunk_id: int
+    content: str
+    context_prefix: str
+    web_artifact_id: int
+    session_id: str | None
+
+
 _INSERT_SQL = """
 INSERT INTO extraction_queue
     (web_chunk_id, session_id, content, content_type, project, priority)
@@ -122,19 +136,16 @@ def enqueue_web_chunks(
     """
     stats = EnqueueStats()
     cutoff = since or datetime(1970, 1, 1, tzinfo=UTC)
+    # Its own cursor, so the rows are the same whatever rows the caller's connection makes.
+    candidates = conn.cursor(row_factory=class_row(_CandidateRow))
     if limit:
-        rows = conn.execute(_CANDIDATES_SQL_LIMITED, (cutoff, limit)).fetchall()
+        rows = candidates.execute(_CANDIDATES_SQL_LIMITED, (cutoff, limit)).fetchall()
     else:
-        rows = conn.execute(_CANDIDATES_SQL, (cutoff,)).fetchall()
+        rows = candidates.execute(_CANDIDATES_SQL, (cutoff,)).fetchall()
 
     for row in rows:
-        # dict_row vs tuple-row tolerance (matches WebArtifactsIngester pattern)
-        if isinstance(row, dict):
-            chunk_id, content = row["web_chunk_id"], row["content"]
-            prefix, session_id = row["context_prefix"], row["session_id"]
-        else:
-            chunk_id, content, prefix, _artifact_id, session_id = row
         stats.candidates += 1
+        content = row.content
 
         if len(content) < GATE_MIN_CHARS:
             stats.skipped_too_small += 1
@@ -143,9 +154,10 @@ def enqueue_web_chunks(
             stats.skipped_link_density += 1
             continue
 
-        queued_content = f"{prefix}\n\n{content}" if prefix else content
+        queued_content = f"{row.context_prefix}\n\n{content}" if row.context_prefix else content
         cur = conn.execute(
-            _INSERT_SQL, (chunk_id, session_id, queued_content, WEB_EXTRACTION_PRIORITY)
+            _INSERT_SQL,
+            (row.web_chunk_id, row.session_id, queued_content, WEB_EXTRACTION_PRIORITY),
         )
         if cur.rowcount:
             stats.enqueued += 1

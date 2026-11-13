@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -152,6 +153,22 @@ def run_once() -> None:
 _SAMPLE_CAP = 10  # bound per-count sample arrays (schema 044 header)
 
 
+@dataclass(frozen=True, slots=True)
+class _SkillSampleRow:
+    """One skill proposal raised tonight, as the dream_runs sample reads it."""
+
+    id: int
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigSampleRow:
+    """One config proposal raised tonight, as the dream_runs sample reads it."""
+
+    id: int
+    file_key: str
+
+
 def _dream_record_start(db_url: str) -> int | None:
     """INSERT the run row (ok NULL, finished_at NULL) and return its id, or None on any error."""
     try:
@@ -178,6 +195,7 @@ def _dream_collect_proposals(
         return samples
     try:
         import psycopg
+        from psycopg.rows import class_row
 
         with psycopg.connect(db_url, autocommit=True, row_factory=None) as conn:
             started = conn.execute(
@@ -195,13 +213,14 @@ def _dream_collect_proposals(
                 from dream.skills.skill_ledger import queue_ready
 
                 col = "proposed_at" if queue_ready(conn) else "created_at"
-                for pid, name in conn.execute(
+                skill_cur = conn.cursor(row_factory=class_row(_SkillSampleRow))
+                for r in skill_cur.execute(
                     "SELECT id, name FROM skills_lane.skill_gap_candidates "
                     f"WHERE status = 'proposed' AND {col} >= %s "
                     f"ORDER BY {col} DESC LIMIT %s",
                     (since, _SAMPLE_CAP),
                 ).fetchall():
-                    proposals.append({"id": f"skill:{pid}", "kind": "skill", "name": name})
+                    proposals.append({"id": f"skill:{r.id}", "kind": "skill", "name": r.name})
                 total += conn.execute(
                     "SELECT count(*) FROM skills_lane.skill_gap_candidates "
                     f"WHERE status = 'proposed' AND {col} >= %s",
@@ -216,13 +235,16 @@ def _dream_collect_proposals(
                 from dream.config import identity_ready
 
                 ccol = "proposed_at" if identity_ready(conn) else "created_at"
-                for pid, fkey in conn.execute(
+                config_cur = conn.cursor(row_factory=class_row(_ConfigSampleRow))
+                for c in config_cur.execute(
                     "SELECT id, file_key FROM config_lane.config_proposals "
                     f"WHERE status = 'proposed' AND {ccol} >= %s "
                     f"ORDER BY {ccol} DESC LIMIT %s",
                     (since, _SAMPLE_CAP),
                 ).fetchall():
-                    proposals.append({"id": f"config:{pid}", "kind": "config-edit", "name": fkey})
+                    proposals.append(
+                        {"id": f"config:{c.id}", "kind": "config-edit", "name": c.file_key}
+                    )
                 total += conn.execute(
                     "SELECT count(*) FROM config_lane.config_proposals "
                     f"WHERE status = 'proposed' AND {ccol} >= %s",

@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
+
+import psycopg
+from psycopg.rows import class_row
 
 from . import config
 from .skill_doc import body_text
@@ -43,14 +47,18 @@ def _dsn() -> str:
 
 
 def _connect(dsn: str):
-    try:
-        import psycopg
+    return psycopg.connect(dsn, connect_timeout=8)
 
-        return psycopg.connect(dsn, connect_timeout=8)
-    except ImportError:
-        import psycopg2
 
-        return psycopg2.connect(dsn, connect_timeout=8)
+@dataclass(frozen=True, slots=True)
+class _SessionTurnRow:
+    """One episode of the window, as the session views read it."""
+
+    session_id: str
+    sequence: int
+    human_turn: str | None
+    content: str
+    created_at: datetime
 
 
 def db_session_views(
@@ -65,7 +73,7 @@ def db_session_views(
     has its own ~/.claude/skills, so its procedures aren't gaps in this catalog).
     """
     conn = _connect(_dsn())
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_SessionTurnRow))
     cur.execute(
         """
         SELECT session_id, sequence, human_turn, content, created_at
@@ -78,8 +86,8 @@ def db_session_views(
         (platform, str(days), list(exclude_projects)),
     )
     sessions: dict[str, dict] = {}
-    for sid, _seq, human, content, created_at in cur.fetchall():
-        sid = str(sid)
+    for r in cur.fetchall():
+        sid = str(r.session_id)
         s = sessions.get(sid)
         if s is None:
             s = sessions[sid] = {
@@ -90,18 +98,18 @@ def db_session_views(
                 "tools": Counter(),
                 "bash_heads": [],
                 "fired": set(),
-                "started": created_at,
+                "started": r.created_at,
             }
-        if created_at is not None and (s["started"] is None or created_at < s["started"]):
-            s["started"] = created_at
-        if human:
-            h = human.strip()
+        if r.created_at is not None and (s["started"] is None or r.created_at < s["started"]):
+            s["started"] = r.created_at
+        if r.human_turn:
+            h = r.human_turn.strip()
             if h:
                 s["user_turns"] += 1
                 if not s["first_user"]:
                     s["first_user"] = h[:600]
                 s["user_msgs"].append(h[:200])
-        for line in (content or "").splitlines():
+        for line in (r.content or "").splitlines():
             m = _MARKER.match(line)
             if not m:
                 continue
@@ -256,6 +264,18 @@ def sessions_since(
     return out[:max_sessions]
 
 
+@dataclass(frozen=True, slots=True)
+class _FireEpisodeRow:
+    """One episode scanned for skill fires; meta_ts is the transcript's own timestamp."""
+
+    session_id: str
+    sequence: int
+    created_at: datetime
+    human_turn: str | None
+    content: str
+    meta_ts: str | None
+
+
 def fire_events(
     last_scan_at=None,
     days: float = 30,
@@ -272,11 +292,12 @@ def fire_events(
     marker), falling back to created_at. created_at alone lied for backfilled sessions — it was
     the ingest wall clock, which stamped week-old fires with import day."""
     conn = _connect(_dsn())
-    cur = conn.cursor()
-    bodies = _registry_bodies(cur)
+    bodies = _registry_bodies(conn.cursor())
+    cur = conn.cursor(row_factory=class_row(_FireEpisodeRow))
     if last_scan_at is not None:
         cur.execute(
-            "SELECT session_id, sequence, created_at, human_turn, content, metadata->>'ts' "
+            "SELECT session_id, sequence, created_at, human_turn, content, "
+            "metadata->>'ts' AS meta_ts "
             "FROM episodes "
             "WHERE platform=%s AND created_at > %s AND (project IS NULL OR project <> ALL(%s)) "
             "ORDER BY session_id, sequence",
@@ -284,7 +305,8 @@ def fire_events(
         )
     else:
         cur.execute(
-            "SELECT session_id, sequence, created_at, human_turn, content, metadata->>'ts' "
+            "SELECT session_id, sequence, created_at, human_turn, content, "
+            "metadata->>'ts' AS meta_ts "
             "FROM episodes "
             "WHERE platform=%s AND created_at > now() - (%s||' days')::interval "
             "AND (project IS NULL OR project <> ALL(%s)) ORDER BY session_id, sequence",
@@ -293,9 +315,9 @@ def fire_events(
     rows = cur.fetchall()
     conn.close()
     events = []
-    for i, (sid, _seq, created_at, _human, content, meta_ts) in enumerate(rows):
-        ts = _event_time(meta_ts, created_at)
-        for line in (content or "").splitlines():
+    for i, r in enumerate(rows):
+        ts = _event_time(r.meta_ts, r.created_at)
+        for line in (r.content or "").splitlines():
             m = _SKILL_MARK.match(line)
             if not m:
                 continue
@@ -307,25 +329,36 @@ def fire_events(
             j = i + 1
             if (
                 j < len(rows)
-                and str(rows[j][0]) == str(sid)
-                and is_loader_episode(rows[j][4], rows[j][3], nm.group(1), bodies.get(nm.group(1)))
+                and str(rows[j].session_id) == str(r.session_id)
+                and is_loader_episode(
+                    rows[j].content, rows[j].human_turn, nm.group(1), bodies.get(nm.group(1))
+                )
             ):
                 j += 1  # the loader's output, not the user's reply
-            if j < len(rows) and str(rows[j][0]) == str(sid):
-                nxt = (rows[j][3] or "").strip()
+            if j < len(rows) and str(rows[j].session_id) == str(r.session_id):
+                nxt = (rows[j].human_turn or "").strip()
                 dismissed = bool(
                     nxt and len(nxt.split()) <= _DISMISS_MAX_WORDS and _CORRECTION.search(nxt)
                 )
             events.append(
                 {
                     "skill": nm.group(1),
-                    "session_id": str(sid),
+                    "session_id": str(r.session_id),
                     "fired_at": ts,
                     "via": "tool",
                     "dismissed": dismissed,
                 }
             )
     return events
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillAskRow:
+    """One user turn that may ask for a skill."""
+
+    session_id: str
+    created_at: datetime
+    human_turn: str
 
 
 def explicit_skill_requests(
@@ -337,7 +370,7 @@ def explicit_skill_requests(
     """User turns that explicitly ask for a skill — a strong GROUNDED derive signal.
     Returns [{session_id, ts, phrasing}]."""
     conn = _connect(_dsn())
-    cur = conn.cursor()
+    cur = conn.cursor(row_factory=class_row(_SkillAskRow))
     cur.execute(
         "SELECT session_id, created_at, human_turn FROM episodes "
         "WHERE platform=%s AND human_turn IS NOT NULL "
@@ -350,8 +383,11 @@ def explicit_skill_requests(
         (platform, last_scan_at if last_scan_at is not None else str(days), list(exclude_projects)),
     )
     out = []
-    for sid, ts, human in cur.fetchall():
+    for r in cur.fetchall():
+        human = r.human_turn
         if human and not _BANNER.match(human) and _EXPLICIT_SKILL.search(human):
-            out.append({"session_id": str(sid), "ts": ts, "phrasing": human[:200]})
+            out.append(
+                {"session_id": str(r.session_id), "ts": r.created_at, "phrasing": human[:200]}
+            )
     conn.close()
     return out

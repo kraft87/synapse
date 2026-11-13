@@ -61,12 +61,12 @@ class Uploader:
         # Sessions this uploader refuses itself (carry_private): private ones with no
         # marker to read, private ones the server is still to be told about, and ones
         # that wait for the server to say whether a session they continue is private
-        # (with the ids to ask about). ``_settled``: what to call for a session once
+        # (with the ids to ask about). ``_settled``: whom to call for a session once
         # nothing is left open for it. ``_made``: every session made private here.
         self._unmarked: set[str] = set()
         self._owed: set[str] = set()
         self._asking: dict[str, tuple[str, ...]] = {}
-        self._settled: dict[str, Callable[[], None]] = {}
+        self._settled: dict[str, list[Callable[[bool], None]]] = {}
         self._made: set[str] = set()
         self._holding = threading.Lock()  # guards the five, which two threads change
 
@@ -130,7 +130,7 @@ class Uploader:
         session_id: str,
         *,
         timeout: float | None = 5,
-        settled: Callable[[], None] | None = None,
+        settled: Callable[[bool], None] | None = None,
     ) -> bool:
         """Keep a conversation off the record when it goes on under a new session id (a
         compression that starts a new session, a branch): private mode is kept per id,
@@ -157,15 +157,22 @@ class Uploader:
         since (``synapse private off --forget``) stays there.
 
         ``settled`` is called once the question is closed for ``session_id``: the server
-        said no earlier id is private, or it has the session's own row. It is the
-        caller's note that the session need not be asked about again, and is not called
-        when there was nothing to ask. Never raises."""
+        said no earlier id is private (it is called with False), or the session was
+        made private here and the server has its own row (True). It is the caller's
+        note that the session need not be asked about again, and of how the question
+        ended: a session made private this way holds turns spoken off the record, also
+        once it is back on it. A session carried again while its question is open (the
+        server has not answered, or is still to be told) has each call's ``settled``
+        called. Not called when there was nothing to ask, nor for a session made
+        private here whose question closed before the call. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
         failed = ""
         lines: list[str] = []
         try:
             with self._holding:
                 if session_id in self._made:
+                    if settled is not None and session_id in self._owed:
+                        self._settled.setdefault(session_id, []).append(settled)
                     return self._private_here(session_id, lines)
                 # One look at the earlier ids. Between two, a settle on another thread
                 # could make one private and drop its question, and neither would be seen.
@@ -182,7 +189,7 @@ class Uploader:
                         return False
                     self._asking[session_id] = ask
                 if settled is not None:
-                    self._settled[session_id] = settled
+                    self._settled.setdefault(session_id, []).append(settled)
         finally:
             self._say_all(lines)
         if not source:
@@ -236,10 +243,11 @@ class Uploader:
     def _close(self, session_id: str) -> None:
         """Nothing is left open for ``session_id``: tell whoever asked to know."""
         with self._holding:
-            settled = self._settled.pop(session_id, None)
-        if settled is not None:
+            asked = self._settled.pop(session_id, ())
+            made = session_id in self._made
+        for settled in asked:
             try:
-                settled()
+                settled(made)
             except Exception:
                 pass
 

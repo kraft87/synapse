@@ -299,34 +299,65 @@ or Group any more. The reasons, the limits and the Hermes source behind them:
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
 with this machine's device token. At session start: one `GET /context` (the board and
-the preferences). Each tool call: one MCP `tools/call`. Each finished turn, not
-one that failed: a `POST /ingest` (format `messages`, client `hermes`) holding the
-session id, the project label and working directory, the model name, and per message its
-role, text, tool-call names and arguments (first 1000 characters), tool results (first
-2000) and timestamp.
+the preferences). Each tool call: one MCP `tools/call`. After each turn that ended with
+a reply, not after one that failed or was cut short: a `POST /ingest` (format
+`messages`, client `hermes`) holding the session id, the project label and working
+directory, the model name, and per message its role, text, tool-call names and
+arguments (first 1000 characters), tool results (first 2000) and timestamp. It holds
+every finished turn not sent yet: a reply you stopped while it came in is stored by
+Hermes as far as it got, and goes up with the next one.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
-Not sent: the system prompt, Hermes's compaction summaries, the memory context it injects
-into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait in
-`$HERMES_HOME/synapse/outbox/` and go with the next successful one. A session marked
+Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
+Hermes folded one into), the memory context it injects into prompts, reasoning, and its
+own bookkeeping fields. With `gateway.managed_workers` on, Hermes builds an agent for
+every turn and tells it the session is new: each turn goes up without the one before
+as context, and one you steered while it ran (`/steer`), or whose message Hermes folded
+into an earlier one that got no reply, is not uploaded.
+Uploads that fail wait in `$HERMES_HOME/synapse/outbox/` and go with the next
+successful one. A session marked
 private (`synapse private on <session-id>`, in a terminal; `hermes sessions list` shows
 the id) uploads nothing. Hermes gives a conversation a new session id when it branches
-it, and when a compression starts a new session: the new id is private when a session it
-holds turns of is, and gets the marker and the server row, so what was said off the
-record stays there. Which session that is comes from the ids Hermes names when it moves
-the agent, and from the session's row in Hermes's store, read before the first upload
-under any id. A marker lasts twelve hours and `off` removes it, so when none says, the
-server is asked (`GET /private-sessions/<earlier id>`) before the new session's first
-upload, once per session; until it answers, nothing is uploaded for that session, and
-the turns that finish are kept in memory.
+it, and when a compression starts a new session: the new id is private when Hermes says
+which session it holds turns of and that one is private. It gets the marker and the
+server row, so what was said off the record stays there. Which session that is comes
+from the ids Hermes names when it moves the agent, and from the session's row in
+Hermes's store, read before the first upload under any id. A marker lasts twelve hours
+and `off` removes it, so when none says, the server is asked
+(`GET /private-sessions/<earlier id>`) before the new session's first upload, once per
+session; until it answers, nothing is uploaded for that session, and the turns that
+finish are kept in memory.
 `/new` and `/resume` open another conversation: nothing is carried to it from the one
 you left, and it is on the record unless you mark it or its own row says it continues a
-private session. `synapse private off --forget <id>` puts a session back on the record
-with the turns spoken in it. For a session that was private because of the one it
-continues, the agent running it uploads only the turns you begin from then on, also
-after a compression gives the conversation another id. A reply Hermes began itself (to
-a background-process notice) lands on the turn before it, and is not uploaded when that
-one was spoken off the record. An agent started for the session later looks back ten
-turns, copied ones included.
+private session. An ACP fork names no session it came from: it is on the record, and
+uploads the turns begun in it, not the ones copied into it. A file under
+`$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds for the
+fork later keeps them out too. Narrow cases are left. The copy of a single turn
+whose message had no text (a picture alone) can go up with the fork's first turn. An
+agent built again for the fork before its first turn (you pick another model before
+your first prompt, or the ACP adapter restarts) looks back ten turns. And when the
+copy is one message that got no reply, that agent keeps it out but the agent built
+after it uploads it. A session seeded with another's messages names none either, and
+is taken for a resumed one: up to ten of the copied turns are uploaded, whatever the
+session they came from was. A chat whose first message got no reply looks like a fork
+when you open it again: the agent built then does not upload that first exchange, and
+an agent Hermes builds for the chat later does.
+`synapse private off --forget <id>` puts a session back on the record with the turns
+spoken in it. A session that was private because of the one it continues keeps those
+turns out, and uploads the turns an agent sees begin on the record from then on. That
+holds for every agent Hermes builds for it under this `HERMES_HOME`, and for a branch
+or a compression made from it later: a file under `$HERMES_HOME/synapse/settled/` says
+the session holds turns from off the record, written once the server has had the
+session's row. Such an agent does not look back: a turn
+that had not been uploaded when Hermes replaced the agent before it is not picked up.
+The first turn back is left out when Hermes added a row of its own to it (a nudge, a
+reply to a background-process notice), when its message had no text, or when Hermes
+folded the message into an earlier one that got no reply. A message cut short off the
+record that you retry on the record is uploaded by an agent built since, as the gateway
+builds one for `/retry`, and not by the agent that saw the message begin. For each
+reply you stopped while such a session was off the record, one turn after
+`off --forget` is not uploaded. A turn from off the record can still go up after
+`off --forget` in a few narrow orders, such as when the uploads of the two turns before
+it were both still waiting as it began (a server that hangs).
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

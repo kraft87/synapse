@@ -45,16 +45,22 @@ def test_legs_without_repeats_fuse_as_before():
 
 
 class _ScriptedCursor:
-    """Answers each statement of ``search_kg_postgres`` from canned rows, by what it reads."""
+    """Answers each statement of ``search_kg_postgres`` from canned rows, by what it reads.
+
+    It stands in for the connection too: every cursor asked of it is itself.
+    """
 
     def __init__(
         self,
-        vec: list[tuple[Any, ...]],
-        seeds: list[tuple[Any, ...]],
-        hops: dict[str, list[tuple[Any, ...]]],
+        vec: list[kg_pg.FactRow],
+        seeds: list[kg_pg._SeedRow],
+        hops: dict[str, list[kg_pg.FactRow]],
     ) -> None:
         self._vec, self._seeds, self._hops = vec, seeds, hops
-        self._rows: list[tuple[Any, ...]] = []
+        self._rows: list[Any] = []
+
+    def cursor(self, **_kw: Any) -> _ScriptedCursor:
+        return self
 
     def execute(self, sql: str, params: Any = None) -> _ScriptedCursor:
         if "src_uuid = %s OR tgt_uuid = %s" in sql:
@@ -71,12 +77,15 @@ class _ScriptedCursor:
             raise AssertionError(sql)
         return self
 
-    def fetchall(self) -> list[tuple[Any, ...]]:
+    def fetchall(self) -> list[Any]:
         return list(self._rows)
 
 
-def _row(uuid: str) -> tuple[Any, ...]:
-    return (uuid, f"fact {uuid}", None, False, None)
+def _row(uuid: str) -> kg_pg.FactRow:
+    return kg_pg.FactRow(uuid, f"fact {uuid}", None, False, None)
+
+
+_SEEDS = [kg_pg._SeedRow("s1", "One", None, 0.1, 5), kg_pg._SeedRow("s2", "Two", None, 0.2, 5)]
 
 
 def test_a_fact_between_two_seeds_gets_the_hop_credit_of_one_occurrence():
@@ -85,7 +94,7 @@ def test_a_fact_between_two_seeds_gets_the_hop_credit_of_one_occurrence():
     # credited once it ranks below it.
     cur = _ScriptedCursor(
         vec=[_row("lead")],
-        seeds=[("s1", "One", None, 0.1, 5), ("s2", "Two", None, 0.2, 5)],
+        seeds=_SEEDS,
         hops={
             "s1": [_row("x1"), _row("link")],
             "s2": [_row("x2"), _row("link")],
@@ -100,7 +109,7 @@ def test_the_fact_between_two_seeds_still_ranks_by_its_best_hop_rank():
     # no vector hit to beat: "link" at hop rank 1 (via s1) leads the hop-only facts
     cur = _ScriptedCursor(
         vec=[],
-        seeds=[("s1", "One", None, 0.1, 5), ("s2", "Two", None, 0.2, 5)],
+        seeds=_SEEDS,
         hops={
             "s1": [_row("link"), _row("x1")],
             "s2": [_row("x2"), _row("link")],

@@ -29,10 +29,12 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -128,8 +130,16 @@ WITH RECURSIVE labeled(project) AS (
          (SELECT max(e.created_at) FROM episodes e WHERE e.project = labeled.project) AS last_at
   FROM labeled WHERE labeled.project IS NOT NULL
 )
-SELECT project, count(*) OVER () FROM latest ORDER BY last_at DESC, project LIMIT %s
+SELECT project, count(*) OVER () AS n_projects FROM latest ORDER BY last_at DESC, project LIMIT %s
 """
+
+
+@dataclass(frozen=True, slots=True)
+class _RecentProjectRow:
+    """One recently active project, with the count of every labeled project beside it."""
+
+    project: str
+    n_projects: int
 
 
 def _banner_stats(
@@ -161,6 +171,7 @@ def _banner_stats(
     with pg_pool.connection(db_url) as conn:
         own = own_surface_if_ready(conn, db_url, own_surface)  # None before schema 057
         scope = episode_scope_sql(allowed_projects, own)
+        recent = conn.cursor(row_factory=class_row(_RecentProjectRow))
         if scope is not None:
             pred, args = scope
             row = conn.execute(
@@ -168,8 +179,8 @@ def _banner_stats(
                 args,
             ).fetchone()
             n_episodes = int(row[0]) if row else 0
-            rows = conn.execute(
-                "SELECT project, count(*) OVER () FROM episodes "  # nosec B608 — as above
+            rows = recent.execute(
+                "SELECT project, count(*) OVER () AS n_projects FROM episodes "  # nosec B608 — as above
                 f"WHERE {pred} AND project IS NOT NULL AND project <> '' "
                 "GROUP BY project ORDER BY max(created_at) DESC, project LIMIT %s",
                 [*args, _RECENT_PROJECTS],
@@ -185,16 +196,16 @@ def _banner_stats(
             # Unlabeled episodes (NULL — and '', defensively) are excluded in SQL so they
             # never consume one of the LIMIT slots or inflate the project count.
             if PROJECT_RECENCY_INDEX.ready(conn, db_url):
-                rows = conn.execute(_RECENT_PROJECTS_SKIP_SCAN, (_RECENT_PROJECTS,)).fetchall()
+                rows = recent.execute(_RECENT_PROJECTS_SKIP_SCAN, (_RECENT_PROJECTS,)).fetchall()
             else:
-                rows = conn.execute(
-                    "SELECT project, count(*) OVER () FROM episodes "
+                rows = recent.execute(
+                    "SELECT project, count(*) OVER () AS n_projects FROM episodes "
                     "WHERE project IS NOT NULL AND project <> '' "
                     "GROUP BY project ORDER BY max(created_at) DESC, project LIMIT %s",
                     (_RECENT_PROJECTS,),
                 ).fetchall()
-    n_projects = int(rows[0][1]) if rows else 0
-    return n_episodes, n_projects, [r[0] for r in rows]
+    n_projects = rows[0].n_projects if rows else 0
+    return n_episodes, n_projects, [r.project for r in rows]
 
 
 def _note_line(note: dict[str, Any]) -> str:

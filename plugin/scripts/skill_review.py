@@ -31,7 +31,8 @@ evidence came from one project. --scope overrides either.
 
 accept refuses, and says why, when there is no draft yet, when the registry body changed
 since the draft was made, or when a new skill's name is already taken (--force overrides the
-last two). For RETUNE accepts a server-side routing-eval runs first (advisory, never blocks).
+last two). For a RETUNE the server runs a routing-eval once the accept is applied, and its
+note is printed here (advisory: the accept stands whatever it says).
 
 Talks to the server's /skills/proposals* HTTP routes (machine-token gated); needs no DB access.
 """

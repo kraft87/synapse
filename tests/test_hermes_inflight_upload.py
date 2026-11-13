@@ -124,8 +124,8 @@ def test_a_delivered_batch_leaves_nothing_behind(plugin, server, tmp_path):
     home = tmp_path / "hermes-a"
     provider = base._start(base._new(plugin), home, _A)
     _join()
-    provider.sync_turn("q", "a", messages=base._conversation(1))
-    provider.sync_turn("q", "a", messages=base._conversation(2))
+    base._say(provider, base._conversation(1))
+    base._say(provider, base._conversation(2))
     assert len(server.posts()) == 2  # its own drain does not send it again
     assert _files(home) == []
 
@@ -135,12 +135,12 @@ def test_a_failed_send_keeps_its_one_copy(plugin, server, tmp_path):
     provider = base._start(base._new(plugin), home, _A)
     _join()
     server.ingest_status = 503
-    provider.sync_turn("q", "a", messages=base._conversation(1))
+    base._say(provider, base._conversation(1))
     (failed,) = server.posts()
     assert _queued(home) == [failed] and _queued(home, ".sending") == []
     assert [n for n in _files(home) if n.startswith(".")] == [".last_error"]
     server.ingest_status = 200
-    provider.sync_turn("q", "a", messages=base._conversation(2))
+    base._say(provider, base._conversation(2))
     _, fresh, drained = server.posts()
     assert drained == failed
     assert base._users(fresh["records"]) == ["question 1", "question 2"]
@@ -161,10 +161,10 @@ def test_without_a_copy_a_failed_send_is_still_queued(plugin, server, tmp_path):
 
     box.put = no_copy
     try:
-        provider.sync_turn("q", "a", messages=base._conversation(1))
+        base._say(provider, base._conversation(1))
         assert _files(home) == []
         server.ingest_status = 503
-        provider.sync_turn("q", "a", messages=base._conversation(2))
+        base._say(provider, base._conversation(2))
     finally:
         box.put = real
     assert _queued(home) == [server.posts()[1]]
@@ -198,7 +198,7 @@ _CHILD = textwrap.dedent(
             thread.join(10)
     print("ready", flush=True)
     sys.stdin.readline()
-    provider.sync_turn("q", "a", messages=base._conversation(1))
+    base._say(provider, base._conversation(1))
     print("returned", flush=True)
     """
 )
@@ -235,11 +235,11 @@ def test_a_batch_in_flight_when_the_process_dies_is_drained_once(
     _join()  # a session start's drain: too soon to tell a dead sender from a slow one
     assert server.posts() == [in_flight]
     _later(monkeypatch, provider)
-    provider.sync_turn("q", "a", messages=base._conversation(1))  # its own, then a drain
+    base._say(provider, base._conversation(1))  # its own, then a drain
     assert _sessions(server.posts()) == [_A, _B, _A]
     assert server.posts()[2] == in_flight
     assert _files(home) == []
-    provider.sync_turn("q", "a", messages=base._conversation(2))
+    base._say(provider, base._conversation(2))
     assert _sessions(server.posts()) == [_A, _B, _A, _B]
 
 
@@ -280,9 +280,7 @@ def _drain_in_another_process(home: Path, url: str) -> str:
 
 def _hold(provider: Any, *, fail: bool = False) -> tuple[_Held, threading.Thread]:
     held = provider._client = provider._uploader.client = _Held(provider._client, fail=fail)
-    worker = threading.Thread(
-        target=provider.sync_turn, args=("q", "a"), kwargs={"messages": base._conversation(1)}
-    )
+    worker = threading.Thread(target=base._say, args=(provider, base._conversation(1)))
     worker.start()
     assert held.entered.wait(10)
     return held, worker
@@ -296,7 +294,7 @@ def test_no_drain_anywhere_takes_a_batch_in_flight(plugin, server, tmp_path):
     held, worker = _hold(a)
     (copy,) = _queued(home, ".sending")
     assert copy["session_id"] == _A
-    b.sync_turn("q", "a", messages=base._conversation(1))  # sends its own, then drains
+    base._say(b, base._conversation(1))  # sends its own, then drains
     base._start(base._new(plugin), home, "20261112_120200_dd0003")
     _join("synapse-outbox")  # a session start's drain
     assert _drain_in_another_process(home, server.url) == "(0, 1)"
@@ -318,7 +316,7 @@ def test_a_sender_past_its_deadline_costs_one_request_more_at_most(
     held, worker = _hold(a, fail=fails)
     with monkeypatch.context() as later:
         _later(later, b)
-        b.sync_turn("q", "a", messages=base._conversation(1))  # its own, then a drain
+        base._say(b, base._conversation(1))  # its own, then a drain
     assert _sessions(server.posts()) == [_B, _A]
     held.go.set()
     worker.join(10)
@@ -335,7 +333,8 @@ def test_concurrent_sessions_each_deliver_their_own_turns_once(plugin, server, t
 
     def run(provider: Any) -> None:
         gate.wait(10)
-        provider.sync_turn("q", "a", messages=base._conversation(2))
+        provider.on_turn_start(1, "question 1")  # a first turn whose upload did not run
+        base._say(provider, base._conversation(2))
 
     workers = [threading.Thread(target=run, args=(p,)) for p in providers]
     for worker in workers:
