@@ -85,8 +85,11 @@ changed, what to do on each machine, what was proven, and what is still open.
 - On a database built by the previous script, where that script's second run fails at
   001, `--status` changed nothing and the first run recorded 68 files and applied none.
 
-**Still open**: no live database has been moved onto the ledger yet. A fresh install still
-replays all 68 files; folding them into one baseline file is a separate change.
+**Done since**: the production database was moved onto the ledger on 2026-11-13. The first
+run recorded 68 files and applied none; the stamp stayed at 069.
+
+**Still open**: a fresh install still replays all 68 files. Folding them into one baseline
+file was considered and dropped.
 
 ## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
 
