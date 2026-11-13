@@ -778,6 +778,205 @@ def test_a_turn_that_ended_before_one_begun_off_the_record_is_not_counted_with_i
     ]
 
 
+def test_an_upload_one_turn_late_twice_running_is_not_the_end_of_the_turn_begun_since(
+    plugin, server, tmp_path
+):
+    """The worker is one upload behind for two turns running, never two: question 5's
+    runs after question 6 has begun, and question 6's after question 7 has. The
+    session is marked while the model works on question 6, so question 7 begins off
+    the record with question 6 still to end, and is counted with it, although an
+    upload (question 5's) has run since question 6 began. Question 6's upload is then
+    the end of one of the two and not of question 7, which stays out at its own,
+    after ``off --forget``."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    _say(provider, _conversation(4), _CHILD)
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    provider.on_turn_start(6, "question 6", previous_message="question 5")
+    provider.sync_turn("question 5", "a", session_id=_CHILD, messages=_conversation(5))
+    _marker(tmp_path, _CHILD)  # `synapse private on`, while the model works on question 6
+    server.private_rows.add(_CHILD)
+    provider.on_turn_start(7, "question 7", previous_message="question 6")
+    provider.sync_turn("question 6", "a", session_id=_CHILD, messages=_conversation(6))
+    _forget(server, tmp_path, _CHILD)  # while the model works on question 7
+    provider.sync_turn("question 7", "a", session_id=_CHILD, messages=_conversation(7))
+    assert _posted(server) == [(_CHILD, ["question 4"]), (_CHILD, _questions(4, 5))]
+    _say(provider, _conversation(8), _CHILD)
+    assert _posted(server)[2:] == [(_CHILD, ["question 8"])]
+
+
+def test_uploads_one_turn_late_across_a_compression_do_not_end_the_turn_begun_since(
+    plugin, server, tmp_path
+):
+    """The same with a new id in between. Question 4 is asked off the record and its
+    upload waits; the compression as question 5 starts moves the session to a new id,
+    off the record as well, and question 4's upload then runs under the id left.
+    ``off --forget`` for the new id while the model works on question 5. Question 6
+    begins on the record and the session is marked again before question 5's upload
+    runs; question 7 begins off the record, ``off --forget`` again. The two uploads
+    still to come are the ends of questions 6 and 7: neither sends question 7, and
+    question 6 is not uploaded (two ends owed, and nothing tells which upload is
+    whose). The turn after goes up."""
+    provider = _carried(plugin, server, tmp_path)
+    home = tmp_path / "hermes-a"
+    third = pm._THIRD
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    provider.prefetch("question 4", session_id=_CHILD)
+    _store(home, third, source="tui", receipt=False, chat_id="")
+    _link(home, third, _CHILD, None)
+    provider.on_pre_compress(_conversation(4))
+    provider.on_session_switch(third, parent_session_id=_CHILD, reason="compression")
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    provider.prefetch("question 5", session_id=third)
+    _forget(server, tmp_path, third)
+    provider.sync_turn("question 4", "a", session_id=_CHILD, messages=_conversation(4))
+    provider.on_turn_start(6, "question 6", previous_message="question 5")
+    provider.prefetch("question 6", session_id=third)
+    _marker(tmp_path, third)  # `synapse private on`
+    server.private_rows.add(third)
+    provider.sync_turn("question 5", "a", session_id=third, messages=_conversation(5))
+    provider.on_turn_start(7, "question 7", previous_message="question 6")
+    provider.prefetch("question 7", session_id=third)
+    _forget(server, tmp_path, third)
+    provider.sync_turn("question 6", "a", session_id=third, messages=_conversation(6))
+    provider.sync_turn("question 7", "a", session_id=third, messages=_conversation(7))
+    assert server.posts() == []
+    _say(provider, _conversation(8), third)
+    assert _posted(server) == [(third, ["question 8"])]
+
+
+# ---------------------------------------------------------------------------
+# A marker set while the server is still to be asked
+# ---------------------------------------------------------------------------
+
+
+def test_a_turn_begun_under_the_ids_own_marker_stays_out_while_the_server_is_still_asked(
+    plugin, server, tmp_path
+):
+    """Back on the record, a compression in the middle of question 4 moves the agent to
+    a new id. The id left is not private on this machine, so whether the new one is
+    waits for the server's answer at its first upload (Uploader.carry_private). The
+    turn is stopped, and Hermes makes no upload for a stopped turn (run_agent.py): the
+    question stays open. `synapse private on` for the new id, question 5, and
+    ``off --forget`` while the model works on it. The marker is this machine's own
+    word, open question or not: question 5 began off the record and stays out. The
+    stopped turn stays counted, which costs the next turn; the one after goes up."""
+    provider = _carried(plugin, server, tmp_path)
+    home = tmp_path / "hermes-a"
+    third = pm._THIRD
+    _forget(server, tmp_path, _CHILD)
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    provider.prefetch("question 4", session_id=_CHILD)
+    _store(home, third, source="tui", receipt=False, chat_id="")
+    _link(home, third, _CHILD, None)
+    provider.on_pre_compress(_conversation(4)[:-1] + _tools(4))
+    provider.on_session_switch(third, parent_session_id=_CHILD, reason="compression")
+    assert provider._uploader.asking(third)
+    _marker(tmp_path, third)  # `synapse private on`, for the id the agent is in
+    server.private_rows.add(third)
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    provider.prefetch("question 5", session_id=third)
+    _forget(server, tmp_path, third)
+    provider.sync_turn("question 5", "a", session_id=third, messages=_conversation(5))
+    assert server.posts() == []
+    _say(provider, _conversation(6), third)
+    assert server.posts() == []
+    _say(provider, _conversation(7), third)
+    assert _posted(server) == [(third, ["question 7"])]
+
+
+# ---------------------------------------------------------------------------
+# After a rewind that names an id the agent left
+# ---------------------------------------------------------------------------
+#
+# A turn compresses the session to a new id and then raises: the TUI keeps the id left
+# as its key (tui_gateway/prompt_turn.py re-anchors it only with a result), and `/undo`
+# names that key (tui_gateway/methods_tools.py; read off Hermes's code, not run). The
+# provider is bound to the id left while the agent is in the new one, until a
+# ``prefetch`` or an upload names the new one. ``on_turn_start`` names no session and
+# comes before the turn's ``prefetch``: a turn's start is read under the id left.
+
+
+def _gone_back(provider: Any, home: Path, n: int) -> str:
+    """Question ``n`` compresses _CHILD to a new id and raises, and `/undo` names
+    _CHILD. Returns the new id, the one the agent is in."""
+    third = pm._THIRD
+    provider.on_turn_start(n, f"question {n}", previous_message=f"question {n - 1}")
+    provider.prefetch(f"question {n}", session_id=_CHILD)
+    _store(home, third, source="tui", receipt=False, chat_id="")
+    _link(home, third, _CHILD, None)
+    provider.on_pre_compress(_conversation(n)[:-1] + _tools(n))
+    provider.on_session_switch(third, parent_session_id=_CHILD, reason="compression")
+    provider.on_session_switch(_CHILD, parent_session_id="", reset=False, rewound=True)
+    return third
+
+
+def test_a_turn_begun_under_the_marker_of_the_id_gone_back_to_stays_out_under_the_agents_id(
+    plugin, server, tmp_path
+):
+    """Back on the record, question 4 fails so. The retry is a trivial prompt, for
+    which Hermes runs no ``prefetch`` (agent/turn_context.py): nothing names the new
+    id before the retry's upload does, and an upload does not move the provider.
+    `synapse private on` for the id the TUI shows, the one gone back to. Question 5's
+    start is read under it, off the record; its upload names the new id, which has no
+    marker of its own. Turn starts are counted for the agent, whichever id each hook
+    names, so that upload finds the turn begun off the record and keeps it out."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    third = _gone_back(provider, tmp_path / "hermes-a", 4)
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    provider.sync_turn("question 4", "a", session_id=third, messages=_conversation(4))
+    assert _posted(server) == [(third, ["question 4"])]
+    _marker(tmp_path, _CHILD)  # `synapse private on`
+    server.private_rows.add(_CHILD)
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    provider.sync_turn("question 5", "a", session_id=third, messages=_conversation(5))
+    assert len(server.posts()) == 1
+
+
+# Still open (HANDOFF.md). The two tests below state what happens today, not what is
+# wanted. Each changes when its gap is closed.
+
+
+def test_still_open_a_turn_begun_under_the_marker_of_the_id_the_agent_is_in_goes_up(
+    plugin, server, tmp_path
+):
+    """The marker is on the new id, the one the agent is in (what
+    ``hermes sessions list`` shows last), and the id gone back to is on the record.
+    The retry's start is read under the id gone back to: no marker there, so it counts
+    as begun on the record, and after ``off --forget`` its upload sends a turn typed
+    off the record."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    third = _gone_back(provider, tmp_path / "hermes-a", 4)
+    _marker(tmp_path, third)  # `synapse private on`, for the id the agent is in
+    server.private_rows.add(third)
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    provider.prefetch("question 4", session_id=third)
+    _forget(server, tmp_path, third)  # while the model works on it
+    provider.sync_turn("question 4", "a", session_id=third, messages=_conversation(4))
+    assert _posted(server) == [(third, ["question 4"])]
+
+
+def test_still_open_after_the_rewind_the_first_two_turns_back_on_the_record_are_not_uploaded(
+    plugin, server, tmp_path
+):
+    """Question 4 fails so off the record, and the user puts the new id back on the
+    record (``off --forget``); the id gone back to keeps its marker. The failed start
+    stays counted, which costs the first turn back (the retry). The retry's own start
+    is read under the id gone back to, whose marker still stands: counted off the
+    record as well, and question 5 is not uploaded either. It errs to private."""
+    provider = _carried(plugin, server, tmp_path)
+    third = _gone_back(provider, tmp_path / "hermes-a", 4)
+    assert (tmp_path / "private" / third).is_file()
+    _forget(server, tmp_path, third)
+    for n in range(4, 8):
+        provider.on_turn_start(n, f"question {n}", previous_message=f"question {n - 1}")
+        provider.prefetch(f"question {n}", session_id=third)
+        provider.sync_turn(f"question {n}", "a", session_id=third, messages=_conversation(n))
+    assert _posted(server) == [(third, ["question 6"]), (third, _questions(6, 7))]
+
+
 # ---------------------------------------------------------------------------
 # A message Hermes folded into the one before it
 # ---------------------------------------------------------------------------
