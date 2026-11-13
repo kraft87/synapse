@@ -114,8 +114,11 @@ def _codex_common(mp: pytest.MonkeyPatch, url: str) -> ModuleType:
     return common
 
 
-def _config(mp: pytest.MonkeyPatch) -> ModuleType:
+def _config(mp: pytest.MonkeyPatch, url: str) -> ModuleType:
+    """config.py configured for the server ``url`` is on: its helpers send through the
+    core's Transport, which gives the bearer to the configured server's origins only."""
     config = load_script("config")
+    mp.setattr(config, "BASE_URL", url.rsplit("/", 1)[0])
     mp.setattr(config, "INGEST_TOKEN", _TOKEN)
     return config
 
@@ -145,9 +148,9 @@ def _login(mp: pytest.MonkeyPatch, url: str) -> None:
 #: name -> send(monkeypatch, url): one request (or two, for the login's MCP handshake)
 #: carrying ``Bearer _TOKEN`` to ``url``.
 SENDERS: dict[str, Callable[[pytest.MonkeyPatch, str], Any]] = {
-    "config.post_json": lambda mp, url: _config(mp).post_json(url, {}),
-    "config.get_json": lambda mp, url: _config(mp).get_json(url),
-    "config.request_json": lambda mp, url: _config(mp).request_json("GET", url),
+    "config.post_json": lambda mp, url: _config(mp, url).post_json(url, {}),
+    "config.get_json": lambda mp, url: _config(mp, url).get_json(url),
+    "config.request_json": lambda mp, url: _config(mp, url).request_json("GET", url),
     "codex common.post_json": lambda mp, url: _codex_common(mp, url).post_json(url, {}),
     "codex common.get_json": lambda mp, url: _codex_common(mp, url).get_json(url),
     "ingest_hook._post_records": _ingest_hook,

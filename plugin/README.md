@@ -13,7 +13,9 @@ Thirteen hooks (`hooks/hooks.json`) plus MCP wiring. In short: a `Stop` hook shi
 session's transcript tail to `/ingest`, a set of `SessionStart` hooks print the board and
 your standing preferences into context (and optionally sync skills and config), a
 `UserPromptSubmit` hook keeps recall/remember present, and `PreToolUse`/`PostToolUse` hooks
-wire session identity and the memory-write spool. Every hook is fail-soft: an unreachable
+wire session identity and the memory-write spool. Session identity lets recall leave out the
+turns the model still holds: the whole session, or after a compaction only the turns since
+it. Every hook is fail-soft: an unreachable
 server is a silent no-op.
 
 The per-hook table, the MCP tool list, every configuration variable, and exactly what leaves

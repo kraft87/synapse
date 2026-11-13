@@ -96,6 +96,7 @@ registry is picked up by all four without a change to the CLI.
 | Catch up after failed uploads | `SessionStart --catchup` sweep | session-start sweep | outbox, flushed in `initialize()` and after each upload |
 | Memory tools | MCP entry in the plugin manifest | MCP entry in `config.toml` | `get_tool_schemas()` / `handle_tool_call()`, proxied to MCP `tools/call` |
 | Caller's session id on tool calls | `PreToolUse` hook | `PreToolUse` hook | set by the provider before the proxy call |
+| Last compaction time on recall (`self_since`) | `PreToolUse` hook, from the transcript's last `compact_boundary` (the first turn it kept, if it names one) | `PreToolUse` hook, from the rollout's last `compacted` line | the provider's clock at an in-place compression |
 | `/ingest` format | `claude_code` | `codex` | `messages` (client `hermes`) |
 | Install | `claude plugin install` | hook blocks in `config.toml` | `synapse install hermes`: folder in `$HERMES_HOME/plugins/synapse/` + `memory.provider: synapse` |
 
@@ -237,9 +238,9 @@ like every other harness, so there is no Hermes setup wizard step.
 | `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. |
 | `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn's `turn_author` is a bot or not the session's user. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
-| `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. |
-| `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
-| `handle_tool_call(name, args)` | `tools.call()`: adds the session id the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
+| `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. A compression that keeps the id (`reason="compression"`) records the time, on the clock Hermes stamps its messages with; recall and recall_full_turns then carry it as `self_since`, so the turns before it serve again. A new id, a reset or a restart forgets it. |
+| `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `self_since` on `recall` and `recall_full_turns`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
+| `handle_tool_call(name, args)` | `tools.call()`: adds the session id, and the compression time where there is one, the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
 
 **What is uploaded.** Hermes passes the whole conversation on every turn, as live message
 dicts, after scrubbing secrets from them. The normaliser keeps only `role`, the text
@@ -288,10 +289,18 @@ with `Settings.load` and sends through `Transport`, and session start, the promp
 the recall-feedback nudge and the Stop hook's private check come from the core. Codex
 keeps its own Stop-hook shipper (rollout cursors, catch-up sweep and retry), the
 session-id injection hook (`pre_tool_use.py`), the private-mode toggle
-(`scripts/private_mode.py`) and the skills-sync glue. Claude Code's hooks
-(`plugin/scripts/`) still carry their own configuration and HTTP code (`config.py`);
-moving them onto the core is the next change, and the two harnesses' wiring then moves
-into `harnesses/` beside Hermes's.
+(`scripts/private_mode.py`) and the skills-sync glue.
+
+Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `config.py`
+resolves with `Settings.load` and sends through `Transport`; the board, preferences and
+prompt-nudge hooks print what `context` builds, with Claude Code's enrollment wording
+(`enroll.py`) passed in; the Stop hook uploads through `Transport` and its private check
+is `private.is_private`. Claude Code keeps its own Stop-hook shipper (byte cursor,
+chunking, the detached `--ship`, retry bookkeeping, the catch-up sweep), the session-id
+injection hook (`self_session_inject.py`), the private-mode toggle
+(`scripts/private_mode.py`), the remember spool, the git feeder and the skills and config
+sync, which send through `config.py`'s helpers. The two harnesses' wiring moving into
+`harnesses/` beside Hermes's is the next change.
 
 A module moves like this: the code goes into `synapse_client/`, the old path keeps a
 few-line stub that imports it (hook commands and Codex's trusted command text never name
@@ -310,18 +319,20 @@ The core ports the hooks' behaviour and wording, with these differences:
   goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
   read as JSON or as server-sent events, up to the answer to this call.
 - **The bearer stays on its origin.** `http.Transport` sends it only to the configured
-  server (and the ingest URL's origin), and Codex's hooks send through it; Claude Code's
-  hook helpers send it to any absolute URL they are given. A redirect carries it only
+  server (and the ingest URL's origin; for Claude Code's `config.py`, the MCP URL's too),
+  and both Codex's and Claude Code's hooks send through it. A redirect carries it only
   within its origin, or from http to https on the same host and the default ports (80 to
-  443, the rule the `requests` library uses). Claude Code's hooks open their requests
-  through the same handler (`http.urlopen`, reached through `config._urlopen`): urllib's
-  stock one forwards the header to wherever a redirect points.
+  443, the rule the `requests` library uses). The sign-in calls that build their own
+  request (`synapse_login.py`) open it through the same handler (`http.urlopen`, reached
+  through `config._urlopen`): urllib's stock one forwards the header to wherever a
+  redirect points.
 - **Legacy credentials are passed in, not read.** `Settings.load` takes the old
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
 - **Session-start order** is notice, upload warning, board, preferences in every harness.
-- **Enrollment notices** take the login hint as an argument; the restricted-device
-  notice has no Claude-only "paste it into /plugin" aside.
+- **Enrollment notices** take the login hint as an argument, and the restricted-device
+  notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
+  one, the other harnesses none.
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
   processes can drain one directory. Up to 2000 wait; past that the oldest are dropped. A
   payload the server refuses with 400, 413 or 422 is dropped; any other failure, 404

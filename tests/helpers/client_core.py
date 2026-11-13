@@ -11,10 +11,15 @@ real configuration or credential is ever read.
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -52,6 +57,28 @@ def core_http() -> ModuleType:
     from synapse_client import http
 
     return http
+
+
+def fake_urlopen(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[urllib.request.Request]:
+    """Replace the core's ``urlopen`` (``core_http``) for one test: each request a hook
+    opens is recorded in the returned list and answered with ``answer`` as a JSON body,
+    or raised, when ``answer`` is an exception."""
+    seen: list[urllib.request.Request] = []
+
+    def fake(req: urllib.request.Request, timeout: float | None = None) -> io.BytesIO:
+        seen.append(req)
+        if isinstance(answer, BaseException):
+            raise answer
+        return io.BytesIO(json.dumps(answer).encode())
+
+    monkeypatch.setattr(core_http(), "urlopen", fake)
+    return seen
+
+
+def requested(req: urllib.request.Request) -> tuple[str, dict[str, str]]:
+    """``(path, query parameters)`` of a request ``fake_urlopen`` recorded."""
+    parts = urllib.parse.urlsplit(req.full_url)
+    return parts.path, dict(urllib.parse.parse_qsl(parts.query))
 
 
 def scratch_user(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -99,3 +126,35 @@ def load_script(name: str) -> ModuleType:
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+#: The head uuid a built Claude Code transcript's boundary preserves.
+HEAD_UUID = "0b7c2a4e-1111-4c22-9d33-000000000002"
+
+
+def transcript(folder: Path, *, codex: bool, at: str | None) -> Path:
+    """A transcript as each PreToolUse hook is handed one: a Codex rollout file whose
+    last ``compacted`` line is stamped ``at``, or a Claude Code transcript whose last
+    boundary preserves a head stamped ``at``. ``at=None``: a session that never
+    compacted."""
+    if codex:
+        rows: list[dict[str, object]] = [
+            {"timestamp": "2026-11-12T13:00:00Z", "type": "session_meta", "payload": {}},
+            {"timestamp": "2026-11-12T13:05:00Z", "type": "response_item", "payload": {}},
+        ]
+        if at is not None:
+            rows.append({"timestamp": at, "type": "compacted", "payload": {"message": "x"}})
+    else:
+        rows = [{"type": "user", "uuid": HEAD_UUID, "timestamp": at or "2026-11-12T13:05:00Z"}]
+        if at is not None:
+            rows.append(
+                {
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "timestamp": "2026-11-12T14:30:00Z",
+                    "compactMetadata": {"preservedSegment": {"headUuid": HEAD_UUID}},
+                }
+            )
+    path = folder / ("rollout.jsonl" if codex else "transcript.jsonl")
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return path

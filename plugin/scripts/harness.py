@@ -20,10 +20,11 @@ OAuth it would start a browser sign-in whose token outranks the device credentia
 
 `harnesses()` is the one list `synapse login`, `install`, `update` and `status` walk:
 Claude Code and Codex as small objects over the functions here, then the client core's
-registry (plugin/synapse_client/harnesses), which is where Hermes lives. The core is
-imported only when the list is built, from the managed client's current version when
-one is installed: `synapse update` builds it after the installer ran, so an adapter's
-copy of the core is the new one.
+registry (plugin/synapse_client/harnesses), which is where Hermes lives. The registry
+is imported when the list is built, from the managed client's current version when one
+is installed: `synapse update` builds it after the installer ran, so an adapter's copy
+of the core is the new one. config.py has imported the core of the plugin it sits in by
+then; a package loaded from anywhere else is forgotten first (``_forget_other_core``).
 """
 
 from __future__ import annotations
@@ -467,12 +468,34 @@ def _core_parent() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _forget_other_core(parent: str) -> None:
+    """Drop a ``synapse_client`` imported from anywhere but ``parent`` from sys.modules,
+    so the next import reads ``parent``'s. config.py imports the core of the plugin it
+    sits in at start; during `synapse update` that is the client being replaced, and an
+    adapter installed from it would copy the old core. Modules that already hold the old
+    package keep it."""
+    loaded = sys.modules.get("synapse_client")
+    where = getattr(loaded, "__file__", None)
+    if loaded is None or not where:
+        return
+    try:
+        if Path(where).resolve().parents[1] == Path(parent).resolve():
+            return
+    except OSError:
+        pass
+    for name in [
+        n for n in sys.modules if n == "synapse_client" or n.startswith("synapse_client.")
+    ]:
+        del sys.modules[name]
+
+
 def _core_registry() -> list:
     """The client core's harnesses (``synapse_client.harnesses.registry``); [] when the
     core cannot be loaded, which is said on stderr."""
     parent = str(_core_parent())
     if not sys.path or sys.path[0] != parent:
         sys.path.insert(0, parent)
+    _forget_other_core(parent)
     try:
         from synapse_client.harnesses import registry
     except ImportError:

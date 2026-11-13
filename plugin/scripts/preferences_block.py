@@ -7,9 +7,10 @@ the top standing user preferences, max 8 lines — printed to stdout so it lands
 session's context. Not query-scoped, so it avoids the relevance-mismatch problem that got
 query-blind recall injection unwired (#171); preferences are few and apply to every turn.
 
-Reads the machine-token-gated ``/preferences/top`` route (thin client, no DSN). Disable
-with SYNAPSE_PREFS_BLOCK=0. Fail-open: any error prints nothing and exits 0 — session
-start never breaks.
+Reads the machine-token-gated ``/preferences/top`` route (thin client, no DSN). The block
+is the client core's (synapse_client.context.preferences_part); this hook prints it in
+the SessionStart envelope. Disable with SYNAPSE_PREFS_BLOCK=0. Fail-open: any error
+prints nothing and exits 0 — session start never breaks.
 """
 
 from __future__ import annotations
@@ -19,35 +20,25 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import _cfg, get_json
+import config
 
-# Header counts toward the block, so cap the preference lines so the whole block is <= 8 lines.
-_MAX_LINES = 7
-_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client import context
+from synapse_client.api import Client
 
 
 def main() -> None:
-    if _cfg("SYNAPSE_PREFS_BLOCK", "1") == "0":
-        return
     try:
-        r = get_json("/preferences/top", {"limit": 8}, timeout=10)
-        items = r.get("items") or []
-        if not items:
-            return
-        lines = ["[Synapse preferences]"]
-        for it in items[:_MAX_LINES]:
-            pref = it.get("pref")
-            if not pref:
-                continue
-            tag = _MARK.get(it.get("polarity"), it.get("polarity") or "")
-            lines.append(f"  - ({tag}) {pref}")
-        if len(lines) > 1:
+        settings = config.live_settings()
+        block = context.preferences_part(Client(settings, config.USER_AGENT), settings)
+        if block:
             print(
                 json.dumps(
                     {
                         "hookSpecificOutput": {
                             "hookEventName": "SessionStart",
-                            "additionalContext": "\n".join(lines),
+                            "additionalContext": block,
                         }
                     }
                 )

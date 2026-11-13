@@ -46,7 +46,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from tests.helpers.client_core import core_http
+from tests.helpers.client_core import core_http, fake_urlopen, requested
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
@@ -708,18 +708,12 @@ def test_codex_stop_hook_process_ships_the_project(layout, server, tmp_path, mod
 
 
 def _run_board(monkeypatch, mod: ModuleType, stdin: str) -> list[tuple[str, dict]]:
-    """main() with the hook payload on stdin and get_json mocked (test_board_block._run)."""
-    calls: list[tuple[str, dict]] = []
-
-    def fake_get_json(path, params=None, timeout=30.0):
-        calls.append((path, dict(params or {})))
-        return {"status": "ok", "text": "[board]"}
-
-    monkeypatch.setattr(mod, "get_json", fake_get_json)
-    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: True)
+    """main() with the hook payload on stdin and the network faked (test_board_block._run);
+    the (path, params) of each request made."""
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "text": "[board]"})
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     mod.main()
-    return calls
+    return [requested(req) for req in seen]
 
 
 @pytest.mark.parametrize(

@@ -25,6 +25,7 @@ class RecallPassagesMixin:
         episodes: list[dict[str, Any]],
         n: int,
         stats: dict[str, int] | None = None,
+        own_session: str | None = None,
     ) -> list[dict[str, Any]]:
         """Compact the top reranked episodes into the n most query-relevant PASSAGES (Stage 2).
 
@@ -35,36 +36,58 @@ class RecallPassagesMixin:
         hybrid->rerank cascade's ceiling at this bounded chunk count, and rerank-only avoids a live
         passage embed. Serves at most n chunks as one item per parent episode, skipping chunks that
         repeat another episode's chosen chunk; ``stats`` (if given) gets ``n_dup_passages``.
-        Returns [] on chunk/rerank failure so the caller falls back to full episodes."""
+        Returns [] on chunk/rerank failure so the caller falls back to full episodes.
+
+        ``own_session`` marks the caller's own turns from before its last compaction among
+        ``episodes``, each at its rank in the episode order. Their chunks join the same rerank
+        call, after the others' and under a cap of their own, but the others' passages are
+        chosen exactly as without them. Then at most _RECALL_SELF_PRIOR_LIMIT own passages are
+        added (so at most that many own turns), in score order, each only if it scores at least
+        as well as the weakest passage chosen from the others and repeats none already chosen.
+        When the others' passages fit without a rerank there is no passage score, and an own
+        turn's passages are added only if the turn ranks above the last other turn served. With
+        no other passage chosen there is nothing to beat."""
         settings = self._settings()
         passages: list[str] = []
         owner: list[dict[str, Any]] = []
         bounds: list[tuple[int, int]] = []  # passage char span in its parent's content
         role_spans: dict[int, list[tuple[int, str]]] = {}  # id(episode) -> marker layout
-        for e in episodes:
-            content = e.get("content") or ""
-            if not content.strip():
-                continue
-            role_spans[id(e)] = _role_spans(content)
-            try:
-                chunks = [
-                    (c.content, c.char_start, c.char_end)
-                    for c in chunk_markdown(content)
-                    if c.content.strip()
-                ]
-            except Exception:
-                chunks = [(content, 0, len(content))]
-            for ch, lo, hi in chunks:
-                passages.append(ch)
-                owner.append(e)
-                bounds.append((lo, hi))
+
+        def _chunk(eps: list[dict[str, Any]]) -> None:
+            start = len(passages)
+            for e in eps:
+                content = e.get("content") or ""
+                if not content.strip():
+                    continue
+                role_spans[id(e)] = _role_spans(content)
+                try:
+                    chunks = [
+                        (c.content, c.char_start, c.char_end)
+                        for c in chunk_markdown(content)
+                        if c.content.strip()
+                    ]
+                except Exception:
+                    chunks = [(content, 0, len(content))]
+                for ch, lo, hi in chunks:
+                    passages.append(ch)
+                    owner.append(e)
+                    bounds.append((lo, hi))
+            # Cap the rerank input so a pathologically long episode can't blow up the call.
+            # Own turns are chunked after the others, under a cap of their own: they never take
+            # the others' room, and others that fill it still leave them some.
+            end = start + settings._RECALL_PASSAGE_CAND
+            del passages[end:], owner[end:], bounds[end:]
+
+        def _own(e: dict[str, Any]) -> bool:
+            return own_session is not None and e.get("session_id") == own_session
+
+        _chunk([e for e in episodes if not _own(e)])
+        m = len(passages)  # the others' passages: indices below m, chosen first
+        limit = settings._RECALL_SELF_PRIOR_LIMIT if own_session is not None else 0
+        if limit > 0:
+            _chunk([e for e in episodes if _own(e)])
         if not passages:
             return []
-        # Cap the rerank input so a pathologically long episode can't blow up the call.
-        if len(passages) > settings._RECALL_PASSAGE_CAND:
-            passages = passages[: settings._RECALL_PASSAGE_CAND]
-            owner = owner[: settings._RECALL_PASSAGE_CAND]
-            bounds = bounds[: settings._RECALL_PASSAGE_CAND]
         # Every path walks the full ranking: a passage redundant with one already chosen is
         # skipped and its slot backfills from the next-ranked passage.
         redundant = _Redundancy(passages, owner)
@@ -77,8 +100,9 @@ class RecallPassagesMixin:
             return True
 
         chosen: list[int] = []
-        if len(passages) <= n:
-            for i in range(len(passages)):  # already in episode-rerank order
+        scored: list[tuple[int, float]] = []
+        if m <= n:
+            for i in range(m):  # already in episode-rerank order
                 if _fresh(i):
                     chosen.append(i)
                     redundant.keep(i)
@@ -100,7 +124,7 @@ class RecallPassagesMixin:
                 return []
             per_sess: dict[Any, int] = {}
             for i, _s in scored:
-                if not _fresh(i):
+                if i >= m or not _fresh(i):
                     continue
                 sid = owner[i].get("session_id")
                 if sid is not None and per_sess.get(sid, 0) >= _SESSION_CAP:
@@ -118,11 +142,13 @@ class RecallPassagesMixin:
             if len(chosen) < n:
                 seen = set(chosen)
                 for i, _s in scored:
-                    if i not in seen and _fresh(i):
+                    if i < m and i not in seen and _fresh(i):
                         chosen.append(i)
                         redundant.keep(i)
                         if len(chosen) >= n:
                             break
+        if len(passages) > m:
+            chosen = _add_own_passages(chosen, scored, m, limit, owner, episodes, redundant)
         if stats is not None:
             stats["n_dup_passages"] = len(dup_ix)
         # One item per parent episode, placed at its best chunk's rank. Chunks of one turn used
@@ -231,6 +257,50 @@ class _Redundancy:
 
     def keep(self, i: int) -> None:
         self._kept.append((id(self._owner[i]), *self._key(i)))
+
+
+def _add_own_passages(
+    chosen: list[int],
+    scored: list[tuple[int, float]],
+    m: int,
+    limit: int,
+    owner: list[dict[str, Any]],
+    episodes: list[dict[str, Any]],
+    redundant: _Redundancy,
+) -> list[int]:
+    """``chosen`` plus up to ``limit`` own passages (the indices from ``m`` on).
+
+    Reranked (``scored``): own passages in score order down to the weakest chosen other,
+    each placed before the first chosen passage that scores lower. Not reranked: the
+    passages of own turns ranked above the last chosen other turn in ``episodes``, at
+    their rank. Either way the others keep their order."""
+    added: list[int] = []
+    if scored:
+        score = dict(scored)
+        bar = min((score[i] for i in chosen), default=None)
+        out = list(chosen)
+        for j, s in scored:
+            if j < m:
+                continue
+            if len(added) >= limit or (bar is not None and s < bar):
+                break
+            if redundant.covers(j):
+                continue
+            at = next((k for k, i in enumerate(out) if score[i] < s), len(out))
+            out.insert(at, j)
+            redundant.keep(j)
+            added.append(j)
+        return out
+    rank = {id(e): k for k, e in enumerate(episodes)}
+    last = max((rank[id(owner[i])] for i in chosen), default=None)
+    for j in range(m, len(owner)):
+        if len(added) >= limit or (last is not None and rank[id(owner[j])] > last):
+            break
+        if redundant.covers(j):
+            continue
+        redundant.keep(j)
+        added.append(j)
+    return sorted([*chosen, *added], key=lambda i: (rank[id(owner[i])], i))
 
 
 def _join_overlap(a: str, b: str) -> str:

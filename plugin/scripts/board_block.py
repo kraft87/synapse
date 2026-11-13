@@ -24,6 +24,10 @@ say so and where to remove it, to the user (systemMessage) and the model. That l
 local, needs no server, and is printed even with the board disabled or the server down,
 since a silent override is the bug it exists to prevent.
 
+What it prints is the client core's (synapse_client.context): the notice, the board
+part, with the enrollment explainers in this plugin's words (enroll.py), assembled. The
+hook adds the stdin payload's project and the JSON envelope.
+
 Disable the board with SYNAPSE_BOARD=0. Fail-open: any error prints nothing beyond that
 notice and exits 0 — a broken board must never break a session start.
 """
@@ -33,23 +37,27 @@ from __future__ import annotations
 import json
 import os
 import sys
-import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
 import enroll
 import synapse_project
-from config import _cfg, get_json, token_override_notice
+
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client import context
+from synapse_client.api import Client
 
 
-def _emit_context(parts: list[str], user_notice: str = "") -> None:
+def _emit_context(text: str, user_notice: str = "") -> None:
     """``user_notice`` also goes out as ``systemMessage``, which Claude Code shows to the
     user directly rather than only to the model."""
-    if not parts:
+    if not text:
         return
     out: dict = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": "\n\n".join(parts),
+            "additionalContext": text,
         }
     }
     if user_notice:
@@ -68,49 +76,36 @@ def _project_label() -> str | None:
     return synapse_project.project_label(cwd) or synapse_project.project_label(os.getcwd())
 
 
-def _board_parts() -> list[str]:
-    """The server-rendered board, plus the enrollment explainer when one applies."""
-    parts = []
-    project = _project_label()
-    params = {"project": project} if project else {}
-    try:
-        r = get_json("/context", params, timeout=10)
-    except urllib.error.HTTPError as e:
-        # 401 with no device credential is the one error worth explaining: this
-        # machine has not enrolled (or its token was revoked), so it is served
-        # nothing and will go on being served nothing until someone signs in.
-        if e.code == 401 and not enroll.is_enrolled():
-            parts.append(enroll.not_enrolled_block())
-        return parts
-    ok = r.get("status") == "ok"
-    # 200 + restricted + no device credential is the SILENT version of the 401 above:
-    # an open server, or a caller holding the shared root token, is served an empty
-    # board and no reason for it. Say why here, or a fresh install reads as "Synapse
-    # is just empty" and the user never learns there is a credential to get.
-    if ok and r.get("trust") == "restricted" and not enroll.is_enrolled():
-        parts.append(enroll.restricted_block())
-    text = r.get("text") if ok else None
-    if text:
-        parts.append(text)
-    return parts
+def _board(settings) -> str:
+    """The server-rendered board, plus the enrollment explainer when one applies: a 401
+    to a machine with no device credential, or a 200 that serves it as ``restricted``
+    (the silent version of the same thing). "" when the server is down."""
+    return context.board_part(
+        Client(settings, config.USER_AGENT),
+        _project_label(),
+        settings,
+        timeout=10,
+        not_enrolled=enroll.not_enrolled_block(),
+        restricted=enroll.restricted_block(),
+    )
 
 
 def main() -> None:
-    parts = []
     try:
-        notice = token_override_notice()
+        notice = config.token_override_notice()
     except Exception:
         notice = ""
-    if notice:
-        parts.append(notice)
-    if _cfg("SYNAPSE_BOARD", "1") != "0":
-        try:
-            parts += _board_parts()
-        except Exception:
-            pass  # fail-open: no board, no noise
+    board = ""
+    try:
+        settings = config.live_settings()
+        # Checked before the payload is read: a disabled board reads nothing, sends nothing.
+        if settings.flag("SYNAPSE_BOARD", "1") != "0":
+            board = _board(settings)
+    except Exception:
+        pass  # fail-open: no board, no noise
     try:
         # guarded: a print that raises must not break the session
-        _emit_context(parts, user_notice=notice)
+        _emit_context(context.assemble((notice, board)), user_notice=notice)
     except Exception:
         return
 

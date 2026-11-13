@@ -63,6 +63,20 @@ flight until its request has had three times its timeout. Turns are remembered b
 re-sends a turn costs a request, not a duplicate. A private session (private.is_private)
 sends nothing and remembers nothing, as the Claude Code hook does.
 
+Compression
+-----------
+Recall leaves out the session's own turns, which the model still holds. When Hermes
+compresses a session in place it keeps the id and replaces the turns before that point
+with a summary, so from then on they are memory like any other: at the commit
+(``on_session_switch`` with ``reason="compression"`` and the same id) the provider takes
+the time, and sends it as ``self_since`` on recall and recall_full_turns, so only the turns
+since are left out. The time is the client's wall clock, the one Hermes stamps each
+message's ``timestamp`` with and so the time the server stores the turn under. A
+compression that moves to a new id needs no cut (the new id holds only what follows); a
+new id, a reset or a restart forgets the cut, and the session is left out whole again.
+Hermes signals an in-place compression even when its commit failed; that costs only
+some recall of turns still in the context.
+
 Every hook catches what it raises and logs it; nothing here raises into Hermes. Hermes
 builds one instance per agent (plugins/memory ``register`` runs per load), so each
 session of the gateway daemon has its own: an instance holds its own settings, client,
@@ -78,6 +92,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +131,11 @@ def _log() -> logging.Logger:
 
 def _say(line: str) -> None:
     _log().info("%s", line)
+
+
+def _clock() -> str:
+    """Now on the client's wall clock (time.time, as Hermes stamps a message), ISO-8601."""
+    return datetime.fromtimestamp(time.time(), tz=UTC).isoformat()
 
 
 def scope(kwargs: Mapping[str, Any]) -> str:
@@ -168,6 +188,7 @@ class SynapseMemoryProvider(MemoryProvider):
         self._lookback: int | None = None
         self._home: str | None = None
         self._said: set[str] = set()
+        self._cut: str | None = None  # the last in-place compression, for self_since
 
     # -- identity and availability -------------------------------------------------
 
@@ -226,6 +247,7 @@ class SynapseMemoryProvider(MemoryProvider):
             self._sent.clear()
             self._block = ""
             self._home = str(home) if home else None
+            self._cut = None
         if mode == INERT:
             self._say_once(f"synapse: off for session {self._session_id}: {verdict.reason}")
         if mode != ACTIVE:
@@ -340,13 +362,17 @@ class SynapseMemoryProvider(MemoryProvider):
         **kwargs: Any,
     ) -> None:
         """Rebind to ``new_session_id``. A new id or a reset forgets which turns were
-        sent; the next upload then looks back at most LOOKBACK turns, as for a resume."""
+        sent; the next upload then looks back at most LOOKBACK turns, as for a resume.
+        It forgets the compression cut too; a compression that keeps the id sets it."""
         try:
             with self._lock:
                 new = str(new_session_id or "")
                 if reset or (new and new != self._session_id):
                     self._sent.clear()
                     self._lookback = LOOKBACK
+                    self._cut = None
+                elif kwargs.get("reason") == "compression":
+                    self._cut = _clock()
                 if new:
                     self._session_id = new
         except Exception:
@@ -519,15 +545,18 @@ class SynapseMemoryProvider(MemoryProvider):
             return []
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
-        """Call ``tool_name`` on the server with this session's id; always a JSON string.
-        Only for an ACTIVE session still the owner's: an instance not initialized yet has
-        no session to judge, and Hermes itself refuses a tool call before ``initialize``
+        """Call ``tool_name`` on the server with this session's id, and on recall and
+        recall_full_turns the compression cut; always a JSON string. Only for an ACTIVE
+        session still the owner's: an instance not initialized yet has no session to
+        judge, and Hermes itself refuses a tool call before ``initialize``
         (agent/memory_manager.py ``handle_tool_call``, ``caller_scope``)."""
         try:
             client = self._client
             if self._mode != ACTIVE or client is None or not self._still_owner():
                 return _error(_LOCAL_ONLY, tool_name)
-            text = tools.call(client, tool_name, args, session_id=self._session_id or None)
+            with self._lock:
+                session_id, cut = self._session_id or None, self._cut
+            text = tools.call(client, tool_name, args, session_id=session_id, since=cut)
             return _json_result(text)
         except Exception as err:
             _log().warning("synapse: tool call %s failed", tool_name, exc_info=True)
