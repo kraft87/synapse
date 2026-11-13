@@ -3,6 +3,59 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — codex: a turn is uploaded with its model and cwd (plugin 0.24.13)
+
+**What changed**
+
+- **Codex turns after a session's first were stored with no model and no cwd.** Codex
+  writes a turn's `turn_context` record, which carries both, just before the turn's user
+  message. The Stop hook cut each tail forward to that user message, so the record was
+  never sent. In prod, 200 of the 1,142 Codex episodes of the last 60 days have neither.
+  The project label was not affected: the hook sends it apart from the records.
+- **Now a tail is sent as read.** What Codex writes between two turns goes along
+  (lifecycle events, injected instructions, the next turn's `turn_context`). The server
+  reads the `turn_context` and skips the rest.
+- **A tail that starts inside a turn sends the whole rollout again.** That is a tail with
+  an assistant message, a tool call or a tool's output before its first user message: a
+  sweep shipped the turn half written, or its last records landed after the hook had
+  read. The turn's start is before the cursor, and the server drops the turns it already
+  holds. Before, when the same tail also held a later user message, the rest of the turn
+  was cut away with the tail's start and never sent.
+- **A tail of lifecycle events alone is sent as it is.** It used to send the whole
+  rollout again.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.13. Nothing to migrate, nothing on the server.
+
+**Proven**
+
+- `tests/test_codex_ingest_retry.py`: a later turn is posted with its `turn_context`,
+  and the server's parser gives its episode the model and cwd; injected instructions,
+  the environment block, the world state and reasoning before a user message do not
+  make a tail the middle of a turn; a tail that starts with the rest of a turn posts the
+  whole rollout, with or without a later turn in it, and the parser then holds the turn
+  in full; a tail of events alone is posted as read.
+- `tests/test_client_server_rule_parity.py`: the hook's list of what is a turn's content
+  is the server parser's list of items without the messages, and for each kind of record
+  the hook and the parser agree on whether it joins the turn a user message opened.
+- Each of the hook's new rules was taken out in turn (7 changes); the tests failed every
+  time.
+
+**Still open**
+
+- Episodes already stored keep their empty model and cwd. This change repairs none.
+- A turn shipped half written and then whole is stored twice, once as the half: the two
+  end on different items, so the server takes them for two turns. That was already so
+  for a tail with no user message in it.
+- Sending the rollout whole is one large request for a long session. It happens only for
+  a tail that starts inside a turn.
+- A user message whose text Codex carries as `output_text` is a turn for the server and
+  not for the hook (a known difference, marked in the parity test).
+- Not run in a real Codex session: Codex on cortex cannot run either configured model.
+  The shapes come from the 30 rollouts on cortex: in each of their 79 later turns the
+  `turn_context` sits between the turn before and the user message.
+
 ## 2026-11-13 — hooks: the shipper reads from its cursor, and the waiting hooks import less (plugin 0.24.12)
 
 **What changed**
