@@ -136,7 +136,9 @@ def test_records_keep_only_what_the_server_reads_and_never_touch_the_input():
     assert [id(m) for m in messages] == ids
     assert all(set(r) <= _KEYS for r in records)
     assert all(r is not m for r in records for m in messages)
-    assert records[:4] == [
+    # The summary's row stays, with no text: Hermes wrote it in the user's place.
+    assert records[0] == {"role": "user", "content": "", "synthetic": True, "id": "u-summary"}
+    assert records[1:5] == [
         {
             "role": "user",
             "content": "Which branch is the release on?",
@@ -180,7 +182,7 @@ def test_records_keep_only_what_the_server_reads_and_never_touch_the_input():
 
 def test_text_parts_are_joined_and_memory_context_removed():
     records = hm.to_records(_conversation())
-    assert records[4] == {
+    assert records[5] == {
         "role": "user",
         "content": "Now tag it.",
         "ts": 1_794_000_100.0,
@@ -213,18 +215,103 @@ def test_hermes_control_frames_are_synthetic_by_their_opening_text(text):
     assert record["synthetic"] is True
 
 
-def test_compaction_rows_of_any_role_and_other_roles_are_dropped():
+def test_compaction_rows_that_are_not_user_rows_and_other_roles_are_dropped():
     records = hm.to_records(
         [
             {"role": "assistant", "content": "[micro compact]", "_compressed_summary": True},
+            {"role": "tool", "content": "[pruned]", "_compressed_summary": True},
             {"role": "developer", "content": "be brief"},
-            {"role": "user", "content": _MEMORY},  # nothing left once the block is gone
             "not a dict",
             None,
         ]
     )
     assert records == []
     assert hm.to_records(None) == []
+
+
+def test_a_user_row_that_carries_a_summary_stays_as_a_row_with_no_text():
+    """Hermes folds the summary into the first row it keeps when no role of its own
+    alternates (agent/context_compressor.py ``_merge_summary_into_tail_row``), and that
+    row may be the user's message. Its text is the summary's too, so none of it is
+    sent; left out altogether, its reply would read as the reply of a turn before it
+    that got none."""
+    cut_short = {"role": "user", "content": "what is this?", "message_uid": "u-1"}
+    carrier = {
+        "role": "user",
+        "content": "[PRIOR CONTEXT — for reference only; not a new message]\nand this?\n\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\nEarlier the user asked.",
+        "_compressed_summary": True,
+        "message_uid": "u-2",
+        "timestamp": 1_794_000_000.0,
+    }
+    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-2"}
+    records = hm.to_records([cut_short, carrier, reply])
+    assert records[1] == {
+        "role": "user",
+        "content": "",
+        "synthetic": True,
+        "ts": 1_794_000_000.0,
+        "id": "u-2",
+    }
+    (turn,) = cm.turns(records)
+    assert cm.complete(turn) and cm.joined(turn)
+
+
+@pytest.mark.parametrize(
+    "witness",
+    [{"_merged_turn_prefix": "what is this?"}, {"_absorbed_message_uids": ["u-2"]}],
+    ids=["as the merge leaves it", "as the store gives it back"],
+)
+def test_a_row_hermes_folded_a_later_message_into_is_shown_to_hold_two(witness):
+    """A message typed after one that got no reply: Hermes makes one user row of the
+    two (agent/agent_runtime_helpers.py ``_merge_consecutive_users``). It is sent as it
+    is. The row with no text after it says the turn holds more than one exchange,
+    which the core cannot read off a single row."""
+    merged = {
+        "role": "user",
+        "content": "what is this?\n\nand this?",
+        "message_uid": "u-1",
+        **witness,
+    }
+    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-2"}
+    records = hm.to_records([merged, reply])
+    assert records == [
+        {"role": "user", "content": "what is this?\n\nand this?", "id": "u-1"},
+        {"role": "user", "content": "", "synthetic": True},
+        {"role": "assistant", "content": "A cat.", "id": "a-2"},
+    ]
+    (turn,) = cm.turns(records)
+    assert cm.complete(turn) and cm.joined(turn)
+    assert cm.turn_key(turn) == "a-2" and cm.opening_key(turn) == "u-1"
+    # A row that holds one message gets no such row, nor does one Hermes wrote itself,
+    # nor a reply Hermes made of two (the same witness, on an assistant row).
+    plain = {"role": "user", "content": "and this?", "message_uid": "u-3"}
+    assert not cm.joined(cm.turns(hm.to_records([plain, reply]))[0])
+    notice = {"role": "user", "content": "[System: resumed]", "message_uid": "n-1", **witness}
+    assert len(hm.to_records([notice])) == 1
+    assert len(hm.to_records([plain, {**reply, **witness}])) == 2
+    (episode,) = _episodes(records)
+    assert episode.human_turn == "what is this?\n\nand this?"
+
+
+def test_a_user_row_with_no_text_stays_as_a_row_that_opens_no_turn():
+    """A picture alone, or nothing once the memory block is gone. Left out, the reply
+    to it would read as the reply of a turn before it that got none."""
+    picture = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
+        "message_uid": "p-1",
+        "timestamp": 1_794_000_000.0,
+    }
+    assert hm.to_records([picture, {"role": "user", "content": _MEMORY}]) == [
+        {"role": "user", "content": "", "synthetic": True, "ts": 1_794_000_000.0, "id": "p-1"},
+        {"role": "user", "content": "", "synthetic": True},
+    ]
+    cut_short = {"role": "user", "content": "what is this?", "message_uid": "u-1"}
+    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-1"}
+    (turn,) = cm.turns(hm.to_records([cut_short, picture, reply]))
+    assert [r["id"] for r in turn] == ["u-1", "p-1", "a-1"]
+    assert cm.complete(turn) and cm.joined(turn)
 
 
 def test_tool_arguments_are_capped_and_user_and_assistant_text_are_not():
@@ -309,6 +396,60 @@ def test_a_synthetic_row_after_a_finished_turn_neither_reopens_it_nor_changes_it
     bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
     assert cm.turn_key([*bare, snapshot]) == cm.turn_key(bare)
     assert not cm.complete([{"role": "user", "content": "q"}, snapshot])
+
+
+def test_joined_says_a_turn_holds_more_than_its_own_exchange():
+    """A reply with no real user row before it lands on the turn before."""
+    asked = {"role": "user", "content": "q", "id": "q"}
+    finished = [asked, {"role": "assistant", "content": "r", "id": "r"}]
+    notice = {"role": "user", "content": "[process ended]", "synthetic": True, "id": "n"}
+    reply = {"role": "assistant", "content": "noted", "id": "r2"}
+    assert not cm.joined(finished)
+    # A row after the reply, also a synthetic one with nothing after it: the harness
+    # may have begun a turn with it that left no other row.
+    assert cm.joined([*finished, notice])
+    assert cm.joined([*finished, notice, reply])
+    assert cm.joined([*finished, reply])  # the row in the user's place left out
+    # A turn cut short, then a notice: its reply is not the reply to what was asked.
+    assert not cm.joined([asked])
+    assert cm.joined([asked, notice])
+    assert cm.joined([asked, notice, reply])
+    # A user row with no text opens no turn; what comes after it began later.
+    empty = {"role": "user", "content": "", "id": "e"}
+    assert cm.turns([*finished, empty, reply]) == [[*finished, empty, reply]]
+    assert cm.joined([*finished, empty])
+    assert cm.joined([asked, empty, reply])
+    # A tool call and its result are the turn still running, not a turn that went on.
+    call = {
+        "role": "assistant",
+        "content": "On it.",
+        "tool_calls": [{"name": "t", "arguments": ""}],
+        "id": "c",
+    }
+    result = {"role": "tool", "content": "ok", "name": "t", "id": "t"}
+    assert not cm.joined([asked, call, result])
+    assert not cm.joined([asked, call, result, finished[1]])
+    assert cm.joined([*finished, call])
+    assert cm.joined([*finished, call, result, reply])
+
+
+def test_the_opening_key_is_the_same_however_the_turn_goes_on():
+    finished = [
+        {"role": "user", "content": "q", "id": "q"},
+        {"role": "assistant", "content": "r", "id": "r"},
+    ]
+    notice = {"role": "user", "content": "[process ended]", "synthetic": True, "id": "n"}
+    reply = {"role": "assistant", "content": "noted", "id": "r2"}
+    later = [*finished, notice, reply]
+    assert cm.turn_key(later) == "r2" != cm.turn_key(finished)
+    assert cm.opening_key(later) == cm.opening_key(finished) == cm.opening_key(finished[:1]) == "q"
+    # With no id, the opening row is hashed: the same row, the same key.
+    bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
+    assert cm.opening_key([*bare, notice, reply]) == cm.opening_key(bare)
+    assert cm.opening_key(bare).startswith("sha256:")
+    assert cm.opening_key(bare) != cm.turn_key(bare)
+    other = [{"role": "user", "content": "another q"}, bare[1]]
+    assert cm.opening_key(other) != cm.opening_key(bare)
 
 
 def _numbered(n: int) -> list[list[dict]]:

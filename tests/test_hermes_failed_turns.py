@@ -230,12 +230,15 @@ def test_a_failure_at_the_end_sends_nothing():
 def test_the_provider_uploads_no_failed_turn(plugin, server, tmp_path):
     provider = base._start(base._new(plugin), tmp_path / "hermes-a", _SID)
     rows = _conversation()
+    provider.on_turn_start(1, "q")
     provider.sync_turn("q", "a", messages=rows[:3])
     # The gateway does not call sync_turn for a failed turn; the boundary reaches the
     # provider in on_session_end's (or on_pre_compress's) list.
+    provider.on_turn_start(2, "q", previous_message="q")
     provider.on_session_end(rows[:7])
     provider.on_pre_compress(rows[:7])
     assert len(server.posts()) == 1
+    provider.on_turn_start(3, "q", previous_message="q")
     provider.sync_turn("q", "a", messages=rows)
     _, second = server.posts()
     assert [r.get("id") for r in second["records"]] == ["u-1", "a-1", "u-3", "a-3"]

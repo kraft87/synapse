@@ -4,244 +4,41 @@
 
     private_mode.py on  <session_id>          # nothing from this session ever ingests
     private_mode.py off <session_id>          # stop skipping locally (row stays)
-    private_mode.py off <session_id> --forget # ALSO delete the server row (see below)
+    private_mode.py off <session_id> --forget # ALSO delete the server row
     private_mode.py status <session_id>
     private_mode.py --session-end             # SessionEnd hook: reads the payload on stdin
 
-Two writes, both required, because they cover different failure modes:
-
-  1. a marker file at ~/.synapse/private/<session_id> — the Stop hook stats it before
-     every POST, so the turns never leave this machine, even with the server down;
-  2. a row in private_sessions on the server — the durable half. The transcript stays
-     on disk long after the marker expires, so without the row a later catch-up sweep
-     or `python -m ingestion.backfill` would ingest exactly what the hook skipped.
-
-`on` therefore verifies BOTH landed (the server flag is read back, not assumed) and
-exits nonzero, loudly, if either did not. Only exit 0 means "off the record" is true.
-
-`off` removes the marker and LEAVES the row. Turning private mode off does not
-retroactively make already-private turns ingestable — those turns are still on disk and
-the row is the only thing keeping them out. Since a session id is never reused, the row
-also means the rest of that session stays private, which is the honest reading of
-"we were off the record". `--forget` is the explicit escape hatch that deletes the row
-(and re-exposes the session to future backfills); the SessionEnd hook never uses it.
+The toggle itself is the client core's, the one every harness runs
+(synapse_client/private_toggle.py: the two writes, why both are required, and what `off`
+and `--forget` leave behind). This script hands it this plugin's server, credential and
+marker folder. Only exit 0 from `on` means "off the record" is true.
 """
 
 from __future__ import annotations
 
-import json
+import dataclasses
 import os
 import sys
-import urllib.error
-import urllib.parse
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+from synapse_client.api import Client
+from synapse_client.private_toggle import Toggle
 
 PRIVATE_DIR = config.PRIVATE_DIR
 
 
-def _plain_name(session_id: str) -> bool:
-    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
-    core's rule (synapse_client/private.py), copied: the id is joined into the marker's
-    path, and ``../x`` would write or delete a file outside PRIVATE_DIR."""
-    seps = {"/", "\\", os.sep, os.altsep or "/"}
-    return (
-        session_id not in (".", "..")
-        and "\0" not in session_id
-        and not any(sep in session_id for sep in seps)
-    )
+def _toggle(program: str) -> Toggle:
+    # The marker folder the Stop hook reads (ingest_hook._private_settings).
+    settings = dataclasses.replace(config.SETTINGS, private_dir=Path(PRIVATE_DIR))
+    return Toggle(Client(settings, config.USER_AGENT), program=program)
 
 
-def _marker(session_id: str):
-    return PRIVATE_DIR / session_id
-
-
-def _write_marker(session_id: str) -> None:
-    PRIVATE_DIR.mkdir(parents=True, exist_ok=True)
-    _marker(session_id).write_text("", encoding="utf-8")
-
-
-def _remove_marker(session_id: str) -> bool:
-    """Delete the marker. True if it's gone afterwards (already-absent counts)."""
-    try:
-        _marker(session_id).unlink()
-    except FileNotFoundError:
-        pass
-    return not _marker(session_id).exists()
-
-
-def _server(method: str, session_id: str) -> dict:
-    sid = urllib.parse.quote(session_id, safe="")
-    return config.request_json(method, f"/private-sessions/{sid}", timeout=15)
-
-
-def _server_private(session_id: str) -> bool:
-    """Read the durable flag back from the server. Raises on transport/HTTP error."""
-    return bool(_server("GET", session_id).get("private"))
-
-
-def _fail(msg: str) -> int:
-    print(f"private mode FAILED: {msg}", file=sys.stderr)
-    print("This session is NOT off the record. Do not tell the user it is.", file=sys.stderr)
-    return 1
-
-
-def _marker_removed_note() -> None:
-    """Last line of every failed --forget. _off removes the marker before it sends the
-    DELETE, so a --forget that does not finish leaves the session as a plain `off` does:
-    the Stop hook sends its turns again, and the server drops them while the row is there."""
-    print(
-        "The local marker was removed. While the server row is kept, this session is in the "
-        "same state as after a plain `off`: its turns are sent and the server discards them.",
-        file=sys.stderr,
-    )
-
-
-def _forget_failed(
-    msg: str,
-    closing: str = "The server row was not deleted; the session stays off the record.",
-) -> int:
-    """A --forget that left the server row in place: the session stays off the record, so
-    _fail's closing line ("NOT off the record") would say the opposite. ``closing`` is
-    replaced when the DELETE may still be in flight and the row's fate is not settled."""
-    print(f"private mode FAILED: {msg}", file=sys.stderr)
-    print(closing, file=sys.stderr)
-    _marker_removed_note()
-    return 1
-
-
-def _on(session_id: str) -> int:
-    # Marker first: it is the half that works with no network, and it protects the very
-    # next turn. If the server write then fails we say so loudly rather than silently
-    # relying on a marker that expires in 12h.
-    try:
-        _write_marker(session_id)
-    except OSError as e:
-        return _fail(f"could not write marker {_marker(session_id)}: {e}")
-    try:
-        _server("PUT", session_id)
-        if not _server_private(session_id):
-            return _fail("server did not record the session as private (read-back said false)")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return _fail(
-            f"server flag not set ({type(e).__name__}: {str(e)[:160]}). Local marker is in place, but a later backfill could still ingest this session."
-        )
-    print(f"private mode ON for {session_id}")
-    print(f"  marker: {_marker(session_id)}")
-    print("  server: private_sessions row written (permanent)")
-    return 0
-
-
-def _off(session_id: str, forget: bool) -> int:
-    if not _remove_marker(session_id):
-        return _fail(f"could not remove marker {_marker(session_id)}")
-    if not forget:
-        print(f"private mode OFF for {session_id} (marker removed)")
-        print("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
-        return 0
-    delete_error = ""
-    delete_answered = False  # the server replied with an HTTP status, so it is done with it
-    try:
-        _server("DELETE", session_id)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        if isinstance(e, urllib.error.HTTPError) and e.code == 403:
-            return _forget_failed(
-                "taking a session back on the record must be done from a full-trust device."
-            )
-        # Not a clear refusal: a timeout or a 5xx may come after the server committed the
-        # delete, so say nothing about the row until it has been read back.
-        delete_error = f"{type(e).__name__}: {str(e)[:160]}"
-        delete_answered = isinstance(e, urllib.error.HTTPError)
-    try:
-        still_private = _server_private(session_id)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        # The DELETE went out but its effect could not be read back: state unknown, so
-        # neither "deleted" nor "stays off the record" can be claimed.
-        print(
-            f"private mode FAILED: could not read back the server row after DELETE "
-            f"({type(e).__name__}: {str(e)[:160]}). Check with: private_mode.py status {session_id}",
-            file=sys.stderr,
-        )
-        _marker_removed_note()
-        return 1
-    if still_private:
-        if delete_error and not delete_answered:
-            # The request may not have reached the server, or may still be working through
-            # it: the row was there at read-back and the DELETE can yet remove it.
-            return _forget_failed(
-                f"server DELETE did not finish ({delete_error}) and the row was still "
-                "present when read back.",
-                "The DELETE may still be applying on the server. "
-                f"Check with: private_mode.py status {session_id}",
-            )
-        return _forget_failed(
-            f"server DELETE failed ({delete_error})."
-            if delete_error
-            else "server still reports the session as private after DELETE."
-        )
-    if delete_error:
-        print(
-            f"private mode: the DELETE reported an error ({delete_error}), but the server "
-            "no longer lists the session as private.",
-            file=sys.stderr,
-        )
-    print(f"private mode OFF for {session_id} (marker removed, server row deleted)")
-    return 0
-
-
-def _status(session_id: str) -> int:
-    marker = _marker(session_id).exists()
-    try:
-        flagged = _server_private(session_id)
-        server = "yes" if flagged else "no"
-    except Exception as e:
-        server = f"unknown ({type(e).__name__})"
-    print(f"{session_id}: marker={'yes' if marker else 'no'} server={server}")
-    return 0
-
-
-def _session_end() -> int:
-    """SessionEnd hook: drop the marker for the ending session, keep the server row.
-
-    The row is the durable record that those turns must never ingest — including via a
-    backfill months from now — so cleanup is local-only. Fail-soft and always exit 0:
-    a hook must not break a session teardown, and a leftover marker expires on its own.
-    """
-    try:
-        session_id = (json.load(sys.stdin) or {}).get("session_id") or ""
-    except Exception:
-        return 0
-    if isinstance(session_id, str) and session_id and _plain_name(session_id):
-        try:
-            _remove_marker(session_id)
-        except OSError:
-            pass
-    return 0
-
-
-def main(argv: list[str]) -> int:
-    if argv and argv[0] == "--session-end":
-        return _session_end()
-    if len(argv) < 2 or argv[0] not in ("on", "off", "status"):
-        print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print("usage: private_mode.py on|off|status <session_id> [--forget]", file=sys.stderr)
-        return 2
-    action, session_id = argv[0], argv[1].strip()
-    if not session_id or not _plain_name(session_id):
-        return _fail(f"invalid session id {session_id!r}")
-    if session_id.startswith("-"):
-        # `off --forget <id>` would otherwise read the flag as the id and
-        # no-op against a session named "--forget" while the real one stays
-        # untouched.
-        return _fail(
-            f"session id {session_id!r} looks like a flag — usage: on|off|status <session_id> [--forget]"
-        )
-    if action == "on":
-        return _on(session_id)
-    if action == "off":
-        return _off(session_id, forget="--forget" in argv[2:])
-    return _status(session_id)
+def main(argv: list[str], program: str = "private_mode.py") -> int:
+    """``program`` is the name this was run under (`synapse private` passes its own), for
+    the lines that name a command to run next."""
+    return _toggle(program).main(argv, sys.stdin)
 
 
 if __name__ == "__main__":

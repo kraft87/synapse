@@ -5,11 +5,15 @@
 session (its chat id, its route, the state keys of its creation receipt), the
 surfaces Hermes stores as an owner's own chat, and the session store's columns it
 reads; ``harnesses/hermes/lineage.py`` copies the ``model_config`` keys under which a
-branch, a reset and a compressed continuation name the session they came from. A Hermes
-that renames any of them would turn a failed turn back into an uploaded reply, the
-owner's ``hermes chat`` back into an inert session, or a copy of a Bot Chat back into
-the owner's chat once its parent is deleted, without a unit test noticing: these checks
-ask the checkout itself.
+branch, a reset and a compressed continuation name the session they came from;
+``harnesses/hermes/provider.py`` reads how a session switch is announced (``reset``, and
+``reason="resume"``) to tell a conversation that goes on under a new id from another
+conversation, and, for a session a new agent is built for, takes the same from its row
+(``lineage.continues``). A Hermes that renames any of them would turn a failed turn back into an
+uploaded reply, the owner's ``hermes chat`` back into an inert session, a copy of a Bot
+Chat back into the owner's chat once its parent is deleted, or a compressed private
+conversation back into an uploaded one, without a unit test noticing: these checks ask
+the checkout itself.
 
 Skipped unless ``SYNAPSE_HERMES_CHECKOUT`` names a Hermes checkout with its virtualenv
 at ``.venv`` (as tests/test_hermes_integration.py). A driver runs under the checkout's
@@ -41,7 +45,8 @@ pytestmark = pytest.mark.skipif(
 
 _DRIVER = textwrap.dedent(
     """
-    import inspect, json, os, sqlite3
+    import inspect, json, os, re, sqlite3
+    from pathlib import Path
 
     import hermes_state_mutation_branch as branch
     import hermes_state_mutation_compress as compress
@@ -51,7 +56,7 @@ _DRIVER = textwrap.dedent(
     from gateway.session import SessionSource, build_session_key
     from gateway.session_policy import STORED_AS_LOCAL, SURFACES
     from hermes_state_keys import local_identity
-    from hermes_state_common import SCHEMA_SQL
+    from hermes_state_common import SCHEMA_SQL, _non_continuation_child_sql
     from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX
 
     store = sqlite3.connect(":memory:")
@@ -66,7 +71,58 @@ _DRIVER = textwrap.dedent(
     origins = [key for key, module in (("_branched_from", branch), ("_reset_from", reset),
                                        ("_compressed_from", compress))
                if "model_config={'%s': target}" % key in inspect.getsource(module)]
+    def says(path, text):
+        return " ".join(Path(path).read_text(encoding="utf-8").split()).count(text)
+
+    switches = {
+        "compression": says("agent/conversation_compression.py",
+                            'reset=False, reason="compression" )'),
+        "branch": says("hermes_cli/cli_commands_mixin.py",
+                       'parent_session_id=parent_session_id, reason="branch")'),
+        "resume": says("hermes_cli/cli_commands_mixin.py",
+                       'parent_session_id=old_session_id, reason="resume")'),
+        "resume_and_branch_keep": says("hermes_cli/cli_session_switch.py",
+                                       'reset=False, reason=reason)'),
+        "new_session": says("hermes_cli/cli_session_mixin.py",
+                            'reset=True, reason="new_session")'),
+    }
+    from agent.memory_provider import MemoryProvider
+    def takes(name):
+        return list(inspect.signature(getattr(MemoryProvider, name)).parameters)
+
+    named = {
+        "turn_start": says("agent/turn_context.py",
+                           "prefetch_all(_query, session_id=agent.session_id)"),
+        "prefetch": takes("prefetch"),
+        "sync_turn_names_one": "session_id" in takes("sync_turn"),
+        "on_session_end": takes("on_session_end"),
+        "on_pre_compress": takes("on_pre_compress"),
+    }
+    def in_order(path, *texts):
+        text = " ".join(Path(path).read_text(encoding="utf-8").split())
+        at = [text.rfind(one) for one in texts]
+        return -1 not in at and at == sorted(at)
+
+    turn_starts = {
+        "hook": takes("on_turn_start"),
+        "says_what_came_before": says("agent/turn_context.py",
+                                      "previous_message=previous_message, )"),
+        "before_the_prefetch": in_order("agent/turn_context.py",
+                                        "agent._memory_manager.on_turn_start(",
+                                        "agent._memory_manager.prefetch_all("),
+        "after_the_compaction": in_order("agent/turn_context.py",
+                                         "agent._user_turn_count += 1",
+                                         "run_turn_start_compaction(",
+                                         "else _memory_turn_start_and_prefetch("),
+    }
+    forks = _non_continuation_child_sql("c.", "?")
     print("RESULT " + json.dumps({
+        "fork_keys": sorted(set(re.findall(r"[$][.](_[a-z_]+)", forks))),
+        "fork_keys_name_the_parent": forks.count("!= ?"),
+        "tui_branch_row": says(
+            "tui_gateway/methods_session.py",
+            'db.create_session(new_key, source=source, model=model, '
+            'model_config={"_branched_from": parent_key}, parent_session_id=parent_key,'),
         "failed_kind": failures.FAILED_TURN_DISPLAY_KIND,
         "failed_notices": notices,
         "untyped": [failures.untyped_failed_turn_display_kind("assistant", n) for n in notices],
@@ -78,6 +134,9 @@ _DRIVER = textwrap.dedent(
         "stored_as_local": sorted(STORED_AS_LOCAL),
         "columns": columns,
         "origins": origins,
+        "switches": switches,
+        "named": named,
+        "turn_starts": turn_starts,
     }))
     """
 )
@@ -151,3 +210,83 @@ def test_this_hermes_names_a_copys_origin_the_way_the_rule_reads_it(names: dict[
     three gateway writers, by their source text: it does not run a delete, and it does
     not cover the in-process writers."""
     assert names["origins"] == list(hl._ORIGINS)
+
+
+def test_this_hermes_knows_no_kind_of_child_the_rule_has_not_decided_on(
+    names: dict[str, Any],
+) -> None:
+    """``lineage.continues`` decides from a row whether the session holds its parent's
+    turns, and so whether it is private with it: a branch and a compressed continuation
+    do, a reset and a subagent do not. That is not Hermes's rule, which asks whether a
+    child is the same session going on and turns a branch away. What is read here is
+    Hermes's list of the keys that mark a child as something else, each counted only
+    when it names the parent: every key on it is one ``continues`` has decided on, and a
+    new key there is a new kind of child someone has to decide on. Hermes's list also
+    turns away a child whose ``source`` is ``tool``, which ``continues`` does not read."""
+    assert names["fork_keys"] == sorted({"_branched_from", *hl._OWN_CONVERSATION})
+    assert names["fork_keys_name_the_parent"] >= 3
+
+
+def test_this_hermes_writes_a_tui_branchs_row_with_the_link_the_rule_reads(
+    names: dict[str, Any],
+) -> None:
+    """The TUI and Desktop build a new agent for a branch and announce no switch: the
+    row, with the parent link and ``_branched_from``, is all the provider has to know
+    the session holds a private parent's turns. When the row is written is not read:
+    the provider looks at it again at each upload until it names a parent. By the
+    source text of the one call that writes it."""
+    assert names["tui_branch_row"] == 1
+
+
+def test_this_hermes_announces_a_session_switch_the_way_the_provider_reads_it(
+    names: dict[str, Any],
+) -> None:
+    """The provider keeps a conversation private across a new session id unless the
+    switch is a reset (``/new``) or says ``reason="resume"`` (another conversation). A
+    compression that came to pass ``reset=True`` would upload a private conversation
+    under its new id; a resume under another reason would make the conversation resumed
+    private for no reason of its own. By the source text of the call sites."""
+    assert names["switches"] == {
+        "compression": 2,  # the child session, and the notice after either mode
+        "branch": 1,
+        "resume": 1,
+        "resume_and_branch_keep": 1,
+        "new_session": 1,
+    }
+
+
+def test_this_hermes_names_the_session_where_the_provider_reads_it(names: dict[str, Any]) -> None:
+    """The flush hooks carry no session id, so a flush goes under the id Hermes named
+    last (harnesses/hermes/live.py): at the start of each turn (``prefetch``, on a
+    thread Hermes waits for, with the agent's session) and at ``sync_turn``. A Hermes
+    that stopped naming it as the turn starts would leave a flush, after a move it did
+    not announce, under the session left; one whose flush hooks came to carry an id
+    should be read there instead. By the call site's source text and the base class's
+    signatures."""
+    assert names["named"] == {
+        "turn_start": 1,
+        "prefetch": ["self", "query", "session_id"],
+        "sync_turn_names_one": True,
+        "on_session_end": ["self", "messages"],
+        "on_pre_compress": ["self", "messages"],
+    }
+
+
+def test_this_hermes_says_when_a_turn_starts_the_way_the_provider_reads_it(
+    names: dict[str, Any],
+) -> None:
+    """A session that holds copies of another's turns uploads a turn only when the
+    provider saw it begin (``on_turn_start``, turn_upload.TurnUploader.begin). That
+    reads three things off Hermes. The hook comes after the turn-start compaction: a
+    switch the compaction makes has moved the provider by then, so the turn is counted
+    under the id it runs in. It comes before the turn's ``prefetch``. And it carries the
+    user message before this one (``previous_message``), which tells a session Hermes
+    said was new that it holds copies; without it an ACP fork is left to the count of
+    its turns alone. By the source text of the call sites and the base class's
+    signature."""
+    assert names["turn_starts"] == {
+        "hook": ["self", "turn_number", "message", "kwargs"],
+        "says_what_came_before": 1,
+        "before_the_prefetch": True,
+        "after_the_compaction": True,
+    }

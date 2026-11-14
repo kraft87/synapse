@@ -1,0 +1,166 @@
+"""What is kept about a session that holds another's turns.
+
+A session that holds another's turns (a branch, a compression that moved to a new id) is
+off the record when that one is, and Hermes builds a new agent for it when it likes: the
+TUI and Desktop for every branch, the gateway daemon after a restart. So the provider
+settles the question when it is bound to such a session (upload.Uploader.carry_private),
+and once only: a branch made before its parent went private stays on the record, and a
+session put back on the record (``synapse private off --forget``) is not taken off again
+because of the session it came from. This is where "once" is kept: one owner-only, empty
+file per settled session under ``<hermes_home>/synapse/settled/``, named by the SHA-256
+of its id. A record that could not be written does not undo it within one agent: the
+uploader makes a session private this way once too (``carry_private``).
+
+The record says the session was asked about, not how that ended. Private mode covers
+whole sessions, and whether one is private is for its marker and the server's row to
+say: a session put back on the record is back whole, with the turns it took over.
+
+A settled session's own answer stands for the sessions above it: it took them into
+account when it was settled. So a session is asked about up its chain only as far as the
+first settled one (``to_ask``).
+
+A session whose row names no session has nothing to be asked about, and can hold
+another's turns all the same: Hermes copies them into an ACP fork and records no
+origin. The uploader finds that out from the fork's first turn (turn_upload: a session
+said to be new that holds turns from before), in memory. ``note_copied`` keeps it, in a
+file of its own under ``<hermes_home>/synapse/copied/``: an agent built for the session
+later looks back at none of its turns either, and nor does a session that goes on from
+it, which is noted the same way (``copies``). It settles nothing: a row that names a
+session later is still asked about, since that one may be private. And it stands
+whatever is settled: the copies stay out also when the answer is "no".
+
+Only an agent built while Hermes's store held no message of the session keeps it
+(``noter``): that is the first agent of a fork, built before the fork's history is
+written. A session with messages at the build and no reply among them is said to be new
+too, and its first turn start names a message before. That is a chat whose first
+message got no reply, opened again: those messages are its own. It is also a copy of
+one unanswered message that was in the store before this agent: a fork whose agent is
+built a second time before its first turn, or a seeded session. The count does not tell
+them apart. The uploader treats each as a fork, in memory, nothing is kept, and an
+agent built later looks back at its turns (HANDOFF.md, "Still open").
+
+Nothing here raises. A record that cannot be written or read leaves the session to be
+asked about again: it is private for as long as the session it came from is. An agent
+built for a session whose copies could not be recorded looks back at its turns.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ...upload import Uploader
+
+_SETTLED = "settled"
+_COPIED = "copied"
+
+
+def _file(home: Any, session_id: str, kind: str) -> Path:
+    digest = hashlib.sha256(session_id.encode("utf-8", "replace")).hexdigest()
+    return Path(str(home)) / "synapse" / kind / digest
+
+
+def _noted(home: Any, session_id: str, kind: str) -> bool:
+    """Whether the session has a record of ``kind``. False when there is none, when it
+    cannot be read, and without a home or an id."""
+    if not home or not session_id:
+        return False
+    try:
+        os.lstat(_file(home, session_id, kind))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _note(home: Any, session_id: str, kind: str) -> None:
+    """Write the session's record of ``kind``, in ``<home>/synapse/<kind>``, owner-only.
+    Without a home or an id, and when the record cannot be written, nothing is kept."""
+    if not home or not session_id:
+        return
+    try:
+        folder = Path(str(home))
+        for part in ("synapse", kind):
+            folder = folder / part
+            if not folder.is_dir():
+                folder.mkdir(mode=0o700, exist_ok=True)
+        os.close(os.open(_file(home, session_id, kind), os.O_WRONLY | os.O_CREAT, 0o600))
+    except (OSError, ValueError):
+        return
+
+
+def settled(home: Any, session_id: str) -> bool:
+    """Whether ``session_id`` was settled under ``home``. False when that cannot be
+    read, and without a home or an id."""
+    return _noted(home, session_id, _SETTLED)
+
+
+def settle(home: Any, session_id: str) -> None:
+    """Record that ``session_id`` is settled: it is not asked about again."""
+    _note(home, session_id, _SETTLED)
+
+
+def to_ask(home: Any, chain: Iterable[str]) -> list[str]:
+    """The sessions of ``chain`` (the ones a session holds turns of, nearest first) to
+    go by: as far up as the first settled one, which answers for those above it."""
+    ask: list[str] = []
+    for session_id in chain:
+        ask.append(session_id)
+        if settled(home, session_id):
+            break
+    return ask
+
+
+def copied(home: Any, session_id: str) -> bool:
+    """Whether ``session_id`` was found to hold turns copied from a session nothing
+    names (``note_copied``). False when that cannot be read, and without a home or an
+    id."""
+    return _noted(home, session_id, _COPIED)
+
+
+def note_copied(home: Any, session_id: str) -> None:
+    """Record that ``session_id`` holds turns copied from a session nothing names."""
+    _note(home, session_id, _COPIED)
+
+
+def noter(home: Any, stored: Any) -> Callable[[str], None] | None:
+    """What the uploader of an agent is to call with a session it finds to hold copies
+    (TurnUploader's ``copied``): ``note_copied``, and nothing when Hermes's store held
+    messages of the agent's session as it built the agent (``stored``, how many).
+    Messages that were there before the agent can be the session's own, or copies
+    it did not see arrive: they are not told apart, and what is found is not kept."""
+    return None if stored else lambda found: note_copied(home, found)
+
+
+def copies(home: Any, session_id: Any, earlier: Iterable[Any] = ()) -> bool:
+    """Whether ``session_id`` holds copies, so that none of its turns from before is
+    looked back at: it was found to (``copied``), or a session of ``earlier``, whose
+    turns it holds, was. It is noted then as one that does, for an agent built later
+    and for the sessions that go on from it."""
+    sid = str(session_id or "")
+    if copied(home, sid):
+        return True
+    if not sid or not any(copied(home, str(one)) for one in earlier if one):
+        return False
+    note_copied(home, sid)
+    return True
+
+
+def carry(
+    uploader: Uploader, home: Any, earlier: Iterable[Any], session_id: Any, timeout: float | None
+) -> bool:
+    """Keep ``session_id`` off the record when a session of ``earlier``, whose turns it
+    holds, is (Uploader.carry_private: it gets the marker and the server's row). With
+    no marker to say one of them is private, the server is asked at the session's first
+    upload. Once per session of ``home``: a settled one is left as it is, and so is one
+    with no session in ``earlier``. With ``timeout`` None no request is made here, and
+    telling the server is left to the caller or that upload. True when a marker made
+    ``session_id`` private here: in this call, or for this uploader before it."""
+    sid = str(session_id or "")
+    ids = [str(one) for one in earlier if one]
+    if not sid or not ids or settled(home, sid):
+        return False
+    return uploader.carry_private(ids, sid, timeout=timeout, settled=lambda _: settle(home, sid))
