@@ -37,6 +37,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.db_notes import note_helpful_counts, select_board_notes
+from ingestion.dedup import owner_name
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
@@ -48,6 +49,7 @@ from ingestion.surfaces import (
 )
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
+from mcp_server.recall_query import owner_query_hint
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
 
@@ -233,6 +235,8 @@ def _render(
         "Absence from this board means SEARCH (recall), not doesn't-exist. "
         "Note bodies: fetch by id."
     )
+    # The same sentence as the server instructions, for a client that reads only the board.
+    lines.append(owner_query_hint(owner_name()))
 
     by_type: dict[str, list[dict[str, Any]]] = {}
     for n in notes:

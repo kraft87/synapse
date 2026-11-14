@@ -13,6 +13,16 @@ _ECHO_SHINGLE_CAP = 2000
 _RERANK_WINDOW_SIZE = 1024
 
 
+def owner_query_hint(owner: str) -> str:
+    """How a caller words a recall query about the owner. Facts and notes are third-person
+    sentences under the owner's stored name, so a first-person question shares no name with
+    them and matches whatever else uses its other words."""
+    return (
+        f'Memory is written in third person and calls the user "{owner}": in a recall query '
+        f'about the user, write "{owner}", not "I" or "my".'
+    )
+
+
 def normalize_whitespace(text: str) -> str:
     """Return the lowercase whitespace-normal form used by echo matching."""
     return _WS_RE.sub(" ", text).strip().lower()

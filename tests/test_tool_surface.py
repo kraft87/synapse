@@ -33,10 +33,12 @@ except Exception:  # pragma: no cover - environment dependent
 from fastmcp import Client  # noqa: E402
 
 from ingestion.db import Database  # noqa: E402
+from ingestion.dedup import owner_name  # noqa: E402
 from ingestion.surfaces import UNKNOWN_SURFACE  # noqa: E402
 from mcp_server import server  # noqa: E402
 from mcp_server.board import _OWNER  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
+from mcp_server.recall_query import owner_query_hint  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The listed surface: names, order, absences, descriptions
@@ -137,6 +139,18 @@ def test_always_loaded_text_describes_only_what_recall_serves():
     assert "Follow-ups:" not in by_name["recall"]
     assert "questions;" not in (server.mcp.instructions or "")
     assert "results; recall_full_turns searches" in (server.mcp.instructions or "")
+
+
+def test_instructions_say_how_to_word_a_query_about_the_owner():
+    """A first-person question shares no name with third-person facts, and every recall
+    query is written by a model: the one text every MCP client always loads tells it the
+    name the memory uses."""
+    hint = owner_query_hint(owner_name())
+    assert hint in (server.mcp.instructions or "")
+    assert owner_query_hint("Sam") == (
+        'Memory is written in third person and calls the user "Sam": in a recall query '
+        'about the user, write "Sam", not "I" or "my".'
+    )
 
 
 def test_fetch_session_schema_stays_short():
