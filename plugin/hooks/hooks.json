@@ -43,12 +43,6 @@
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/preferences_block.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/preferences_block.py\"",
-            "timeout": 15
-          },
-          {
-            "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
             "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
             "timeout": 10

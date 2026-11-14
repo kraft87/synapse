@@ -14,7 +14,8 @@ as a separate process; one pass is cheaper). The text is the client core's
                       (plugin/synapse_client/project.py); for a machine that is not
                       enrolled, or is served as ``restricted`` with no device token,
                       the explainer that says how to fix it
-  * preferences     — GET /preferences/top, max 7 lines
+  * preferences     — the top standing preferences, max 7 lines, rendered by the
+                      server and returned by the same GET /context
 
 and, around them:
 
@@ -26,8 +27,8 @@ and, around them:
                       ~/.agents/skills and the project's <root>/.agents/skills
 
 Time: Codex kills this hook at 20 s (install.py's block). The board and preferences are
-fetched side by side, each request bounded at 10 s, while the skills sync runs (at most
-12 s, ``SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT``); everything is cut off 15 s after the hook
+one request, bounded at 10 s, made while the skills sync runs (at most 12 s,
+``SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT``); everything is cut off 15 s after the hook
 starts, and whatever is ready by then is printed.
 
 Output is Codex's JSON envelope: {"hookSpecificOutput": {"hookEventName":
@@ -76,17 +77,13 @@ def _left() -> float:
     return _STARTED + _DEADLINE_S - time.monotonic()
 
 
-def _board_text(project: str | None) -> str:
-    # No `surface` param since schema 054: the bearer identifies the caller. "" when
-    # SYNAPSE_BOARD=0 or anything fails (context.board_part).
-    return context.board_part(
+def _served(project: str | None) -> tuple[str, str]:
+    # The board and the preferences block, from one request. No `surface` param since
+    # schema 054: the bearer identifies the caller. Each is "" when it is switched off
+    # (SYNAPSE_BOARD=0, SYNAPSE_PREFS_BLOCK=0) or anything fails (context.server_parts).
+    return context.server_parts(
         client(), project, live_settings(), timeout=_FETCH_TIMEOUT, login_hint=_LOGIN_HINT
     )
-
-
-def _prefs_text() -> str:
-    # "" when SYNAPSE_PREFS_BLOCK=0 or anything fails (context.preferences_part).
-    return context.preferences_part(client(), live_settings(), timeout=_FETCH_TIMEOUT)
 
 
 def _upload_warning() -> str | None:
@@ -142,25 +139,21 @@ def _sync_skills(cwd: str | None = None) -> None:
         pass
 
 
-def _fetch(project: str | None) -> tuple[list[threading.Thread], dict[str, str]]:
-    """Start the board and preferences requests side by side; each lands in the returned
-    dict when it finishes. Daemon threads: the hook prints and exits at its deadline
-    without waiting for a request that is still out."""
-    ready: dict[str, str] = {}
+def _fetch(project: str | None) -> tuple[threading.Thread, list[tuple[str, str]]]:
+    """Start the request for the board and the preferences; the pair lands in the
+    returned list when it is back. A daemon thread: the hook prints and exits at its
+    deadline without waiting for a request that is still out."""
+    ready: list[tuple[str, str]] = []
 
-    def run(name: str, fetch, *args) -> None:
+    def run() -> None:
         try:
-            ready[name] = fetch(*args) or ""
+            ready.append(_served(project))
         except Exception:
             pass
 
-    threads = [
-        threading.Thread(target=run, args=("board", _board_text, project), daemon=True),
-        threading.Thread(target=run, args=("prefs", _prefs_text), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-    return threads, ready
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, ready
 
 
 def main() -> None:
@@ -175,16 +168,14 @@ def main() -> None:
     project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
         os.getcwd()
     )
-    threads, ready = _fetch(project)
+    thread, ready = _fetch(project)
     _sync_skills(str(payload.get("cwd") or os.getcwd()))
-    for thread in threads:
-        thread.join(max(0.0, _left()))
-    ready = dict(ready)  # what arrived by the deadline; a late reply is dropped
+    thread.join(max(0.0, _left()))
+    # What arrived by the deadline; a late reply is dropped.
+    board, prefs = ready[0] if ready else ("", "")
     # The local lines lead (the credential notice, then the upload warning), so they show
     # even with the server down; then the board, then the preferences.
-    text = context.assemble(
-        (token_override_notice(), warning, ready.get("board"), ready.get("prefs"))
-    )
+    text = context.assemble((token_override_notice(), warning, board, prefs))
     if not text:
         return
     out = {

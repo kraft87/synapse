@@ -274,7 +274,7 @@ def server() -> Iterator[SimpleNamespace]:
         def do_GET(self) -> None:
             path = self._record(None)
             if path == "/context":
-                self._reply({"status": "ok", "text": "[board]"})
+                self._reply({"status": "ok", "text": "[board]", "preferences": ""})
             else:
                 self._reply({"status": "ok", "items": []})
 
@@ -710,10 +710,13 @@ def test_codex_stop_hook_process_ships_the_project(layout, server, tmp_path, mod
 def _run_board(monkeypatch, mod: ModuleType, stdin: str) -> list[tuple[str, dict]]:
     """main() with the hook payload on stdin and the network faked (test_board_block._run);
     the (path, params) of each request made."""
-    seen = fake_urlopen(monkeypatch, {"status": "ok", "text": "[board]"})
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "text": "[board]", "preferences": ""})
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     mod.main()
     return [requested(req) for req in seen]
+
+
+_BOTH = "board,preferences"  # the parts board_block.py asks /context for
 
 
 @pytest.mark.parametrize(
@@ -730,7 +733,7 @@ def test_board_block_scopes_the_board_to_the_resolved_project(
 ):
     mod = _load(_BOARD_BLOCK, "board_block_project_wiring_test")
     calls = _run_board(monkeypatch, mod, json.dumps({"cwd": _where(layout, where)}))
-    assert calls == [("/context", {"project": expected})]
+    assert calls == [("/context", {"project": expected, "parts": _BOTH})]
     out = json.loads(capsys.readouterr().out)
     assert out["hookSpecificOutput"]["additionalContext"] == "[board]"
 
@@ -738,13 +741,14 @@ def test_board_block_scopes_the_board_to_the_resolved_project(
 def test_board_block_falls_back_to_the_process_cwd(monkeypatch, layout):
     mod = _load(_BOARD_BLOCK, "board_block_project_wiring_test")
     monkeypatch.chdir(layout.wt_sub)
-    assert _run_board(monkeypatch, mod, "{}") == [("/context", {"project": "MyRepo"})]
+    calls = _run_board(monkeypatch, mod, "{}")
+    assert calls == [("/context", {"project": "MyRepo", "parts": _BOTH})]
 
 
 def test_board_block_process_sends_the_resolved_project(layout, server, tmp_path):
     proc = _run([str(_BOARD_BLOCK)], server.url, tmp_path, json.dumps({"cwd": str(layout.sub)}))
     gets = [r for r in server.seen if r.path == "/context"]
-    assert [g.query for g in gets] == [{"project": "MyRepo"}]
+    assert [g.query for g in gets] == [{"project": "MyRepo", "parts": _BOTH}]
     assert json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"] == "[board]"
 
 
@@ -754,8 +758,7 @@ def codex_start(monkeypatch) -> SimpleNamespace:
     `boards` collects the project each board fetch was asked for."""
     mod = _load(_SESSION_START, "codex_session_start_project_wiring_test")
     boards: list[str | None] = []
-    monkeypatch.setattr(mod, "_board_text", lambda project: boards.append(project) or "[board]")
-    monkeypatch.setattr(mod, "_prefs_text", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_served", lambda project: (boards.append(project) or "[board]", ""))
     monkeypatch.setattr(mod, "_sync_skills", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_spawn_catchup", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_upload_warning", lambda *a, **k: None)
@@ -799,7 +802,7 @@ def test_codex_session_start_process_sends_the_resolved_project(layout, server, 
         SYNAPSE_SKILLS_SYNC="0",
     )
     gets = [r for r in server.seen if r.path == "/context"]
-    assert [g.query for g in gets] == [{"project": "MyRepo"}]
+    assert [g.query for g in gets] == [{"project": "MyRepo", "parts": "board"}]
     assert json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"] == "[board]"
 
 

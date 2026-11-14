@@ -6,6 +6,47 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-13 — session start: the board and the preferences are one request (plugin 0.24.11)
+
+**What changed** (the detail is in the pull request and `docs/client-harnesses.md`)
+
+- **A session start is one request.** `GET /context?parts=board,preferences` returns
+  the board and the preferences block together, and the server renders the block.
+  Before, every client also read `/preferences/top` and rendered the block itself; in
+  Claude Code that was a second hook and a second Python process.
+- **Only the parts asked for are built.** A request with no `parts` gets the board
+  alone, which is what every client released so far sends: their replies are unchanged.
+- **Who is served what is unchanged.** The block comes from the query behind
+  `/preferences/top`, with the trust the caller's token resolves to.
+- **Claude Code's `preferences_block.py` hook and script are gone**: `board_block.py`
+  prints both. `SYNAPSE_PREFS_BLOCK=0` and `SYNAPSE_BOARD=0` each leave their piece out
+  of the request; with both off there is no request.
+- **An older server still works.** Its reply has no `preferences`, and the client then
+  reads `/preferences/top` itself. That fallback is kept for one release.
+
+**On each machine**
+
+1. Nothing has to happen in order: the server deploys by itself, and each side works
+   with the other's older version.
+2. `synapse update` for plugin 0.24.11. No setting to change.
+
+**Proven**
+
+- Tests: the route in `tests/test_context_parts.py` and, against a real database, in
+  `tests/test_board.py` and `tests/test_preferences_routes.py`; the clients in
+  `tests/test_client_core_context.py`, `test_claude_on_core.py`, `test_codex_on_core.py`
+  and `test_hermes_provider.py`. 25 single changes to the new rules were tried, and the
+  tests failed on each.
+
+**Still open**
+
+- The saving was not measured. It is one HTTP request and, in Claude Code, one Python
+  process fewer per session start.
+- Not run on Windows, in a real Codex session, or in a real Hermes session (the Hermes
+  tests drive the provider through a Hermes checkout's own loader).
+- The fallback for an older server (`context.preferences_block`, `Client.preferences`)
+  is to be removed in a later release, once no server from before this one is in use.
+
 ## 2026-11-13 — client: one private-mode toggle, and a Hermes conversation stays private under a new session id (plugin 0.24.10)
 
 **What changed** (the detail is in PR #270, `docs/client-harnesses.md` and

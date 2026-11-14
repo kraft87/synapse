@@ -17,7 +17,7 @@ def _command_hooks():
 
 def test_every_command_hook_has_a_powershell_override():
     hooks = list(_command_hooks())
-    assert len(hooks) == 13
+    assert len(hooks) == 12
     for event, hook in hooks:
         command = hook.get("commandWindows", "")
         assert command, f"{event} hook is missing commandWindows"

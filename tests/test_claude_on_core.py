@@ -498,16 +498,17 @@ def test_act_gates_on_the_expected_status(scratch, monkeypatch, server, capsys):
 
 
 def test_hooks_json_is_unchanged():
-    """The move changes no hook registration: the file is byte-identical to the one the
-    hooks shipped with before it."""
+    """A change to the core changes no hook registration: the file is byte-identical to
+    the one last changed on purpose (the preferences hook went when board_block.py began
+    to print both blocks from one request)."""
     raw = (PLUGIN / "hooks" / "hooks.json").read_bytes()
     assert hashlib.sha256(raw).hexdigest() == (
-        "b0a2f7e92bf1903f6bc907695df50a2ded3328651c5c3dc245db1d02e7e0df50"
+        "542bd1149033d81d9e83ac3804d6c64fac4f17fef5a42f6642765186f811f06b"
     )
 
 
 # ---------------------------------------------------------------------------
-# Session start: board_block.py and preferences_block.py print what the core builds
+# Session start: board_block.py prints what the core builds, from one request
 # ---------------------------------------------------------------------------
 
 _NOT_ENROLLED = (
@@ -529,6 +530,8 @@ _RESTRICTED = (
     "    /plugin > synapse > Synapse token)."
 )
 _BOARD = "[Synapse board]\n- a note"
+_PREFS_TEXT = "[Synapse preferences]\n  - (likes) Terse answers\n  - (rule) Full-time roles only"
+_BOTH_PARTS = "parts=board%2Cpreferences"
 
 
 def _session_start(text: str, notice: str = "") -> str:
@@ -557,30 +560,36 @@ def _run_hook(monkeypatch, capsys, name: str, stdin: str = "{}") -> str:
 
 
 _BOARD_REPLIES: dict[str, tuple[int, Any, bool, str]] = {
-    # name -> (status, reply, enrolled, the context printed)
-    "normal": (200, {"status": "ok", "text": _BOARD, "trust": "full"}, True, _BOARD),
+    # name -> (status, reply, enrolled, the context printed). A reply's ``preferences``
+    # is what this caller is served of them: none, in these.
+    "normal": (
+        200,
+        {"status": "ok", "text": _BOARD, "trust": "full", "preferences": ""},
+        True,
+        _BOARD,
+    ),
     "401-not-enrolled": (401, {"detail": "no"}, False, _NOT_ENROLLED),
     "401-enrolled": (401, {"detail": "no"}, True, ""),
     "restricted-without-a-device-token": (
         200,
-        {"status": "ok", "text": _BOARD, "trust": "restricted"},
+        {"status": "ok", "text": _BOARD, "trust": "restricted", "preferences": ""},
         False,
         _RESTRICTED + "\n\n" + _BOARD,
     ),
     "restricted-with-a-device-token": (
         200,
-        {"status": "ok", "text": _BOARD, "trust": "restricted"},
+        {"status": "ok", "text": _BOARD, "trust": "restricted", "preferences": ""},
         True,
         _BOARD,
     ),
     "restricted-empty": (
         200,
-        {"status": "ok", "text": "", "trust": "restricted"},
+        {"status": "ok", "text": "", "trust": "restricted", "preferences": ""},
         False,
         _RESTRICTED,
     ),
     "500": (500, {"detail": "boom"}, True, ""),
-    "not-ok": (200, {"status": "error", "text": _BOARD}, True, ""),
+    "not-ok": (200, {"status": "error", "text": _BOARD, "preferences": ""}, True, ""),
 }
 
 
@@ -590,19 +599,47 @@ def test_board_block_prints_the_board(scratch, monkeypatch, capsys, server, case
     _home(scratch, server, enrolled=enrolled)
     server.answer("/context", reply, status=status)
     assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(printed)
-    assert [r["path"] for r in server.seen] == ["/context?project=" + scratch.parent.name]
+    # One request, whatever the answer: an error status is not followed by another try.
+    assert [r["path"] for r in server.seen] == [
+        f"/context?project={scratch.parent.name}&{_BOTH_PARTS}"
+    ]
 
 
 def test_board_block_envelope_bytes(scratch, monkeypatch, capsys, server):
     _home(scratch, server, enrolled=True)
-    server.answer("/context", {"status": "ok", "text": "[board]"})
+    server.answer("/context", {"status": "ok", "text": "[board]", "preferences": "[prefs]"})
     out = _run_hook(monkeypatch, capsys, "board_block", json.dumps({"cwd": str(scratch)}))
     assert out == (
         '{"hookSpecificOutput": {"hookEventName": "SessionStart", '
-        '"additionalContext": "[board]"}}\n'
+        '"additionalContext": "[board]\\n\\n[prefs]"}}\n'
     )
+    assert len(server.seen) == 1
     assert server.seen[0]["headers"]["authorization"] == f"Bearer {_DEVICE}"
     assert server.seen[0]["headers"]["user-agent"] == _user_agent()
+
+
+def test_board_block_prints_the_preferences_the_server_rendered(
+    scratch, monkeypatch, capsys, server
+):
+    """The block comes with the board, in one request, and is printed after it as it
+    came: the server renders it, so every harness shows the same lines."""
+    _home(scratch, server, enrolled=True)
+    server.answer("/context", {"status": "ok", "text": _BOARD, "preferences": _PREFS_TEXT})
+    out = _run_hook(monkeypatch, capsys, "board_block")
+    assert out == _session_start(_BOARD + "\n\n" + _PREFS_TEXT)
+    assert [r["path"] for r in server.seen] == [
+        f"/context?project={scratch.parent.name}&{_BOTH_PARTS}"
+    ]
+
+
+def test_board_block_shows_the_preferences_of_a_restricted_machine_after_the_explainer(
+    scratch, monkeypatch, capsys, server
+):
+    _home(scratch, server, enrolled=False)
+    reply = {"status": "ok", "text": "", "trust": "restricted", "preferences": _PREFS_TEXT}
+    server.answer("/context", reply)
+    out = _run_hook(monkeypatch, capsys, "board_block")
+    assert out == _session_start(_RESTRICTED + "\n\n" + _PREFS_TEXT)
 
 
 @pytest.mark.parametrize("status", [200, 500])
@@ -610,27 +647,52 @@ def test_board_block_leads_with_the_credential_notice(scratch, monkeypatch, caps
     """The notice is local: it is printed, to the user too, whatever the server says."""
     _home(scratch, server, enrolled=True)
     monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
-    server.answer("/context", {"status": "ok", "text": _BOARD}, status=status)
+    reply = {"status": "ok", "text": _BOARD, "preferences": _PREFS_TEXT}
+    server.answer("/context", reply, status=status)
     out = _run_hook(monkeypatch, capsys, "board_block")
-    text = _NOTICE_ENV_SHELL + ("\n\n" + _BOARD if status == 200 else "")
-    assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+    served = "\n\n" + _BOARD + "\n\n" + _PREFS_TEXT if status == 200 else ""
+    assert out == _session_start(_NOTICE_ENV_SHELL + served, notice=_NOTICE_ENV_SHELL)
 
 
 @pytest.mark.parametrize("value", ["0", " 0"])
 def test_board_block_kill_switch(scratch, monkeypatch, capsys, server, value):
-    """SYNAPSE_BOARD=0 sends nothing; the credential notice still shows. Only exactly "0"
-    switches it off: " 0" does not, as it never has."""
+    """SYNAPSE_BOARD=0 asks for no board, and for no project (the payload is not read);
+    the credential notice and the preferences still show. Only exactly "0" switches it
+    off: " 0" does not, as it never has."""
     _home(scratch, server, enrolled=True)
     monkeypatch.setenv("SYNAPSE_BOARD", value)
     monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
-    server.answer("/context", {"status": "ok", "text": _BOARD})
+    server.answer("/context", {"status": "ok", "text": _BOARD, "preferences": _PREFS_TEXT})
     out = _run_hook(monkeypatch, capsys, "board_block")
     if value == "0":
-        assert out == _session_start(_NOTICE_ENV_SHELL, notice=_NOTICE_ENV_SHELL)
-        assert server.seen == []
-    else:
-        text = _NOTICE_ENV_SHELL + "\n\n" + _BOARD
+        text = _NOTICE_ENV_SHELL + "\n\n" + _PREFS_TEXT
         assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+        assert [r["path"] for r in server.seen] == ["/context?parts=preferences"]
+    else:
+        text = _NOTICE_ENV_SHELL + "\n\n" + _BOARD + "\n\n" + _PREFS_TEXT
+        assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+    # The payload names the folder, which only the board is scoped by.
+    assert (sys.stdin.tell() == 0) is (value == "0")
+
+
+def test_preferences_kill_switch(scratch, monkeypatch, capsys, server):
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
+    server.answer("/context", {"status": "ok", "text": _BOARD, "preferences": _PREFS_TEXT})
+    assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(_BOARD)
+    assert [r["path"] for r in server.seen] == [
+        f"/context?project={scratch.parent.name}&parts=board"
+    ]
+
+
+def test_both_switched_off_sends_nothing(scratch, monkeypatch, capsys, server):
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_BOARD", "0")
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
+    out = _run_hook(monkeypatch, capsys, "board_block")
+    assert out == _session_start(_NOTICE_ENV_SHELL, notice=_NOTICE_ENV_SHELL)
+    assert server.seen == []
 
 
 def test_board_block_with_the_server_down_prints_nothing(scratch, monkeypatch, capsys):
@@ -649,16 +711,26 @@ _PREFERENCES = {
 }
 
 
-def test_preferences_block_prints_the_top_preferences(scratch, monkeypatch, capsys, server):
+# A server from before /context carried the preferences block (kept for one release)
+
+
+def test_a_server_from_before_the_block_is_asked_for_its_top_preferences(
+    scratch, monkeypatch, capsys, server
+):
+    """Its /context reply has no ``preferences``: the items come from /preferences/top
+    and the client renders them, to the same text."""
     _home(scratch, server, enrolled=True)
+    server.answer("/context", {"status": "ok", "text": _BOARD, "trust": "full"})
     server.answer("/preferences/top", _PREFERENCES)
-    assert _run_hook(monkeypatch, capsys, "preferences_block") == (
-        '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": '
-        '"[Synapse preferences]\\n  - (likes) Terse answers\\n  - (dislikes) Emoji\\n'
-        '  - (rule) Full-time roles only\\n  - (neutral) Plain text"}}\n'
+    assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(
+        _BOARD + "\n\n[Synapse preferences]\n  - (likes) Terse answers\n  - (dislikes) Emoji\n"
+        "  - (rule) Full-time roles only\n  - (neutral) Plain text"
     )
-    assert [r["path"] for r in server.seen] == ["/preferences/top?limit=8"]
-    assert server.seen[0]["headers"]["authorization"] == f"Bearer {_DEVICE}"
+    assert [r["path"] for r in server.seen] == [
+        f"/context?project={scratch.parent.name}&{_BOTH_PARTS}",
+        "/preferences/top?limit=7",
+    ]
+    assert server.seen[1]["headers"]["authorization"] == f"Bearer {_DEVICE}"
 
 
 @pytest.mark.parametrize(
@@ -666,21 +738,37 @@ def test_preferences_block_prints_the_top_preferences(scratch, monkeypatch, caps
     [(401, {"detail": "no"}), (500, {"detail": "boom"}), (200, {"items": []}), (200, {})],
     ids=["401", "500", "none", "no-items"],
 )
-def test_preferences_block_prints_nothing_without_preferences(
+def test_an_older_server_with_no_preferences_to_show_still_shows_its_board(
     scratch, monkeypatch, capsys, server, status, reply
 ):
-    _home(scratch, server, enrolled=False)
+    _home(scratch, server, enrolled=True)
+    server.answer("/context", {"status": "ok", "text": _BOARD})
     server.answer("/preferences/top", reply, status=status)
-    assert _run_hook(monkeypatch, capsys, "preferences_block") == ""
+    assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(_BOARD)
+    assert len(server.seen) == 2
+
+
+def test_an_older_server_is_not_asked_for_preferences_that_are_switched_off(
+    scratch, monkeypatch, capsys, server
+):
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
+    server.answer("/context", {"status": "ok", "text": _BOARD})
+    server.answer("/preferences/top", _PREFERENCES)
+    assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(_BOARD)
     assert len(server.seen) == 1
 
 
-def test_preferences_block_kill_switch(scratch, monkeypatch, capsys, server):
-    _home(scratch, server, enrolled=True)
-    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
-    server.answer("/preferences/top", _PREFERENCES)
-    assert _run_hook(monkeypatch, capsys, "preferences_block") == ""
-    assert server.seen == []
+def test_no_preferences_hook_is_left(scratch):
+    """One session-start hook prints both: a second process and a second request were
+    the cost of rendering the preferences on the client."""
+    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    commands = [
+        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert sum("board_block.py" in command for command in commands) == 1
+    assert not any("preferences_block" in command for command in commands)
+    assert not (SCRIPTS / "preferences_block.py").exists()
 
 
 def test_the_enrollment_explainers_are_the_claude_wording(scratch):

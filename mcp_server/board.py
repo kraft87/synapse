@@ -13,6 +13,10 @@ mirrors preferences_routes). There is deliberately no MCP board tool: the hook
 already injects the block, and a listed tool invites a double-inject (Hermes
 pattern — when injection covers the read, ship no read tool).
 
+The route is the whole session-start read: ``?parts=board,preferences`` adds the
+rendered preferences block (preferences_routes.top_block) to the reply, so a client
+makes one request for both and renders neither.
+
 Pure SQL, no embedding calls, target <100ms: the note list (ingestion/db_notes.py's
 select_board_notes), the timeline milestones (timeline_routes._recent_events — reused,
 not duplicated), and two cheap banner aggregates. Each read borrows its own connection
@@ -48,6 +52,7 @@ from ingestion.surfaces import (
 )
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
+from mcp_server.preferences_routes import top_block
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
 
@@ -483,6 +488,29 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
         logger.debug("board metrics record failed: %s", e)
 
 
+#: What a /context reply can hold: ``text`` (the board) and ``preferences``.
+PARTS = frozenset({"board", "preferences"})
+
+
+def wanted_parts(raw: str | None) -> frozenset[str]:
+    """The parts a request asks for in ``?parts=`` (comma-separated names; an unknown
+    name is ignored). Without the parameter it is the board alone, which is the whole
+    reply every client before the parameter expects."""
+    if raw is None:
+        return frozenset({"board"})
+    return PARTS & {name.strip() for name in raw.split(",")}
+
+
+def _preferences(db_url: str, trust: SurfaceTrust) -> str:
+    """The reply's preferences block; "" when it cannot be built. The lesser piece
+    never costs the caller its board."""
+    try:
+        return top_block(db_url, trust)
+    except Exception as e:
+        logger.warning("preferences block failed: %s", e)
+        return ""
+
+
 def register(
     mcp: Any,
     db_url: str,
@@ -511,26 +539,36 @@ def register(
 
     @mcp.custom_route("/context", methods=["GET"])  # type: ignore[misc]
     async def board_context(request: Request) -> JSONResponse:
-        """The rendered board for the plugin's SessionStart hook (follow-up PR): one
-        bounded always-relevant index block, not query-blind recall injection."""
+        """What a session starts with, rendered for the client's session-start hook: the
+        board (one bounded always-relevant index block, not query-blind recall
+        injection) as ``text`` and, when asked for in ``?parts=``, the preferences
+        block as ``preferences``. Only the parts asked for are built."""
         if not authorized(request):
             return unauthorized()
         project = request.query_params.get("project") or None
+        want = wanted_parts(request.query_params.get("parts"))
         note_ignored_surface(request.query_params.get("surface"), "http.context")
         trust = resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE
-        # Explain only a verdict that was actually resolved for an authenticated caller.
-        told = resolve_trust is not None and authenticated is not None and authenticated(request)
-        notice = None
-        if told:
-            own = await run_in_threadpool(own_surface_served, db_url, trust)
-            notice = serving_notice(trust, own)
-        t0 = time.perf_counter()
-        try:
-            board = await run_in_threadpool(build_board, db_url, project, None, trust, notice)
-        except Exception as e:
-            logger.warning("board build failed: %s", e)
-            return err(str(e)[:200], 500)
-        if get_recall is not None:
-            record_board_metrics(get_recall(), "http", (time.perf_counter() - t0) * 1000.0, board)
-        board.pop("note_ids", None)
-        return JSONResponse(board)
+        reply: dict[str, Any] = {"status": "ok", "trust": trust.trust}
+        if "board" in want:
+            # Explain only a verdict that was actually resolved for an authenticated caller.
+            told = (
+                resolve_trust is not None and authenticated is not None and authenticated(request)
+            )
+            notice = None
+            if told:
+                own = await run_in_threadpool(own_surface_served, db_url, trust)
+                notice = serving_notice(trust, own)
+            t0 = time.perf_counter()
+            try:
+                reply = await run_in_threadpool(build_board, db_url, project, None, trust, notice)
+            except Exception as e:
+                logger.warning("board build failed: %s", e)
+                return err(str(e)[:200], 500)
+            if get_recall is not None:
+                ms = (time.perf_counter() - t0) * 1000.0
+                record_board_metrics(get_recall(), "http", ms, reply)
+            reply.pop("note_ids", None)
+        if "preferences" in want:
+            reply["preferences"] = await run_in_threadpool(_preferences, db_url, trust)
+        return JSONResponse(reply)

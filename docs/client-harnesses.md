@@ -124,7 +124,7 @@ still on some machine asks for it.
 
 | Synapse behaviour | Claude Code | Codex | Hermes |
 |---|---|---|---|
-| Board + preferences at session start | `SessionStart` hooks | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
+| Board + preferences at session start (one request) | `SessionStart` hook | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
 | Which sessions | every session | every session | local sessions only (below) |
 | Per-prompt recall nudge + timestamp | `UserPromptSubmit` hook | `UserPromptSubmit` hook | `prefetch()` (returns both; no recall is run) |
 | Upload a finished turn | `Stop` hook reads the session JSONL | `Stop` hook reads the rollout | `sync_turn(messages=...)` |
@@ -325,7 +325,7 @@ like every other harness, so there is no Hermes setup wizard step.
 | Method | Behaviour |
 |---|---|
 | `is_available()` | A URL and a token resolve. No network. |
-| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences side by side within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. With a marker to go by, the server is told here, beside those two requests and inside the same 5 seconds; with none, it is asked at the first upload. Once per session: `carried.py` records that the session was asked about, so one put back on the record since (`off --forget`) is not made private again by an agent built later. An agent built for a session that was found to hold copies (an ACP fork: the record under `copied/`), or for one that goes on from it, looks back at no turn. Any other resumed session looks back ten. |
+| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences (one request) within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. With a marker to go by, the server is told here, beside that request and inside the same 5 seconds; with none, it is asked at the first upload. Once per session: `carried.py` records that the session was asked about, so one put back on the record since (`off --forget`) is not made private again by an agent built later. An agent built for a session that was found to hold copies (an ACP fork: the record under `copied/`), or for one that goes on from it, looks back at no turn. Any other resumed session looks back ten. |
 | `system_prompt_block()` | The text fetched in `initialize()`, in an active session that the store still says is the owner's. Hermes caches it for the session, stores it with the session and restores it for a continuing one, and asks again after a compression. |
 | `prefetch(query, session_id=...)` | The timestamp line and the recall nudge, in an active session. No request is made. Hermes runs it as a turn starts, after `on_turn_start`, on a thread it waits for, with the agent's session id: the provider notes it as the session the agent is in (`live.py`), for the hooks that name none. Hermes runs none for a trivial prompt, a bare skill invocation, an owner scope that refuses it, a fork with its hooks off, or while its gate holds a stuck call. |
 | `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. Tells the uploader that a turn starts in the session the instance is bound to (`TurnUploader.begin`), and whether Hermes names a user message before this one (`previous_message`): the first turn start of a session Hermes said was new shows by that whether turns were copied into it, and a session that holds copies uploads only turns seen to begin. Every turn gets the hook but a prompt a `pre_llm_call` hook vetoed; it comes after the turn-start compaction and before `prefetch`. |
@@ -399,9 +399,10 @@ session-id injection hook (`pre_tool_use.py`) and the skills-sync glue. Its
 `scripts/private_mode.py` is the core's toggle with Codex's settings (plugin 0.24.10).
 
 Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `config.py`
-resolves with `Settings.load` and sends through `Transport`; the board, preferences and
-prompt-nudge hooks print what `context` builds, with Claude Code's enrollment wording
-(`enroll.py`) passed in; the Stop hook uploads through `Transport` and its private check
+resolves with `Settings.load` and sends through `Transport`; the board hook (which prints
+the preferences too) and the prompt-nudge hook print what `context` builds, with Claude
+Code's enrollment wording (`enroll.py`) passed in; the Stop hook uploads through
+`Transport` and its private check
 is `private.is_private`, with `private.check_payload` run again inside the sender
 (`_post_records`), which the catch-up sweep and `synapse-import` share. Claude Code keeps
 its own Stop-hook shipper (byte cursor,
@@ -440,6 +441,11 @@ The core ports the hooks' behaviour and wording, with these differences:
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
 - **Session-start order** is notice, upload warning, board, preferences in every harness.
+  The board and the preferences are one request (`context.server_parts`:
+  `GET /context?parts=board,preferences`) and both are rendered by the server. A piece
+  switched off is not asked for. A server from before the `parts` parameter answers
+  with the board alone; its preferences are then read from `/preferences/top` and
+  rendered by the client, in what is left of the same timeout.
 - **Enrollment notices** take the login hint as an argument, and the restricted-device
   notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
   one, the other harnesses none.

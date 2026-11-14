@@ -33,7 +33,6 @@ SCRIPT_MODULES = (
     "enroll",
     "harness",
     "board_block",
-    "preferences_block",
     "recall_nudge",
     "ingest_hook",
     "synapse_ingest_retry",
