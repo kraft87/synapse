@@ -6,6 +6,55 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — hermes: `/private` takes the session it is typed in off the record (plugin 0.24.15)
+
+**What changed**
+
+- **Hermes has a `/private` command.** Before, private mode in Hermes was only
+  `synapse private on <session-id>` in a terminal, and you had to find the id. Hermes
+  hands a plugin command the id of the session it was typed in, so the command needs
+  none.
+- **`/private on`** is the same toggle (`private_toggle.Toggle`): the marker on this
+  machine and the row on the server. It answers ON only when the server has confirmed
+  the row. What was uploaded before stays stored.
+- **`/private`** alone and **`/private status`** say where the session stands.
+- **There is no `/private off`.** Private mode covers whole sessions. `/private off`
+  says so and changes nothing: to go back on the record, start a new session.
+- **Only the owner's own local sessions.** Hermes runs a plugin command on every
+  surface, and in a messaging chat anyone can type it. The command applies the rule the
+  provider applies to a session, and refuses anywhere else before any request or file.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.15. Nothing to migrate, nothing on the server.
+2. Restart Hermes where it is running (`hermes gateway stop`; the next `hermes chat`
+   starts it again): a running process keeps the plugin code it loaded.
+
+**Proven**
+
+- Tests: `tests/test_hermes_private_command.py` (88). Eleven rules of the command were
+  taken out in turn; the tests failed each time.
+- In real Hermes bca51750 with the real plugin and a local fake server, in both plugin
+  isolation modes: `/private on` through `slash.exec` (what the CLI, the TUI and
+  Desktop send), through `command.dispatch`, and typed in an ACP editor session. Each
+  made one `PUT` and one `GET`, the turns after it made no upload, and a second
+  session made private before its first turn uploaded nothing.
+  `tests/test_hermes_integration.py` runs the command through Hermes's own dispatch;
+  CI has no Hermes checkout, so those cases ran on cortex only.
+
+**Open**
+
+- In a gateway started just now, Hermes does not know `/private` until the first
+  message of the first session has been sent, and that message is uploaded. Hermes
+  loads a memory provider with the first agent it builds, and its plugin discovery
+  skips a memory provider. A second, stand-alone plugin for the command alone would
+  close this; it is not built.
+- The stand-alone TUI backend (`python -m tui_gateway.entry`) takes the gateway's lock,
+  so the provider uploads nothing from it. Hermes's own source says only test harnesses
+  start it; the TUI itself attaches to the gateway. Read at upstream head d3d4ee4c too,
+  not run there.
+- Read, not run: the classic CLI's own-process fallback (off the gateway).
+
 ## 2026-11-14 — hermes: a turn's upload runs after `sync_turn` has returned (plugin 0.24.14)
 
 **What changed**

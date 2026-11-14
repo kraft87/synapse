@@ -94,11 +94,16 @@ class _Handler(BaseHTTPRequestHandler):
             prefs = "[Synapse preferences]\n  - (likes) Kyle likes small commits"
             reply = {"status": "ok", "text": "BOARD-TEXT", "trust": "full", "preferences": prefs}
             self._send(200, reply)
+        elif self.path.startswith("/private-sessions/"):
+            held = self.path.rsplit("/", 1)[-1] in self.server.private_rows
+            self._send(200, {"status": "ok", "private": held})
         else:
             self._send(404, {})
 
     def do_PUT(self) -> None:
         self._record()
+        if self.path.startswith("/private-sessions/"):
+            self.server.private_rows.add(self.path.rsplit("/", 1)[-1])
         self._send(200 if self.path.startswith("/private-sessions/") else 404, {"private": True})
 
     def do_POST(self) -> None:
@@ -129,6 +134,7 @@ class _Server(ThreadingHTTPServer):
         self.seen: list[dict[str, Any]] = []
         #: Seconds an ``/ingest`` request waits for its answer.
         self.ingest_delay = 0.0
+        self.private_rows: set[str] = set()  # the sessions the server holds off the record
 
     @property
     def url(self) -> str:
@@ -466,6 +472,83 @@ _CLOSE_DRIVER = textwrap.dedent(
 )
 
 
+#: ``/private on`` the way Hermes runs a plugin's slash command: the handler Hermes holds
+#: for the name, called through its own dispatch with the session it was typed in.
+_COMMAND_DRIVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+
+    from agent.memory_manager import MemoryManager
+    from plugins.memory import load_memory_provider
+
+    sid, model, secret, cwd = sys.argv[1:5]
+    home = os.environ["HERMES_HOME"]
+    out = {"warnings": []}
+
+    manager = MemoryManager()
+    provider = load_memory_provider("synapse")
+    manager.add_provider(provider)
+    manager.initialize_all(
+        session_id=sid,
+        platform="tui",
+        hermes_home=home,
+        agent_context="primary",
+        warning_callback=out["warnings"].append,
+        status_callback=lambda *args: None,
+        resumed=False,
+        message_count=0,
+        cwd=cwd,
+        agent_identity="default",
+        agent_workspace="hermes",
+    )
+
+    from hermes_cli.plugin_command_dispatch import invoke_plugin_command
+    from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
+
+    handler = get_plugin_command_handler("private")
+    out["found"] = handler is not None
+
+
+    def run(text, **context):
+        context = {"source": None, "session_id": sid, "session_key": sid, "platform": "tui", **context}
+        return str(resolve_plugin_command_result(invoke_plugin_command(handler, text, **context)))
+
+
+    out["refused"] = run("on", platform="telegram")
+    out["before"] = run("status")
+    out["on"] = run("on")
+    out["after"] = run("status")
+
+    manager.on_turn_start(
+        1, "question 1", model=model, author_id=None, author_name=None,
+        author_is_bot=False, previous_message="",
+    )
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "question 1", "timestamp": 1001.0},
+        {"role": "assistant", "content": "answer 1"},
+    ]
+    manager.sync_all("question 1", "answer 1", session_id=sid, messages=messages)
+    manager.flush_pending(timeout=60)
+    manager.on_session_end(messages)
+    manager.shutdown_all()
+
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        host = get_plugin_manager()._running_plugin_host()
+        out["host_pid"] = host.pid if host is not None else None
+        if host is not None:
+            host.shutdown()
+    except Exception as exc:
+        out["host_error"] = repr(exc)
+    print("RESULT " + json.dumps(out))
+    """
+)
+
+
 def _checkout() -> tuple[Path, Path]:
     checkout = Path(os.path.expanduser(_CHECKOUT)).resolve()
     python = checkout / ".venv" / "bin" / "python"
@@ -681,3 +764,25 @@ def test_hermes_does_not_wait_for_an_upload_until_it_closes(
     assert out["left"] == []
     (post,) = server.requests("POST", "/ingest")
     assert [e.human_turn for e in _stored([post["body"]])] == ["question 1"]
+
+
+@pytest.mark.parametrize("isolation", ["in_process", "host"])
+def test_the_private_command_runs_through_hermes(
+    tmp_path: Path, server: _Server, isolation: str
+) -> None:
+    """Hermes holds the plugin's ``/private`` handler once it has loaded the provider,
+    and its dispatch passes the handler the session the command was typed in: the
+    session goes off the record with no id typed, and its turn is not uploaded. In the
+    plugin host too, where the handler Hermes holds stands for one in another process."""
+    out = _run(tmp_path, server, isolation, _COMMAND_DRIVER)
+    assert out["network"] == "" and out["warnings"] == []
+    if isolation == "host":
+        assert out.get("host_pid"), "the provider did not run in Hermes's plugin host"
+    assert out["found"], "Hermes holds no handler for /private"
+    assert out["refused"].startswith("Synapse: /private works only in the owner's own local")
+    assert out["before"].startswith(f"Synapse private mode, {_SID}: marker=no server=no")
+    assert f"private mode is ON for this session ({_SID})" in out["on"]
+    assert out["after"].startswith(f"Synapse private mode, {_SID}: marker=yes server=yes")
+    assert os.listdir(out["private_dir"]) == [_SID]
+    assert [r["path"] for r in server.requests("PUT", "/")] == [f"/private-sessions/{_SID}"]
+    assert server.requests("POST", "/ingest") == []

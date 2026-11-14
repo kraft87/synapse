@@ -315,8 +315,8 @@ as context, and one you steered while it ran (`/steer`), or whose message Hermes
 into an earlier one that got no reply, is not uploaded.
 Uploads that fail wait in `$HERMES_HOME/synapse/outbox/` and go with the next
 successful one. A session marked
-private (`synapse private on <session-id>`, in a terminal; `hermes sessions list` shows
-the id) uploads nothing. Hermes gives a conversation a new session id when it branches
+private (`/private on` typed in it, or `synapse private on <session-id>` in a terminal;
+`hermes sessions list` shows the id) uploads nothing. Hermes gives a conversation a new session id when it branches
 it, and when a compression starts a new session: the new id is private when Hermes says
 which session it holds turns of and that one is private. It gets the marker and the
 server row, so what was said off the record stays there. Which session that is comes
@@ -358,9 +358,21 @@ compressions made from it afterwards, for every agent Hermes builds under this
 `HERMES_HOME`. An ACP fork you marked private and put back uploads from its next turn
 on: the turns that ended in it while it was private are not told from the copied ones.
 
+**`/private`.** In a session you run on this machine, type `/private on` to take that
+session off the record. `/private` alone, or `/private status`, says whether it is. It
+is `synapse private on` for the session you type it in: it writes the marker, sets the
+server's row, and answers ON only when the server has confirmed the row. What was
+uploaded before stays stored. There is no `/private off`: to go back on the record,
+start a new session. It works where Hermes runs your own sessions (the CLI, the TUI,
+Desktop, an editor over ACP). In a chat-platform session it refuses and changes
+nothing, because anyone in the chat could type it. Hermes loads a memory provider with
+the first agent it builds: in a gateway started just now, Hermes says `/private` is
+unknown until you have sent the first message of the first session, and that message
+is uploaded. After `synapse update`, restart Hermes (`hermes gateway stop`) to get the
+command.
+
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
-queued), the recall-feedback nudge, a Hermes slash command for private mode (use
-`synapse private` in a terminal), skills and config sync, and importing past Hermes
+queued), the recall-feedback nudge, skills and config sync, and importing past Hermes
 sessions from its `state.db`.
 
 ## More
