@@ -19,29 +19,19 @@ A settled session's own answer stands for the sessions above it: it took them in
 account when it was settled. So a session is asked about up its chain only as far as the
 first settled one (``to_ask``).
 
-A session whose row names no session has nothing to be asked about, and can hold
-another's turns all the same: Hermes copies them into an ACP fork and records no
-origin. The uploader finds that out from the fork's first turn (turn_upload: a session
-said to be new that holds turns from before), in memory. ``note_copied`` keeps it, in a
-file of its own under ``<hermes_home>/synapse/copied/``: an agent built for the session
-later looks back at none of its turns either, and nor does a session that goes on from
-it, which is noted the same way (``copies``). It settles nothing: a row that names a
-session later is still asked about, since that one may be private. And it stands
-whatever is settled: the copies stay out also when the answer is "no".
-
-Only an agent built while Hermes's store held no message of the session keeps it
-(``noter``): that is the first agent of a fork, built before the fork's history is
-written. A session with messages at the build and no reply among them is said to be new
-too, and its first turn start names a message before. That is a chat whose first
-message got no reply, opened again: those messages are its own. It is also a copy of
-one unanswered message that was in the store before this agent: a fork whose agent is
-built a second time before its first turn, or a seeded session. The count does not tell
-them apart. The uploader treats each as a fork, in memory, nothing is kept, and an
-agent built later looks back at its turns (HANDOFF.md, "Still open").
+Clients 0.24.10 to 0.24.15 also guessed that a session holds another's turns when
+nothing names the session they came from (the ACP session manager in the adapter's own
+process copies a fork's turns into such a row), and kept what they found in a file of
+its own under ``<hermes_home>/synapse/copied/``. Nothing finds such a session any more:
+an ACP session with no gateway identity is INERT (sessions.py), and a branch names its
+parent. The records already written are still read, for one more release: an agent
+built for a recorded session looks back at none of its turns, and nor does a session
+that goes on from it, which is noted the same way (``copies``). A record settles
+nothing: a row that names a session is still asked about, since that one may be
+private.
 
 Nothing here raises. A record that cannot be written or read leaves the session to be
-asked about again: it is private for as long as the session it came from is. An agent
-built for a session whose copies could not be recorded looks back at its turns.
+asked about again: it is private for as long as the session it came from is.
 """
 
 from __future__ import annotations
@@ -49,7 +39,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -117,9 +107,9 @@ def to_ask(home: Any, chain: Iterable[str]) -> list[str]:
 
 
 def copied(home: Any, session_id: str) -> bool:
-    """Whether ``session_id`` was found to hold turns copied from a session nothing
-    names (``note_copied``). False when that cannot be read, and without a home or an
-    id."""
+    """Whether ``session_id`` is recorded as holding turns copied from a session nothing
+    names (by a client before 0.24.16, or ``copies``). False when that cannot be read,
+    and without a home or an id."""
     return _noted(home, session_id, _COPIED)
 
 
@@ -128,19 +118,10 @@ def note_copied(home: Any, session_id: str) -> None:
     _note(home, session_id, _COPIED)
 
 
-def noter(home: Any, stored: Any) -> Callable[[str], None] | None:
-    """What the uploader of an agent is to call with a session it finds to hold copies
-    (TurnUploader's ``copied``): ``note_copied``, and nothing when Hermes's store held
-    messages of the agent's session as it built the agent (``stored``, how many).
-    Messages that were there before the agent can be the session's own, or copies
-    it did not see arrive: they are not told apart, and what is found is not kept."""
-    return None if stored else lambda found: note_copied(home, found)
-
-
 def copies(home: Any, session_id: Any, earlier: Iterable[Any] = ()) -> bool:
     """Whether ``session_id`` holds copies, so that none of its turns from before is
-    looked back at: it was found to (``copied``), or a session of ``earlier``, whose
-    turns it holds, was. It is noted then as one that does, for an agent built later
+    looked back at: it is recorded so (``copied``), or a session of ``earlier``, whose
+    turns it holds, is. It is noted then as one that does, for an agent built later
     and for the sessions that go on from it."""
     sid = str(session_id or "")
     if copied(home, sid):

@@ -9,7 +9,10 @@ branch, a reset and a compressed continuation name the session they came from;
 ``harnesses/hermes/provider.py`` reads how a session switch is announced (``reset``, and
 ``reason="resume"``) to tell a conversation that goes on under a new id from another
 conversation, and, for a session a new agent is built for, takes the same from its row
-(``lineage.continues``). A Hermes that renames any of them would turn a failed turn back into an
+(``lineage.continues``). ``sessions.py`` also counts on ``hermes acp`` running its
+sessions in the gateway (an ACP session outside it is inert), and the provider on a
+branch's row naming its parent before a row is copied into it: nothing in the client
+guesses that a session holds copies. A Hermes that renames any of them would turn a failed turn back into an
 uploaded reply, the owner's ``hermes chat`` back into an inert session, a copy of a Bot
 Chat back into the owner's chat once its parent is deleted, or a compressed private
 conversation back into an uploaded one, without a unit test noticing: these checks ask
@@ -62,7 +65,7 @@ _DRIVER = textwrap.dedent(
     store = sqlite3.connect(":memory:")
     store.executescript(SCHEMA_SQL)
     columns = {table: [row[1] for row in store.execute("PRAGMA table_info(%s)" % table)]
-               for table in ("sessions", "state_meta")}
+               for table in ("sessions", "state_meta", "messages")}
     notices = [failures.FAILED_TURN_NOTICE, failures.PARTIAL_FAILED_TURN_NOTICE,
                failures.AUTOMATION_INTERRUPTED_NOTICE]
     owner = "uid:%d" % os.getuid()
@@ -105,15 +108,35 @@ _DRIVER = textwrap.dedent(
 
     turn_starts = {
         "hook": takes("on_turn_start"),
-        "says_what_came_before": says("agent/turn_context.py",
-                                      "previous_message=previous_message, )"),
+        "names_the_author": says("agent/turn_context.py",
+                                 'author_id=_author.get("id") or None, '
+                                 'author_name=_author.get("name") or None, '
+                                 'author_is_bot=bool(_author.get("is_bot")),'),
         "before_the_prefetch": in_order("agent/turn_context.py",
                                         "agent._memory_manager.on_turn_start(",
                                         "agent._memory_manager.prefetch_all("),
-        "after_the_compaction": in_order("agent/turn_context.py",
-                                         "agent._user_turn_count += 1",
-                                         "run_turn_start_compaction(",
-                                         "else _memory_turn_start_and_prefetch("),
+    }
+    copies = {
+        "acp_default_is_the_gateways": says(
+            "acp_adapter/server.py",
+            "def __new__(cls, session_manager=None): if session_manager is None: "
+            "from acp_adapter.gateway_server import GatewayACPAgent "
+            "return GatewayACPAgent() return super().__new__(cls)"),
+        "acp_entry_names_no_manager": says("acp_adapter/entry.py", "agent = HermesACPAgent()"),
+        "acp_agents_built": says("acp_adapter/entry.py", "HermesACPAgent("),
+        "branch_row_before_its_rows": in_order(
+            "hermes_state_mutation_branch.py",
+            "db._publish_child_session_row(conn, parent, parent_session_id=target,",
+            "model_config={'_branched_from': target}",
+            "db._clone_message_rows(conn, ids, session_id=child)"),
+        "clone_leaves_out": says(
+            "hermes_state_messages.py",
+            'skip = ("id", "active", "compacted", "display_order") '
+            '+ (("session_id",) if retarget else ())'),
+        "clone_takes_the_rest": says(
+            "hermes_state_messages.py",
+            'col_list = ", ".join(c for c in self._message_column_names(conn) '
+            'if c not in skip)'),
     }
     forks = _non_continuation_child_sql("c.", "?")
     print("RESULT " + json.dumps({
@@ -137,6 +160,7 @@ _DRIVER = textwrap.dedent(
         "switches": switches,
         "named": named,
         "turn_starts": turn_starts,
+        "copies": copies,
     }))
     """
 )
@@ -275,18 +299,42 @@ def test_this_hermes_names_the_session_where_the_provider_reads_it(names: dict[s
 def test_this_hermes_says_when_a_turn_starts_the_way_the_provider_reads_it(
     names: dict[str, Any],
 ) -> None:
-    """A session that holds copies of another's turns uploads a turn only when the
-    provider saw it begin (``on_turn_start``, turn_upload.TurnUploader.begin). That
-    reads three things off Hermes. The hook comes after the turn-start compaction: a
-    switch the compaction makes has moved the provider by then, so the turn is counted
-    under the id it runs in. It comes before the turn's ``prefetch``. And it carries the
-    user message before this one (``previous_message``), which tells a session Hermes
-    said was new that it holds copies; without it an ACP fork is left to the count of
-    its turns alone. By the source text of the call sites and the base class's
-    signature."""
+    """``on_turn_start`` tells the provider who wrote the turn (``author_*``), and a
+    turn someone else wrote turns it INERT. That has to come before the turn's
+    ``prefetch``: a recall for someone else's message would be made with the owner's
+    token. By the source text of the call site and the base class's signature."""
     assert names["turn_starts"] == {
         "hook": ["self", "turn_number", "message", "kwargs"],
-        "says_what_came_before": 1,
+        "names_the_author": 1,
         "before_the_prefetch": True,
-        "after_the_compaction": True,
     }
+
+
+def test_this_hermes_runs_no_acp_session_outside_the_gateway(names: dict[str, Any]) -> None:
+    """An ACP session with no gateway identity is INERT (sessions.from_keywords): the
+    session manager in the adapter's own process copies a fork's turns into a row that
+    names no parent, so nothing could keep a private session's copies off the record.
+    The rule costs nobody a session as long as ``hermes acp`` builds its agent with no
+    session manager, which hands back the gateway's agent: that one runs every session
+    in the gateway, with a gateway identity. A Hermes that built the in-process manager
+    again would leave its ACP sessions with no memory, and this says so. By the source
+    text of the constructor and of its one call."""
+    copies = names["copies"]
+    assert copies["acp_default_is_the_gateways"] == 1
+    assert copies["acp_entry_names_no_manager"] == copies["acp_agents_built"] == 1
+
+
+def test_this_hermes_branch_names_its_parent_before_it_copies_a_row(
+    names: dict[str, Any],
+) -> None:
+    """Nothing in the client guesses that a session holds copies: a branch is known by
+    its row, which names the parent. So the row, with the link, has to be written
+    before the rows are copied into the session, in the one transaction: no agent then
+    sees the copies in a session that names no parent. The copy takes every column of
+    a row but its place and state, ``message_uid`` with the rest, so a copied turn has
+    the id it had in the parent. By the source text of the branch and of the clone, and
+    the store's own columns."""
+    copies = names["copies"]
+    assert copies["branch_row_before_its_rows"] is True
+    assert copies["clone_leaves_out"] == copies["clone_takes_the_rest"] == 1
+    assert "message_uid" in names["columns"]["messages"]

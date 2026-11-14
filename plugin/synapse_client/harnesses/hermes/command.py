@@ -30,7 +30,9 @@ the same facts (sessions.from_keywords):
   command;
 - no ``source`` (a surface that runs the command in its own process: the classic CLI off
   the gateway, and the stand-alone TUI backend, which only test harnesses start): the
-  ``platform`` Hermes names must be a local one.
+  ``platform`` Hermes names must be a local one, and not "acp". An ACP session the
+  gateway does not run uploads nothing (sessions.py), so it has nothing to take off the
+  record; one the gateway runs comes with a ``source``.
 
 A session the store says someone else writes into is not looked up here: the provider
 uploads nothing from it whatever the marker says, and the toggle can only reach the one

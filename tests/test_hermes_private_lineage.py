@@ -729,19 +729,20 @@ def test_a_row_written_after_the_agent_was_built_is_read_at_the_first_upload(
 def test_a_row_that_names_no_session_is_read_again_before_the_next_upload(plugin, server, tmp_path):
     """A row that names no session settles nothing: it is read before every upload
     until it names one. No order of Hermes's calls is known that puts an upload before
-    the write above, and none is counted on: a flush that found no row leaves the
-    session to be read again, and it is off the record from the upload after its row
-    names a private one."""
+    the write above (test_hermes_checkout_names.py pins the order of a branch). An
+    upload that found no row sends what it was shown, as for any session nothing names
+    a parent of; the session is read again, and it is off the record from the upload
+    after its row names a private one."""
     home = tmp_path / "hermes-a"
     _store(home, _PARENT, source="tui", receipt=False, chat_id="")
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home, message_count=0)
     provider.on_pre_compress(_conversation(3))
-    assert server.asked() == [] and server.posts() == []
+    assert server.asked() == [] and len(server.posts()) == 1
     _store(home, _CHILD, source="tui", receipt=False, chat_id="")
     _link(home, _CHILD, _PARENT, _BRANCHED)
     _say(provider, _conversation(4), _CHILD)
-    assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
+    assert len(server.posts()) == 1 and (tmp_path / "private" / _CHILD).is_file()
     assert server.asked() == [_PARENT] and server.puts() == [f"/private-sessions/{_CHILD}"]
 
 

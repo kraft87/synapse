@@ -572,18 +572,6 @@ def test_a_resumed_session_looks_back_ten_turns(plugin, server, tmp_path):
     assert _users(second["records"]) == ["question 15", "question 16"]
 
 
-def test_a_new_session_sends_every_turn_it_saw_begin(plugin, server, tmp_path):
-    """No look-back in a session that is new here: when the uploads of its turns did not
-    run, more of them than LOOKBACK go up with the next one."""
-    provider = _start(_new(plugin), tmp_path / "hermes-a")
-    for n in range(1, 16):
-        before = f"question {n - 1}" if n > 1 else ""
-        provider.on_turn_start(n, f"question {n}", previous_message=before)
-    provider.sync_turn("q", "a", session_id=_SID, messages=_conversation(15))
-    (body,) = server.posts()
-    assert len(_users(body["records"])) == 15
-
-
 def test_a_failed_upload_waits_in_the_outbox_and_drains_after_a_success(plugin, server, tmp_path):
     home = tmp_path / "hermes-a"
     provider = _start(_new(plugin), home)
@@ -645,20 +633,6 @@ def test_compression_and_session_end_upload_what_is_left(plugin, server, tmp_pat
     first, second = server.posts()
     assert _users(first["records"]) == ["question 1", "question 2"]
     assert _users(second["records"]) == ["question 2", "question 3"]
-
-
-@pytest.mark.parametrize("flush", ["on_pre_compress", "on_session_end"])
-def test_a_new_session_uploads_nothing_before_its_first_turn_starts(
-    plugin, server, tmp_path, flush
-):
-    """Hermes said the session was new, and a flush finds turns in it before any turn
-    has started here: nothing says they are its own (an ACP fork's are copies, written
-    after its agent was built). The first turn start says whether any came before."""
-    provider = _start(_new(plugin), tmp_path / "hermes-a")
-    getattr(provider, flush)(_conversation(1))
-    assert server.posts() == []
-    _say(provider, _conversation(1))
-    assert [_users(body["records"]) for body in server.posts()] == [["question 1"]]
 
 
 def test_a_session_switch_rebinds(plugin, server, tmp_path):
@@ -866,7 +840,7 @@ def test_a_session_that_is_off_carries_nothing(plugin, server, tmp_path):
         ({"platform": "", "agent_context": ""}, "active"),
         ({"platform": "tui", "user_id": "kyle@example.net"}, "active"),
         ({"platform": "desktop", "agent_context": "primary"}, "active"),
-        ({"platform": "acp"}, "active"),
+        ({"platform": "acp"}, "inert"),  # no gateway identity: its forks name no parent
         ({"platform": "cron", "agent_context": "cron"}, "inert"),
         ({"platform": "cli", "agent_context": "cron"}, "inert"),
         ({"platform": "cli", "agent_context": "subagent"}, "inert"),
