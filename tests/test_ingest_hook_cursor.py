@@ -283,6 +283,212 @@ def test_ship_stop_mode_seeds_cursor_from_tail(hook, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A long session costs what it added: nothing before the cursor is read
+# ---------------------------------------------------------------------------
+
+
+def _append_jsonl(path: Path, recs: list[dict]) -> None:
+    with open(path, "ab") as f:
+        for r in recs:
+            f.write(json.dumps(r).encode() + b"\n")
+
+
+def _reads(hook, monkeypatch) -> list[int]:
+    """Record the byte each read of a transcript starts at."""
+    starts: list[int] = []
+    read = hook._read_offset_records
+
+    def recording(path, start=0):
+        starts.append(start)
+        return read(path, start)
+
+    monkeypatch.setattr(hook, "_read_offset_records", recording)
+    return starts
+
+
+def _posts(hook, monkeypatch) -> list[list[str]]:
+    posted: list[list[str]] = []
+    monkeypatch.setattr(
+        hook,
+        "_post_records",
+        lambda recs, source="hook": posted.append([r["uuid"] for r in recs]) or "ok",
+    )
+    return posted
+
+
+def test_reading_from_an_offset_is_the_whole_read_past_it(hook, tmp_path):
+    """Whatever byte the read starts at, it returns the records of the lines that start
+    at or after it, with the offsets a whole read gives them: on a line start, inside a
+    line (a file rewritten under its cursor), at the end and past it."""
+    path = tmp_path / "s.jsonl"
+    offsets = _write_jsonl(path, _turns3())
+    glued_at = path.stat().st_size
+    first = json.dumps(_u("lost"))
+    with open(path, "ab") as f:
+        # Two records on one line: not a record as a whole, though its second half is.
+        f.write((first + json.dumps(_u("glued")) + "\n").encode())
+        f.write(b"\nnot json\n" + json.dumps(_u("u4")).encode())  # no newline yet
+    whole, eof = hook._read_offset_records(str(path))
+    assert eof == path.stat().st_size and len(whole) == 7
+    inside = glued_at + len(first)  # where the line's second record begins
+    for start in [*offsets, offsets[2] + 1, offsets[5] - 1, glued_at, inside, eof - 3, eof]:
+        assert hook._read_offset_records(str(path), start) == (
+            [(o, r) for o, r in whole if o >= start],
+            eof,
+        )
+    assert hook._read_offset_records(str(path), eof + 50) == ([], eof)
+    assert hook._read_offset_records(str(path), 1)[0] == whole[1:]
+
+
+def test_reading_an_empty_file_from_an_offset_reads_nothing(hook, tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b"")
+    assert hook._read_offset_records(str(path), 0) == ([], 0)
+    assert hook._read_offset_records(str(path), 7) == ([], 0)
+
+
+def test_a_file_with_nothing_new_is_not_read(hook, tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    _write_jsonl(path, _turns3())
+    posted = _posts(hook, monkeypatch)
+    assert hook._ship(str(path), mode="catchup") == (1, 6)
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (0, 0)
+    assert hook._ship(str(path), mode="catchup") == (0, 0)
+    assert starts == [] and len(posted) == 1
+
+
+def test_a_file_with_a_cursor_is_read_from_the_cursor(hook, tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    offsets = _write_jsonl(path, _turns3())
+    posted = _posts(hook, monkeypatch)
+    hook._ship(str(path), mode="catchup")
+    _append_jsonl(path, [_u("u4"), _a("a4")])
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (1, 4)
+    assert starts == [offsets[4]]  # the start of the last turn sent, not byte 0
+    # That turn goes again (it may have grown), with the new one.
+    assert posted[1] == ["u3", "a3", "u4", "a4"]
+    ent = hook._load_state()[str(path)]
+    assert ent["size"] == path.stat().st_size and ent["offset"] > offsets[5]
+
+
+def test_a_backlog_resumed_partway_is_read_from_where_it_stopped(hook, tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    offsets = _write_jsonl(path, _turns3())
+    monkeypatch.setattr(hook, "TAIL_RECORDS", 2)  # one turn a request
+    calls = {"n": 0}
+
+    def one_then_die(recs, source="hook"):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("server unreachable")
+        return "ok"
+
+    monkeypatch.setattr(hook, "_post_records", one_then_die)
+    assert hook._ship(str(path), mode="catchup") == (1, 2)
+    ent = hook._load_state()[str(path)]
+    # The failure marks the entry and keeps what it held: the cursor and the ids.
+    assert ent["offset"] == offsets[2] and ent["pending"] and ent["sids"] == ["s1"]
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="catchup") == (2, 4)
+    assert starts == [offsets[2]]
+
+
+def test_the_cursor_entry_keeps_the_session_ids_the_file_holds(hook, tmp_path, monkeypatch):
+    """A resumed transcript carries records under an earlier session id. With the file
+    read from its cursor those records are no longer seen, so their ids are kept in the
+    entry: taking that session off the record still holds back the whole file."""
+    path = tmp_path / "now.jsonl"
+    earlier = [{**_u("u1"), "sessionId": "before"}, {**_a("a1"), "sessionId": "before"}]
+    current = [{**r, "sessionId": "now"} for r in (_u("u2"), _a("a2"), _u("u3"), _a("a3"))]
+    _write_jsonl(path, earlier + current)
+    posted = _posts(hook, monkeypatch)
+    private: set[str] = set()
+    monkeypatch.setattr(hook, "_is_private", lambda session_id: session_id in private)
+    assert hook._ship(str(path), mode="catchup") == (1, 6)
+    # The file's own id is its name and is checked first, so it is not kept.
+    assert hook._load_state()[str(path)]["sids"] == ["before"]
+
+    _append_jsonl(path, [{**_u("u4"), "sessionId": "now"}, {**_a("a4"), "sessionId": "now"}])
+    private.add("before")
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (0, 0)
+    assert starts and starts[0] > 0  # read from the cursor: no record seen says "before"
+    assert len(posted) == 1
+    log = (tmp_path / "hook.log").read_text(encoding="utf-8")
+    assert "PRIVATE skip stop now.jsonl (record sid)" in log
+
+    private.clear()
+    assert hook._ship(str(path), mode="stop") == (1, 4)
+    assert hook._load_state()[str(path)]["sids"] == ["before"]
+
+
+@pytest.mark.parametrize("sids", [None, "s1", [1, 2], {"s1": True}])
+def test_an_entry_with_no_ids_to_go_by_has_its_file_read_whole(hook, tmp_path, monkeypatch, sids):
+    """An entry written by a client from before the ids were kept (or holding anything
+    that is not a list of them) says nothing about the records before its cursor, so
+    they are read once more, and the entry written after that has the ids."""
+    path = tmp_path / "s.jsonl"
+    offsets = _write_jsonl(path, _turns3())
+    entry = {"offset": offsets[4], "size": -1, "ts": time.time()}
+    if sids is not None:
+        entry["sids"] = sids
+    hook._update_state(str(path), lambda state, now: state.__setitem__(str(path), entry))
+    posted = _posts(hook, monkeypatch)
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (1, 2)
+    assert starts == [0] and posted == [["u3", "a3"]]  # read whole, sent from the cursor
+    assert hook._load_state()[str(path)]["sids"] == ["s1"]
+
+    _append_jsonl(path, [_u("u4"), _a("a4")])
+    assert hook._ship(str(path), mode="stop") == (1, 4)
+    assert starts == [0, offsets[4]]
+
+
+def test_an_old_entry_still_holds_back_a_file_with_a_private_record(hook, tmp_path, monkeypatch):
+    """The whole read of an entry without ids is what finds the earlier session's."""
+    path = tmp_path / "now.jsonl"
+    recs = [{**_u("u1"), "sessionId": "before"}, {**_a("a1"), "sessionId": "before"}]
+    recs += [{**_u("u2"), "sessionId": "now"}, {**_a("a2"), "sessionId": "now"}]
+    offsets = _write_jsonl(path, recs)
+    entry = {"offset": offsets[2], "size": -1, "ts": time.time()}
+    hook._update_state(str(path), lambda state, now: state.__setitem__(str(path), entry))
+    posted = _posts(hook, monkeypatch)
+    monkeypatch.setattr(hook, "_is_private", lambda session_id: session_id == "before")
+    assert hook._ship(str(path), mode="stop") == (0, 0)
+    assert posted == []
+
+
+def test_a_file_with_more_ids_than_are_kept_is_read_whole_each_time(hook, tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    recs = [{**_u("u1"), "sessionId": "a"}, {**_a("a1"), "sessionId": "b"}, _u("u2"), _a("a2")]
+    _write_jsonl(path, recs)
+    monkeypatch.setattr(hook, "_SIDS_KEPT", 2)
+    _posts(hook, monkeypatch)
+    hook._ship(str(path), mode="catchup")
+    assert "sids" not in hook._load_state()[str(path)]  # a, b and s1: one too many
+    _append_jsonl(path, [_u("u3"), _a("a3")])
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (1, 4)
+    assert starts == [0]
+
+
+def test_a_rewritten_file_forgets_the_ids_of_the_old_one(hook, tmp_path, monkeypatch):
+    """A cursor past the end means another file under the same name: it is read whole
+    and the ids kept are the ones it holds now."""
+    path = tmp_path / "s.jsonl"
+    _write_jsonl(path, [{**r, "sessionId": "old"} for r in _turns3()])
+    _posts(hook, monkeypatch)
+    hook._ship(str(path), mode="catchup")
+    assert hook._load_state()[str(path)]["sids"] == ["old"]
+    _write_jsonl(path, _turns3()[:2])  # shorter than the cursor
+    starts = _reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="catchup") == (1, 2)
+    assert starts == [0] and hook._load_state()[str(path)]["sids"] == ["s1"]
+
+
+# ---------------------------------------------------------------------------
 # Catch-up candidate selection
 # ---------------------------------------------------------------------------
 

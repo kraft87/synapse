@@ -16,7 +16,6 @@ marker folder. Only exit 0 from `on` means "off the record" is true.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ PRIVATE_DIR = config.PRIVATE_DIR
 
 def _toggle(program: str) -> Toggle:
     # The marker folder the Stop hook reads (ingest_hook._private_settings).
-    settings = dataclasses.replace(config.SETTINGS, private_dir=Path(PRIVATE_DIR))
+    settings = config.SETTINGS.replace(private_dir=Path(PRIVATE_DIR))
     return Toggle(Client(settings, config.USER_AGENT), program=program)
 
 

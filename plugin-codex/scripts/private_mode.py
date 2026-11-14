@@ -16,7 +16,6 @@ script hands it Codex's server, credential and marker folder.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ PRIVATE_DIR = common.PRIVATE_DIR
 
 def _toggle() -> Toggle:
     # The marker folder the Stop hook reads.
-    settings = dataclasses.replace(common.SETTINGS, private_dir=Path(PRIVATE_DIR))
+    settings = common.SETTINGS.replace(private_dir=Path(PRIVATE_DIR))
     return Toggle(Client(settings, common.USER_AGENT), program="private_mode.py")
 
 

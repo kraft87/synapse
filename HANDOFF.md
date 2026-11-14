@@ -6,6 +6,58 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-13 — hooks: the shipper reads from its cursor, and the waiting hooks import less (plugin 0.24.12)
+
+**What changed** (the detail and the measurements are in the pull request)
+
+- **Claude Code's shipper reads from its cursor.** After every turn the detached
+  worker parsed the whole transcript to find the few records past its cursor. It now
+  looks at the size first (an unchanged file is not opened) and reads from the cursor
+  on. On a 32.6 MB transcript: about 0.4 s and 95 MB before, 10 to 20 ms and 20 MB
+  after.
+- **The private check is as strict as before.** A transcript is held back while any
+  session id its records carry is in private mode. The cursor entry now keeps those
+  ids (`sids`, in `ingest_cursors.json`), so the ones before the cursor still count.
+  An entry with no ids (from an older plugin, or after a failed first upload), a file
+  with more than 64 ids and a truncated file are read whole.
+- **The hooks a user waits for import less.** The six hooks that run at each prompt,
+  after each recall and after each turn loaded the request stack and `dataclasses`
+  without using them. They take about half the time now (each prompt: 130 ms before,
+  69 ms after, on cortex).
+- **For code that uses the core:** `Settings` is an immutable class written out by
+  hand. A changed copy is `settings.replace(...)`; `dataclasses.replace(settings, ...)`
+  no longer works. `config.SURFACE` is worked out at its first read, and Codex's
+  `common.SURFACE`, which had no reader, is gone.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.12. No setting to change and nothing to migrate: the
+   cursor file is read as it is, and each entry gains its ids at its next upload.
+2. Nothing on the server.
+
+**Proven**
+
+- Tests: `tests/test_ingest_hook_cursor.py` (the cursor read and the private check),
+  `tests/test_hook_imports.py` (runs the six hooks and fails when one loads the request
+  stack again), `tests/test_client_core_settings.py`. 42 single changes to the new
+  rules were tried, and the tests failed on each.
+- Measured on cortex on a real 32.6 MB transcript, and over 40 runs of each hook, old
+  and new taken in turn.
+
+**Still open**
+
+- **The flag hooks still load the settings.** What is left is `json`, `pathlib`, `typing`
+  and `hashlib` (the device token's fingerprint). A module that only reads flags would
+  bring the four hooks closer to a bare interpreter. Not done: it is about 20 ms a
+  prompt, for a parity test on every flag.
+- **A file rewritten in place without shrinking below its cursor.** The records before
+  the cursor are not read again, so a session id that only the new content holds there
+  is not seen. No record of a private session is sent either way: each batch is checked
+  where it leaves (`_post_records`). What is lost in that case is holding back the rest
+  of the file.
+- The two shippers are still two files; merging them comes later.
+- Not run on Windows or in a real Codex session.
+
 ## 2026-11-13 — session start: the board and the preferences are one request (plugin 0.24.11)
 
 **What changed** (the detail is in the pull request and `docs/client-harnesses.md`)

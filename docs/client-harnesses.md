@@ -91,6 +91,16 @@ server-only change leaves the version alone. The rules live in `scripts/release_
    put back on the record (`off --forget`) is back with all of them. A harness that
    gives a continuing conversation a new session id calls `Uploader.carry_private`, or
    the turns spoken off the record go up under the new id.
+8. **A hook the user waits for imports what it uses.** Every hook is a fresh python3, so
+   its imports are time at the prompt. The four hooks that run at each prompt or after
+   each recall only read flags, and the two Stop hooks only start a detached worker: none
+   of them loads the request stack (`urllib.request`, `http.client`, `ssl`, `socket`).
+   So `context.py` names `Client` and `Settings` under `TYPE_CHECKING`; `config.py`,
+   Codex's `common.py`, the two shippers and `synapse_ingest_retry.py` import what sends
+   a request inside the function that sends one; and `Settings` is an immutable class
+   written out by hand, because `dataclasses` cost more to import than the rest of the
+   settings together. `tests/test_hook_imports.py` runs the six hooks and fails when one
+   of those modules is loaded again.
 
 ## What an adapter provides
 

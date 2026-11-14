@@ -19,7 +19,6 @@ import os
 import re
 import types
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +150,25 @@ def _lookup(
     return default
 
 
-@dataclass(frozen=True)
+#: The fields of a ``Settings``, in the order ``repr`` shows them.
+_FIELDS = (
+    "home",
+    "base_url",
+    "ingest_url",
+    "token",
+    "token_note",
+    "device",
+    "enrolled",
+    "private_dir",
+    "device_origins",
+    "environ",
+    "config",
+    "extras",
+)
+#: The raw sources ``flag`` reads: left out of ``repr`` and of ``==``.
+_SOURCES = frozenset({"environ", "config", "extras"})
+
+
 class Settings:
     """Resolved settings for one Synapse client. Build it with ``Settings.load``.
 
@@ -162,20 +179,71 @@ class Settings:
     ``enrolled`` whether it names a surface.
     ``device_origins`` are where the device token may go (empty when unenrolled).
     The token and the raw sources are left out of ``repr``.
+
+    Immutable: assigning to a field raises AttributeError, and ``replace`` gives a
+    changed copy. Written out by hand, not as a dataclass: every hook loads this
+    module, the ones that run at each prompt included, and ``dataclasses`` costs them
+    more to import than everything else here.
     """
 
     home: Path
     base_url: str
     ingest_url: str
-    token: str = field(repr=False)
+    token: str
     token_note: Mapping[str, Any]
     device: Mapping[str, Any]
     enrolled: bool
     private_dir: Path
     device_origins: frozenset[tuple[str, str]]
-    environ: Mapping[str, str] = field(repr=False, compare=False)
-    config: Mapping[str, Any] = field(repr=False, compare=False)
-    extras: tuple[tuple[str, Mapping[str, str]], ...] = field(repr=False, compare=False)
+    environ: Mapping[str, str]
+    config: Mapping[str, Any]
+    extras: tuple[tuple[str, Mapping[str, str]], ...]
+
+    def __init__(
+        self,
+        *,
+        home: Path,
+        base_url: str,
+        ingest_url: str,
+        token: str,
+        token_note: Mapping[str, Any],
+        device: Mapping[str, Any],
+        enrolled: bool,
+        private_dir: Path,
+        device_origins: frozenset[tuple[str, str]],
+        environ: Mapping[str, str],
+        config: Mapping[str, Any],
+        extras: tuple[tuple[str, Mapping[str, str]], ...],
+    ) -> None:
+        values = locals()
+        for name in _FIELDS:
+            object.__setattr__(self, name, values[name])
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"cannot assign to field {name!r}: Settings is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"cannot delete field {name!r}: Settings is immutable")
+
+    def __repr__(self) -> str:
+        shown = ", ".join(
+            f"{name}={getattr(self, name)!r}"
+            for name in _FIELDS
+            if name != "token" and name not in _SOURCES
+        )
+        return f"Settings({shown})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Settings):
+            return NotImplemented
+        return all(
+            getattr(self, name) == getattr(other, name) for name in _FIELDS if name not in _SOURCES
+        )
+
+    def replace(self, **changes: Any) -> Settings:
+        """This value with the named fields changed. A name that is not a field is a
+        TypeError."""
+        return Settings(**{**{name: getattr(self, name) for name in _FIELDS}, **changes})
 
     @property
     def config_file(self) -> Path:
@@ -202,8 +270,7 @@ class Settings:
         For an adapter whose sources change after it loaded: a hook's kill switches
         follow the live environment, and a CLI that writes config.json reads its own
         write back from the copy it holds."""
-        return replace(
-            self,
+        return self.replace(
             environ=self.environ if environ is None else _frozen(_snapshot(environ)),
             config=self.config if config is None else _frozen(config),
             extras=(

@@ -29,14 +29,9 @@ so it can't shadow an installed package (see synapse_filelock.py).
 
 from __future__ import annotations
 
-import http
-import http.client
 import json
 import os
-import socket
-import ssl
 import time
-import urllib.error
 from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
@@ -231,6 +226,14 @@ def short_reason(e: BaseException) -> str:
     Built from the exception type and the HTTP status code only. Message text from the
     server or the library is never used, since it can echo URLs, headers or response
     bodies."""
+    # Imported here: only a failed upload needs them, and the hook that runs after
+    # every turn loads this module just to start its detached worker.
+    import http
+    import http.client
+    import socket
+    import ssl
+    import urllib.error
+
     if isinstance(e, urllib.error.HTTPError):
         try:
             return f"HTTP {e.code} {http.HTTPStatus(e.code).phrase}"

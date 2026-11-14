@@ -33,13 +33,10 @@ optional):
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
-import socket
 import sys
-import urllib.request
 from pathlib import Path
 
 
@@ -48,12 +45,14 @@ def _load_home():
     too (tests, plugin-codex), so this directory need not be on sys.path."""
     mod = sys.modules.get("synapse_home")
     if mod is None:
-        spec = importlib.util.spec_from_file_location(
-            "synapse_home", Path(__file__).resolve().with_name("synapse_home.py")
-        )
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["synapse_home"] = mod
-        spec.loader.exec_module(mod)
+        # This directory leads sys.path for the one import. importlib.util would load
+        # the file by path, and brings threading with it into every hook.
+        here = str(Path(__file__).resolve().parent)
+        sys.path.insert(0, here)
+        try:
+            import synapse_home as mod
+        finally:
+            sys.path.remove(here)
     return mod
 
 
@@ -64,8 +63,11 @@ synapse_home = _load_home()
 # one this plugin ships. Every setting below resolves on it.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from synapse_client import __version__, context, credentials  # noqa: E402
-from synapse_client.http import Transport  # noqa: E402
 from synapse_client.settings import Settings  # noqa: E402
+
+# What sends a request (urllib, http, ssl, socket) is imported where one is sent, not
+# here: every hook imports this module, and the ones that run at each prompt only read
+# flags.
 
 
 def _force_utf8_stdio() -> None:
@@ -474,7 +476,17 @@ CONFIG_PATHS = [g for g in re.split(r"[,\s]+", _cfg("SYNAPSE_CONFIG_PATHS", ""))
 # it identifies nothing and grants nothing. The config lane still keys mirrored files on
 # it (those are per-machine files, not a trust boundary). Serving trust comes from the
 # device token; a hostname is no longer accepted as evidence of anything.
-SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
+# Resolved when first read (__getattr__ below): the hostname needs the socket module.
+
+
+def __getattr__(name: str):
+    if name == "SURFACE":
+        import socket
+
+        value = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # What this machine is, as `synapse login` asked it (or a pre-0.20 install prompt did):
@@ -512,7 +524,7 @@ USER_AGENT = f"synapse-client/{__version__} claude-code"
 _UA = USER_AGENT
 
 
-def _urlopen(req: urllib.request.Request, timeout: float):
+def _urlopen(req, timeout: float):
     """Open ``req`` through the client core (synapse_client.http.urlopen), whose redirect
     handler keeps the bearer off a redirect to another origin; urllib's stock one copies
     it wherever the server points. For the scripts that still build their own request
@@ -523,11 +535,13 @@ def _urlopen(req: urllib.request.Request, timeout: float):
     return urlopen(req, timeout=timeout)
 
 
-def _transport() -> Transport:
+def _transport():
     # Built per request from this module's names, so a caller that repoints them (enroll
     # sends without a bearer; a test points BASE_URL at its server) is obeyed. The bearer
     # goes to the origins this machine's URLs name, BASE_URL's, INGEST_URL's and
     # MCP_URL's, and nowhere else, redirects included.
+    from synapse_client.http import Transport
+
     return Transport(BASE_URL, INGEST_TOKEN, USER_AGENT, token_origins=(INGEST_URL, MCP_URL))
 
 
