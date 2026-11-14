@@ -33,17 +33,11 @@ two, and everything that is still open.
 
 **Proven**
 
-- `tests/test_codex_ingest_retry.py`: a later turn is posted with its `turn_context`,
-  and the server's parser gives its episode the model and cwd; injected instructions,
-  the environment block, the world state and reasoning before a user message do not
-  make a tail the middle of a turn; a tail that starts with the rest of a turn posts the
-  whole rollout, with or without a later turn in it, and the parser then holds the turn
-  in full; a tail of events alone is posted as read.
-- `tests/test_client_server_rule_parity.py`: the hook's list of what is a turn's content
-  is the server parser's list of items without the messages, and for each kind of record
-  the hook and the parser agree on whether it joins the turn a user message opened.
-- Each of the hook's new rules was taken out in turn (7 changes); the tests failed every
-  time.
+- Tests: `tests/test_codex_ingest_retry.py` (a later turn is posted with its
+  `turn_context`, and the server's parser gives its episode the model and cwd) and
+  `tests/test_client_server_rule_parity.py` (the hook and the server's parser agree on
+  what belongs to a turn). Each of the hook's new rules was taken out in turn (7
+  changes); the tests failed every time.
 
 **Still open**
 
