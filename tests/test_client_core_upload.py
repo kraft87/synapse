@@ -469,10 +469,10 @@ def test_after_a_batch_that_is_lost_the_rest_are_not_requested_either(tmp_path):
     assert [sent.count(f"a{n}") for n in (1, 20, 21)] == [1, 2, 1]  # 20: context too
 
 
-def test_the_turn_that_has_just_ended_goes_up_after_time_off_the_record(tmp_path):
-    """``lookback`` 0 leaves out every turn from before. A turn seen to begin once the
-    session is back on the record (``begin``) is not one of them, and the turn before
-    it, spoken off the record, does not go along as its context."""
+def test_the_turn_that_has_just_ended_goes_up_in_a_session_that_holds_copies(tmp_path):
+    """``lookback`` 0 leaves out every turn from before: they are copies. A turn seen
+    to begin here (``begin``) is not one of them, and the turn before it, a copy, does
+    not go along as its context."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + _turn(3)
     turns.begin("s-1")
@@ -498,7 +498,7 @@ def test_a_turn_from_before_is_not_taken_for_the_one_that_has_just_ended(tmp_pat
     assert turns.upload(done, "s-1", timeout=5, finished=True) is True
     sent = [r["id"] for r in wire.posts[0]["body"]["records"] if r["role"] == "user"]
     # What the first upload left out stays out, as a turn and as a context: also the
-    # turn cut short, which was not seen to begin on the record.
+    # turn cut short, which was not seen to begin.
     assert sent == (["u5"] if finished else ["u4", "u5"])
 
 
@@ -795,6 +795,30 @@ def test_settled_is_not_called_before_the_server_has_the_row(tmp_path):
     assert up.settle_private("s-new") is True and done == [True]
 
 
+@pytest.mark.parametrize("known", ["marker", "row"])
+def test_settled_is_not_called_for_a_session_whose_marker_could_not_be_written(
+    tmp_path, monkeypatch, known
+):
+    """The caller's note says the session need not be asked about again. With no
+    marker, the uploader that made it private is all that keeps its turns on this
+    machine: the next one finds the note, asks nothing and sends them."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    done: list[bool] = []
+    if known == "marker":
+        _mark(tmp_path, "s-old")
+    else:
+        wire.rows.add("s-old")
+    _no_marker_written(monkeypatch)
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is (known == "marker")
+    assert up.settle_private("s-new") is True and up.is_private("s-new")
+    assert wire.requests[-1] == _put("s-new")  # the server has its row
+    assert done == [] and not (tmp_path / "private" / "s-new").exists()
+    # Nor at a later carry, or a later settle.
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is True
+    assert up.settle_private("s-new") is True and done == []
+
+
 def test_a_settled_that_raises_changes_nothing(tmp_path):
     client, _ = _client(tmp_path)
     up = upload.Uploader(client)
@@ -945,17 +969,20 @@ def test_a_turn_goes_up_at_the_upload_the_server_says_on_the_record_at(tmp_path)
     assert wire.requests == [_get("s-old")] and wire.sessions() == ["s-new"]
 
 
-def test_a_session_the_server_then_calls_private_is_not_looked_back_at(tmp_path):
-    """As after a switch that knew: what was said off the record is not looked back at
-    once the session can be uploaded again (`private off --forget`)."""
+def test_a_session_the_server_then_calls_private_is_back_whole_once_put_back(tmp_path):
+    """Private mode covers the whole session: nothing is noted of the turns spoken while
+    it was private, and `private off --forget` puts all of it back on the record."""
     turns, wire = _turns(tmp_path, lookback=10)
     wire.rows.add("s-old")
     assert turns.uploader.carry_private(["s-old"], "s-new") is False
     assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5) is False
     assert wire.tries == 0 and (tmp_path / "private" / "s-new").is_file()
-    (tmp_path / "private" / "s-new").unlink()
     assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5) is False
     assert wire.tries == 0
+    (tmp_path / "private" / "s-new").unlink()  # `private off --forget`
+    wire.rows.discard("s-new")
+    assert turns.upload(_turn(1) + _turn(2), "s-new", timeout=5) is True
+    assert [post["body"]["records"] for post in wire.posts] == [_turn(1) + _turn(2)]
 
 
 def test_turns_finished_while_the_server_did_not_answer_are_sent_when_it_does(tmp_path):
@@ -995,7 +1022,12 @@ def test_turns_the_conversation_drops_while_the_server_does_not_answer_still_go_
     assert turns.upload(_turn(4) + _turn(5), "s-new", timeout=5) is False and wire.tries == 1
 
 
-def test_turns_kept_for_a_session_the_server_then_calls_private_are_dropped(tmp_path):
+def test_turns_kept_for_a_session_the_server_then_calls_private_go_up_once_it_is_put_back(
+    tmp_path,
+):
+    """Private mode covers the whole session: while it is private the turns kept for the
+    server's answer stay where they are, and `private off --forget` puts them back on
+    the record with the rest, also one the conversation has dropped since."""
     turns, wire = _turns(tmp_path)
     wire.rows.add("s-old")
     assert turns.uploader.carry_private(["s-old"], "s-new") is False
@@ -1007,9 +1039,8 @@ def test_turns_kept_for_a_session_the_server_then_calls_private_are_dropped(tmp_
     (tmp_path / "private" / "s-new").unlink()  # `private off --forget`
     wire.rows.discard("s-new")
     said = _turn(2) + _turn(3) + _turn(4)
-    turns.begin("s-new")
     assert turns.upload(said, "s-new", timeout=5, finished=True) is True
-    assert [post["body"]["records"] for post in wire.posts] == [_turn(4)]
+    assert [post["body"]["records"] for post in wire.posts] == [_turn(1) + said]
 
 
 def test_only_so_many_turns_are_kept_for_an_answer(tmp_path, monkeypatch):
@@ -1092,6 +1123,31 @@ def test_a_server_that_cannot_be_told_is_told_again_at_the_next_turn(tmp_path):
     assert len(warned) == 3 and lines == []
 
 
+@pytest.mark.parametrize("found", ["at the carry", "at the answer"])
+def test_a_session_the_server_was_never_told_of_makes_the_next_one_private(tmp_path, found):
+    """Its marker is gone (`private off`, its twelve hours) and the server could not
+    be told: this uploader's hold is all that says the session is private. A session
+    that goes on from it is private by that hold, where a server asked for a row would
+    say it has none."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    if found == "at the answer":
+        assert up.carry_private(["s-2"], "s-3") is False  # asked at its next upload
+    _mark(tmp_path, "s-1")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-1"], "s-2") is True
+    wire.fail_private = None
+    for gone in ("s-1", "s-2"):
+        (tmp_path / "private" / gone).unlink()
+    if found == "at the carry":
+        assert up.carry_private(["s-2"], "s-3") is True
+    else:
+        assert up.settle("s-3") == upload.PRIVATE
+    assert (tmp_path / "private" / "s-3").is_file() and wire.rows == {"s-2", "s-3"}
+    # Told of both, and asked about neither.
+    assert wire.requests[1:] == [_put("s-3"), _put("s-2")]
+
+
 def _no_marker_written(monkeypatch) -> None:
     def refuse(settings: Any, session_id: str) -> Path:
         raise PermissionError(13, "read-only", session_id)
@@ -1145,25 +1201,6 @@ def test_a_held_session_is_carried_on_to_the_next(tmp_path, monkeypatch):
     ]
 
 
-def test_private_here_is_what_this_machine_knows_and_not_an_open_question(tmp_path, monkeypatch):
-    """A marker says a session is private, and so does the uploader for one it holds as
-    private with no marker. One that only waits for the server's answer is refused
-    meanwhile but not known to be private; its own marker still says it is."""
-    client, _ = _client(tmp_path)
-    up = upload.Uploader(client)
-    _mark(tmp_path, "s-marked")
-    assert up.private_here("s-marked") and not up.private_here("s-on")
-    assert up.carry_private(["s-gone"], "s-asking") is False  # the server is to be asked
-    assert up.asking("s-asking") and up.is_private("s-asking")
-    assert not up.private_here("s-asking")
-    marker = _mark(tmp_path, "s-asking")  # `synapse private on`, for the session itself
-    assert up.private_here("s-asking")
-    marker.unlink()
-    _no_marker_written(monkeypatch)
-    assert up.carry_private(["s-marked"], "s-held") is True
-    assert up.private_here("s-held") and not (tmp_path / "private" / "s-held").exists()
-
-
 def test_a_session_id_no_marker_can_be_named_by_is_held(tmp_path):
     client, wire = _client(tmp_path)
     up = upload.Uploader(client)
@@ -1199,10 +1236,23 @@ def test_settle_says_where_a_session_stands(tmp_path):
     wire.fail_private = urllib.error.URLError("down")
     assert up.settle("s-new") == upload.WAITING
     wire.fail_private = None
-    assert up.settle("s-new") == upload.TAKEN  # the answer made it private, in this call
+    assert up.settle("s-new") == upload.PRIVATE  # the answer made it private
     assert up.settle("s-new") == upload.PRIVATE  # and private it is from then on
     assert up.settle("s-next") == upload.OPEN  # the session it continues is on the record
     assert not up.is_private("s-next")
+
+
+def test_a_session_with_nothing_open_costs_no_request_while_another_is_owed(tmp_path):
+    """The server is told about a session it is still to be told about when that
+    session has a turn, and after a delivered upload (``settle_owed``): not at every
+    upload of every other session."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    _mark(tmp_path, "s-old")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-old"], "s-new") is True
+    asked = len(wire.requests)
+    assert up.settle("s-plain") == upload.OPEN and len(wire.requests) == asked
 
 
 @pytest.mark.parametrize("known", ["marker", "row"])
@@ -1218,7 +1268,7 @@ def test_a_session_is_made_private_by_the_one_it_continues_only_once(tmp_path, k
     else:
         wire.rows.add("s-old")
         assert up.carry_private(["s-old"], "s-new") is False
-        assert up.settle("s-new") == upload.TAKEN
+        assert up.settle("s-new") == upload.PRIVATE
     asked = list(wire.requests)
     # Still private: carried again it says so, and nothing is written or asked.
     assert up.carry_private(["s-old"], "s-new") is True and wire.requests == asked

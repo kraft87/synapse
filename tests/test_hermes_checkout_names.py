@@ -275,8 +275,8 @@ def test_this_hermes_names_the_session_where_the_provider_reads_it(names: dict[s
 def test_this_hermes_says_when_a_turn_starts_the_way_the_provider_reads_it(
     names: dict[str, Any],
 ) -> None:
-    """A session that holds turns from before uploads a turn only when the provider saw
-    it begin on the record (``on_turn_start``, turn_upload.TurnUploader.begin). That
+    """A session that holds copies of another's turns uploads a turn only when the
+    provider saw it begin (``on_turn_start``, turn_upload.TurnUploader.begin). That
     reads three things off Hermes. The hook comes after the turn-start compaction: a
     switch the compaction makes has moved the provider by then, so the turn is counted
     under the id it runs in. It comes before the turn's ``prefetch``. And it carries the
