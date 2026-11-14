@@ -365,11 +365,15 @@ server's row, and answers ON only when the server has confirmed the row. What wa
 uploaded before stays stored. There is no `/private off`: to go back on the record,
 start a new session. It works where Hermes runs your own sessions (the CLI, the TUI,
 Desktop, an editor over ACP). In a chat-platform session it refuses and changes
-nothing, because anyone in the chat could type it. Hermes loads a memory provider with
-the first agent it builds: in a gateway started just now, Hermes says `/private` is
-unknown until you have sent the first message of the first session, and that message
-is uploaded. After `synapse update`, restart Hermes (`hermes gateway stop`) to get the
-command.
+nothing, because anyone in the chat could type it. When the server does not confirm
+the row, the reply says FAILED and why; type `/private on` again.
+One limit comes from Hermes. It loads a memory provider with the first agent it
+builds: in a gateway started just now, Hermes says `/private` is an unknown command
+until you have sent the first message of the first session, and that message is
+uploaded. A gateway that `hermes chat` started itself exits after ten idle minutes
+(`gateway.unmanaged_idle_exit_seconds`), so this is the first session after a break.
+There, send a first message that may be stored, then `/private on`. After `synapse
+update`, restart Hermes (`hermes gateway stop`) to get the command.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, skills and config sync, and importing past Hermes

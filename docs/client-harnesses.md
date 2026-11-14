@@ -371,12 +371,19 @@ a session that has had no turn yet. A surface that runs the command in its own p
 its own platform name.
 
 Two limits come from Hermes. Its plugin discovery skips an `exclusive` plugin, and a
-memory provider is loaded as the first agent of the process is built: in a gateway
-started just now, Hermes answers that `/private` is unknown until the first message of
-the first session has been sent, and that message is uploaded. And the stand-alone TUI
-backend (`python -m tui_gateway.entry`, which only test harnesses start) takes the
-gateway's lock for its home, so the provider takes its agents for the daemon's side
-tasks and uploads nothing there; the command still answers.
+memory provider is loaded as the first agent of the process is built. The gateway's
+`commands.catalog`, which the classic CLI reads before it sends a plugin command (and
+reads again when a typed name is not in it), lists `private` from then on, not before.
+So in a gateway started just now, Hermes answers that `/private` is unknown until the
+first message of the first session has been sent, and that message is uploaded. A
+gateway a client started exits after `gateway.unmanaged_idle_exit_seconds` (600) with
+nothing to do, so this is the first session after a break. A stand-alone plugin that
+registers the command would be loaded at discovery; there is none yet. And the
+stand-alone TUI backend (`python -m tui_gateway.entry`) takes the gateway's lock for
+its home, so the provider takes its agents for the daemon's side tasks and uploads
+nothing there; the command still answers. At bca51750 no product code starts that
+backend (its own docstring says so, and a search of the checkout agrees): the TUI and
+Desktop attach to the gateway.
 
 **What is uploaded.** Hermes passes the whole conversation on every turn, as live message
 dicts, after scrubbing secrets from them. The normaliser keeps only `role`, the text

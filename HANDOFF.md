@@ -37,23 +37,30 @@ two, and everything that is still open.
 - In real Hermes bca51750 with the real plugin and a local fake server, in both plugin
   isolation modes: `/private on` through `slash.exec` (what the CLI, the TUI and
   Desktop send), through `command.dispatch`, and typed in an ACP editor session. Each
-  made one `PUT` and one `GET`, the turns after it made no upload, and a second
-  session made private before its first turn uploaded nothing.
-  `tests/test_hermes_integration.py` runs the command through Hermes's own dispatch;
+  made one `PUT` and one `GET`, and the turns after it made no upload. A second session
+  made private before its first turn uploaded nothing. The gateway's `commands.catalog`,
+  which the CLI reads first, lists `private` after the first turn.
+- With the server answering 500, the reply says FAILED and that the session is not off
+  the record; with a server that takes 8 seconds for a request, the reply comes after 16.
+- `tests/test_hermes_integration.py` runs the command through Hermes's own dispatch;
   CI has no Hermes checkout, so those cases ran on cortex only.
 
 **Open**
 
-- In a gateway started just now, Hermes does not know `/private` until the first
-  message of the first session has been sent, and that message is uploaded. Hermes
-  loads a memory provider with the first agent it builds, and its plugin discovery
-  skips a memory provider. A second, stand-alone plugin for the command alone would
-  close this; it is not built.
+- **`/private` is unknown in a gateway started just now, until the first message of
+  the first session has been sent. That message is uploaded.** Hermes loads a memory
+  provider with the first agent it builds, and its plugin discovery skips a memory
+  provider. A gateway that `hermes chat` started exits after ten idle minutes, so this
+  is the first session after a break. Hermes says the command is unknown; nothing says
+  ON. A second, stand-alone plugin for the command alone would close this. It is not
+  built: it adds a second plugin folder and an entry in Hermes's enabled-plugins list.
+- Not run: a real `hermes chat` or TUI client (the runs sent their requests to a real
+  gateway), `gateway.managed_workers`, and the classic CLI's own-process fallback off
+  the gateway.
 - The stand-alone TUI backend (`python -m tui_gateway.entry`) takes the gateway's lock,
-  so the provider uploads nothing from it. Hermes's own source says only test harnesses
-  start it; the TUI itself attaches to the gateway. Read at upstream head d3d4ee4c too,
-  not run there.
-- Read, not run: the classic CLI's own-process fallback (off the gateway).
+  so the provider uploads nothing from it. At bca51750 no product code starts it: the
+  TUI and Desktop attach to the gateway. The backend takes the same lock at upstream
+  head d3d4ee4c (read, not run).
 
 ## 2026-11-14 — hermes: a turn's upload runs after `sync_turn` has returned (plugin 0.24.14)
 
