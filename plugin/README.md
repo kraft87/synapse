@@ -287,8 +287,7 @@ already open stays without it. After `synapse update`, run `hermes gateway stop`
 the gateway loads the new code (the next `hermes` starts it again).
 
 On Windows, Hermes names the owner by the account's SID. Synapse reads the same SID,
-and a Windows test checks it against Hermes's own identity code. A full chat has not
-been run on Windows yet.
+and a Windows test checks it against Hermes's own identity code.
 
 **What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
 ACP editor): the board and your preferences in the system prompt at session start, the
