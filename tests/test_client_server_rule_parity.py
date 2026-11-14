@@ -341,6 +341,45 @@ def test_codex_hook_and_server_agree_on_turn_starts(codex_hook, rec, starts):
     assert codex_hook._is_user_boundary(copy.deepcopy(rec)) is starts
 
 
+def _server_reads_into_the_turn(rec: dict[str, Any]) -> bool:
+    """The server's answer: sent right after a user message, does ``rec`` become part of
+    that message's episode? An episode's span id names the last item read into it."""
+    rec = copy.deepcopy(rec)
+    if isinstance(rec.get("payload"), dict):
+        rec["payload"]["id"] = "item-case"
+    opened = _message("user", [_input("the question")])
+    opened["payload"]["id"] = "item-open"
+    episodes = CodexRolloutParser().parse_records([opened, rec], "parity", session_id_hint="s")
+    return len(episodes) == 1 and episodes[0].span_id == "codex:item-case"
+
+
+def test_codex_hook_names_the_items_the_server_reads_into_a_turn(codex_hook):
+    """The hook reships a rollout whole when a tail starts with a turn's content. What
+    counts as content is the server's list of items, without the messages."""
+    assert set(codex_hook._CONTENT_TYPES) == set(codex_client._ITEM_TYPES) - {"message"}
+
+
+@pytest.mark.parametrize(
+    ("rec", "content"),
+    [
+        pytest.param(_message("assistant", [_output("an answer")]), True, id="assistant"),
+        pytest.param(_message("developer", [_input("instructions")]), False, id="developer"),
+        pytest.param(_message("user", [_input("a question")]), False, id="user"),
+        pytest.param(_item({"type": "reasoning", "summary": []}), False, id="reasoning"),
+        pytest.param(_item({"type": "task_complete"}, "event_msg"), False, id="event"),
+        pytest.param(_item({"cwd": "/work", "model": "m"}, "turn_context"), False, id="context"),
+        pytest.param(_item(None), False, id="payload-null"),
+        *(
+            pytest.param(_item({"type": kind, "call_id": "c"}), True, id=kind)
+            for kind in sorted(set(codex_client._ITEM_TYPES) - {"message"})
+        ),
+    ],
+)
+def test_codex_hook_and_server_agree_on_what_follows_a_user_message(codex_hook, rec, content):
+    assert _server_reads_into_the_turn(rec) is content
+    assert codex_hook._is_turn_content(copy.deepcopy(rec)) is content
+
+
 # ---------------------------------------------------------------------------
 # Hermes: the memory-context block both sides strip from user text
 # ---------------------------------------------------------------------------

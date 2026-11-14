@@ -287,6 +287,37 @@ def test_flags_rank_env_then_config_json_then_the_options_and_read_live(scratch,
     assert config.machine_role() == "personal"
 
 
+@pytest.mark.parametrize(("hostname", "name"), [("box-7", "box-7"), ("", "default")])
+def test_the_machine_name_is_the_hostname_resolved_when_first_read(
+    scratch, monkeypatch, hostname, name
+):
+    """SURFACE is worked out at its first read, not at import: the hostname needs the
+    socket module, which a hook that reads flags has no other use for."""
+    import socket
+
+    asked = []
+    monkeypatch.setattr(socket, "gethostname", lambda: asked.append(1) or hostname)
+    config = load_script("config")
+    assert asked == [] and "SURFACE" not in vars(config)
+    assert config.SURFACE == name
+    assert config.SURFACE == name and asked == [1]  # kept: asked for once
+
+
+def test_a_set_machine_name_asks_for_no_hostname(scratch, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: pytest.fail("asked for the hostname"))
+    monkeypatch.setenv("SYNAPSE_SURFACE", "named")
+    assert load_script("config").SURFACE == "named"
+
+
+def test_config_has_no_other_name_it_makes_up(scratch):
+    config = load_script("config")
+    assert not hasattr(config, "SURFACES")
+    with pytest.raises(AttributeError, match="SURFACES"):
+        getattr(config, "SURFACES")  # noqa: B009
+
+
 # The token rules: (env, config.json, settings.json) -> (token sent, note, notice).
 _NOTICE_ENV_SHELL = (
     "[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "

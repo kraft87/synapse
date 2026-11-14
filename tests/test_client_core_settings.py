@@ -260,6 +260,63 @@ def test_settings_are_frozen_and_hide_the_token(tmp_path):
         s.environ["SYNAPSE_URL"] = "x"  # type: ignore[index]
 
 
+def test_a_field_cannot_be_deleted_either(tmp_path):
+    s = Settings.load(env={}, home=tmp_path / "h")
+    with pytest.raises(AttributeError):
+        del s.base_url
+    assert s.base_url == ""
+
+
+def test_repr_names_the_resolved_fields_and_none_of_the_sources(tmp_path):
+    """The token is left out, and so are the raw sources it could be read back from."""
+    home = tmp_path / "h"
+    _write_config(home, {"url": "https://s.example", "token": _TOKEN, "role": "cfgROLE"})
+    extras = [("plugin_config", {"SYNAPSE_SKILLS_SYNC": "extraVALUE"})]
+    s = Settings.load(env={"SYNAPSE_SURFACE": "envVALUE"}, home=home, extra_candidates=extras)
+    text = repr(s)
+    assert text.startswith("Settings(home=") and text.endswith(")")
+    assert "base_url='https://s.example'" in text and "enrolled=False" in text
+    for hidden in (_TOKEN, "envVALUE", "cfgROLE", "extraVALUE", "token=", "environ="):
+        assert hidden not in text
+
+
+def test_replace_gives_a_changed_copy(tmp_path):
+    home = tmp_path / "h"
+    _write_config(home, {"url": "https://s.example", "token": _TOKEN})
+    s = Settings.load(env={"SYNAPSE_RECALL_NUDGE": "0"}, home=home)
+    moved = s.replace(private_dir=tmp_path / "elsewhere", base_url="https://other.example")
+    assert (moved.private_dir, moved.base_url) == (tmp_path / "elsewhere", "https://other.example")
+    assert (s.private_dir, s.base_url) != (moved.private_dir, moved.base_url)
+    # everything not named is carried over, the sources included
+    assert (moved.token, moved.home, moved.ingest_url) == (s.token, s.home, s.ingest_url)
+    assert moved.flag("SYNAPSE_RECALL_NUDGE") == "0" and moved.flag("SYNAPSE_URL") == s.flag(
+        "SYNAPSE_URL"
+    )
+    assert s.replace() == s and s.replace() is not s
+    with pytest.raises(AttributeError):
+        moved.base_url = "x"  # type: ignore[misc]
+
+
+def test_replace_refuses_a_name_that_is_not_a_field(tmp_path):
+    s = Settings.load(env={}, home=tmp_path / "h")
+    with pytest.raises(TypeError):
+        s.replace(private_directory=tmp_path)
+
+
+def test_settings_compare_by_what_was_resolved_not_by_the_sources(tmp_path):
+    home = tmp_path / "h"
+    _write_config(home, {"url": "https://s.example"})
+    a = Settings.load(env={}, home=home)
+    assert a == Settings.load(env={}, home=home)
+    # a flag only the sources hold does not make two values differ
+    assert a == Settings.load(env={"SYNAPSE_RECALL_NUDGE": "0"}, home=home)
+    assert a != Settings.load(env={"SYNAPSE_URL": "https://other.example"}, home=home)
+    assert a != a.replace(enrolled=True)
+    assert a != "https://s.example"
+    with pytest.raises(TypeError):
+        hash(a)
+
+
 def test_two_homes_load_side_by_side(tmp_path):
     """Nothing is cached at module level: one process can hold two settings."""
     a, b = tmp_path / "a", tmp_path / "b"

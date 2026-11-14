@@ -20,7 +20,11 @@ Cursor semantics:
     the last turn may still be mid-flight at Stop time, so it is re-shipped on
     the next run and lands as a span_id no-op once complete;
   * size   = file EOF at the last FULLY successful run; when the current EOF
-    matches, there is nothing new and the file is skipped without a POST;
+    matches, there is nothing new and the file is skipped without being opened;
+  * sids   = the session ids the file's records carry, as far as it was read.
+    A file with a cursor is read from the cursor on, not from its start, so
+    the ids before it are kept here: a record whose id is in private mode
+    holds back the whole file, wherever in it the record is;
   * a cursor pointing past EOF means the transcript was truncated/rewritten —
     reset to 0 and re-ship (the server skips every already-stored turn).
 
@@ -87,14 +91,13 @@ Env (all optional):
 
 from __future__ import annotations
 
-import dataclasses
 import glob
 import json
 import os
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -108,7 +111,9 @@ from synapse_filelock import lock_exclusive
 # The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from synapse_client import private
-from synapse_client.http import Transport
+
+# What sends a request is imported where one is sent (_post_records): the process Claude
+# Code waits for only starts the detached worker.
 
 
 def _env_number(name: str, default: str, kind: type = float) -> Any:
@@ -130,6 +135,7 @@ ACTIVE_GRACE = _env_number("SYNAPSE_INGEST_ACTIVE_GRACE", "300")
 CATCHUP_MAX_FILES = _env_number("SYNAPSE_INGEST_CATCHUP_MAX", "20", int)
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
+_SIDS_KEPT = 64  # session ids kept in a cursor entry; a file with more is read whole each run
 _HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
 _WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
 _WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
@@ -195,15 +201,24 @@ def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
-    """Read a transcript as [(byte_offset, record), ...] plus the EOF offset.
+def _read_offset_records(path: str, start: int = 0) -> tuple[list[tuple[int, dict[str, Any]]], int]:
+    """Read a transcript from byte `start` as [(byte_offset, record), ...] plus the
+    EOF offset. Nothing before `start` is read, so a long session costs what it added.
 
-    Offsets are line starts, so any offset this returns is a valid cursor.
+    Offsets are line starts, so any offset this returns is a valid cursor. A `start`
+    inside a line (the file was rewritten under its cursor) begins at the next line, and
+    one past the end reads nothing: the records a whole read keeps when it drops every
+    line that starts before `start`, and the same EOF.
     Unparseable/blank lines are skipped (their bytes still count toward EOF).
     """
     out: list[tuple[int, dict[str, Any]]] = []
     eof = 0
     with open(path, "rb") as f:
+        if start > 0:
+            # One byte back: at a line start that byte is a newline. Never past the end.
+            f.seek(max(0, min(start, f.seek(0, os.SEEK_END)) - 1))
+            if f.read(1) != b"\n":
+                f.readline()
         while True:
             off = f.tell()
             line = f.readline()
@@ -277,7 +292,14 @@ def _update_state(path: str, apply: Callable[[dict[str, Any], float], None]) -> 
     retry.update_state(CURSOR_PATH, path, apply, ttl_days=_CURSOR_TTL_DAYS)
 
 
-def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -> None:
+def _advance_cursor(
+    path: str,
+    offset: int,
+    size: int,
+    *,
+    force: bool = False,
+    sids: Iterable[str] | None = None,
+) -> None:
     """Persist a cursor under an exclusive flock, monotonic per file unless
     `force` (truncation reset). Concurrent shippers (a Stop child racing the
     catch-up sweep) serialize here and can't rewind each other; both re-shipping
@@ -286,9 +308,15 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
     `size` is the EOF of a FULLY shipped file; pass -1 for intermediate chunks
     so a crash mid-backlog can't fake the everything-shipped skip condition.
 
+    `sids` are the session ids the file's records carry, as far as it has been read
+    (_ship). They are kept with the cursor so the next run can start reading at it and
+    still know every id the file holds. None, or more than _SIDS_KEPT of them, keeps
+    none: the next run then reads the whole file to find them.
+
     Only ever called after a successful POST, so it also ends the upload-failure
     streak, and rewriting the entry clears the file's `pending` marker.
     """
+    kept = sorted(set(sids)) if sids is not None else None
 
     def apply(state: dict[str, Any], now: float) -> None:
         retry.mark_ok(state, now)
@@ -296,8 +324,20 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
         if not force and isinstance(ent, dict) and int(ent.get("offset", -1)) > offset:
             return  # a racer already got further (and cleared any marker)
         state[path] = {"offset": offset, "size": size, "ts": now}
+        if kept is not None and len(kept) <= _SIDS_KEPT:
+            state[path]["sids"] = kept
 
     _update_state(path, apply)
+
+
+def _entry_sids(ent: dict[str, Any]) -> set[str] | None:
+    """The session ids a cursor entry holds for its file (_advance_cursor), or None when
+    it holds none it can be trusted on: an entry written before they were kept, or by a
+    failed first upload."""
+    sids = ent.get("sids")
+    if not isinstance(sids, list) or not all(isinstance(sid, str) for sid in sids):
+        return None
+    return set(sids)
 
 
 def _record_failure(path: str, reason: str, offset: int) -> None:
@@ -356,7 +396,7 @@ def _private_settings() -> Any:
     """The client core's settings for the private check: this hook's marker folder, and
     the TTL read from the environment only, as this hook always has."""
     settings = config.SETTINGS.with_sources(environ=os.environ, config={}, extra_candidates=())
-    return dataclasses.replace(settings, private_dir=Path(PRIVATE_DIR))
+    return settings.replace(private_dir=Path(PRIVATE_DIR))
 
 
 def _is_private(session_id: str) -> bool:
@@ -429,6 +469,8 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     # and a bearer that does not follow a redirect to another origin. The Transport holds
     # its URL without trailing slashes; they go back on as the path, so the POST goes to
     # INGEST_URL exactly as configured.
+    from synapse_client.http import Transport
+
     url = str(INGEST_URL)
     base = url.rstrip("/")
     transport = Transport(base, INGEST_TOKEN, config.USER_AGENT, TIMEOUT)
@@ -457,27 +499,39 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
         _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)}")
         return (0, 0)
     try:
-        offset_recs, eof = _read_offset_records(transcript_path)
+        # The size and the cursor first: a file with nothing new is not opened, and one
+        # with a cursor is read from it. A session's transcript only grows, and it was
+        # parsed whole after every turn.
+        size = os.path.getsize(transcript_path)
+        ent = _load_state().get(transcript_path)
+        cursor: int | None = None
+        force = False
+        before: set[str] | None = None  # the session ids of the records before the cursor
+        if isinstance(ent, dict):
+            cursor = int(ent.get("offset", 0))
+            if cursor > size:  # transcript truncated/rewritten — start over
+                cursor, force = None, True
+            elif int(ent.get("size", -1)) == size:
+                return (0, 0)  # nothing new since the last fully-shipped run
+            else:
+                before = _entry_sids(ent)
+        # With no cursor, or no record of the ids before it, the whole file is read.
+        start = cursor if cursor is not None and before is not None else 0
+        offset_recs, eof = _read_offset_records(transcript_path, start)
         if not offset_recs:
             return (0, 0)
 
         # Belt and braces: a resumed/compacted transcript can carry records whose
         # sessionId differs from the filename, and it's the record's id that the
-        # server stores (and that private_mode.py marked).
-        for sid in {str(r.get("sessionId") or "") for _, r in offset_recs} - {"", session_id}:
+        # server stores (and that private_mode.py marked). Every id the file holds
+        # counts, the ones before the cursor too (kept in its entry).
+        sids = {str(r.get("sessionId") or "") for _, r in offset_recs} | (before or set())
+        sids -= {"", session_id}
+        for sid in sids:
             if _is_private(sid):
                 _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
                 return (0, 0)
 
-        ent = _load_state().get(transcript_path)
-        cursor: int | None = None
-        force = False
-        if isinstance(ent, dict):
-            cursor = int(ent.get("offset", 0))
-            if cursor > eof:  # transcript truncated/rewritten — start over
-                cursor, force = None, True
-            elif int(ent.get("size", -1)) == eof:
-                return (0, 0)  # nothing new since the last fully-shipped run
         if cursor is None:
             if mode == "stop":
                 tail = offset_recs[-TAIL_RECORDS:]
@@ -516,7 +570,9 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
             break
         try:
             final = n == len(plans) - 1
-            _advance_cursor(transcript_path, cursor_after, eof if final else -1, force=force)
+            _advance_cursor(
+                transcript_path, cursor_after, eof if final else -1, force=force, sids=sids
+            )
         except Exception as e:
             _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
             break

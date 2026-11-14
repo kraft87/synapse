@@ -16,10 +16,12 @@ Design constraints, inherited from the Claude Code hook:
   * No third-party deps — the standard library and the client core only.
   * Ship a byte-cursor tail, not the whole file. Cursor state lives in
     ~/.synapse/codex_cursors.json keyed by rollout path and advances only
-    after a successful POST, so a failed push retries next turn. A tail that
-    starts mid-turn (prior failure) is trimmed forward to the next real user
-    message; if no boundary exists in the tail, fall back to the full file —
-    span_id dedup server-side makes the re-ship a no-op.
+    after a successful POST, so a failed push retries next turn. A tail is
+    shipped as read, with what Codex writes between two turns: the next
+    turn's turn_context is there, and carries its model and cwd. A tail that
+    starts inside a turn (turn content before its first real user message)
+    falls back to the full file — span_id dedup server-side makes the re-ship
+    of the turns already stored a no-op.
   * A pushed tail usually lacks the rollout's session_meta line, so the POST
     carries session_id explicitly; the server passes it to the parser as the
     identity hint.
@@ -93,7 +95,6 @@ import synapse_ingest_retry as retry
 import synapse_project
 from common import INGEST_URL, SETTINGS, TOKEN, USER_AGENT
 from synapse_client import private
-from synapse_client.http import Transport
 from synapse_filelock import lock_exclusive
 
 
@@ -159,6 +160,42 @@ def _is_user_boundary(rec: dict[str, Any]) -> bool:
                 parts.append(str(b.get("text") or ""))
     text = "\n".join(parts).strip()
     return bool(text) and not text.lstrip().startswith(_MACHINERY_PREFIXES)
+
+
+#: The response items the server's parser reads as a turn's text, besides messages
+#: (ingestion.codex_client._ITEM_TYPES).
+_CONTENT_TYPES = (
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "function_call",
+    "function_call_output",
+    "local_shell_call",
+    "web_search_call",
+)
+
+
+def _is_turn_content(rec: dict[str, Any]) -> bool:
+    """A record the parser reads as part of a turn, other than the user message that
+    opens it: an assistant message, a tool call, a tool's output."""
+    if rec.get("type") != "response_item":
+        return False
+    payload = rec.get("payload") or {}
+    if payload.get("type") == "message":
+        return payload.get("role") == "assistant"
+    return payload.get("type") in _CONTENT_TYPES
+
+
+def _mid_turn(records: list[dict[str, Any]]) -> bool:
+    """Whether a tail starts inside a turn: turn content comes before its first real
+    user message, or with none. What Codex writes between two turns is not content
+    (lifecycle events, injected instructions, the next turn's ``turn_context``), so a
+    tail that starts with those starts where a turn does."""
+    for rec in records:
+        if _is_user_boundary(rec):
+            return False
+        if _is_turn_content(rec):
+            return True
+    return False
 
 
 def _read_records(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
@@ -280,7 +317,10 @@ def _post(
     # RAISES private.PrivateSession, before any request, for a session in private mode.
     private.check_payload(SETTINGS, body, (), _log)
     # Through the core's Transport: the bearer goes to INGEST_URL's origin and does not
-    # follow a redirect to another.
+    # follow a redirect to another. Imported here, where a request is sent: the process
+    # Codex waits for only starts the detached worker.
+    from synapse_client.http import Transport
+
     transport = Transport("", TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
     resp: dict[str, Any] = transport.post_json(INGEST_URL, body, timeout=TIMEOUT)
     return resp
@@ -321,18 +361,18 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     if not records:
         return (0, 0)
 
-    if offset > 0 and not any(_is_user_boundary(r) for r in records):
-        # Mid-turn tail with no boundary to trim to (prior failure inside one
-        # mega-turn) — reship the whole file; server-side span dedup no-ops
-        # everything already stored.
+    if offset > 0 and _mid_turn(records):
+        # The tail starts inside a turn (a sweep shipped the turn half written, or
+        # its last records landed after the hook had read): the turn's start is
+        # before the cursor, so reship the whole file. Server-side span dedup no-ops
+        # every turn already stored. A tail that starts where a turn does is shipped
+        # as read: trimmed forward to its user message it would lose the turn's
+        # turn_context, and with it the model and cwd of the episode.
         try:
             records, new_offset = _read_records(path, 0)
         except OSError as e:
             _log(f"error re-reading {path}: {e}")
             return (0, 0)
-    elif offset > 0:
-        first = next(i for i, r in enumerate(records) if _is_user_boundary(r))
-        records = records[first:]
 
     if not records:
         return (0, 0)

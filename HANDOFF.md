@@ -54,6 +54,105 @@ Take the new image. No client change: the board text is the server's.
   beside the owner's name, so a question that names the owner draws them: 91 of the 333
   episodes served for the 60 named questions, against 6 of 319 in the first person.
 - The same sentence is not in the clients' own prompt nudges.
+## 2026-11-13 — codex: a turn is uploaded with its model and cwd (plugin 0.24.13)
+
+**What changed**
+
+- **Codex turns after a session's first were stored with no model and no cwd.** Codex
+  writes a turn's `turn_context` record, which carries both, just before the turn's user
+  message. The Stop hook cut each tail forward to that user message, so the record was
+  never sent. In prod, 200 of the 1,142 Codex episodes of the last 60 days have neither.
+  The project label was not affected: the hook sends it apart from the records.
+- **Now a tail is sent as read.** What Codex writes between two turns goes along
+  (lifecycle events, injected instructions, the next turn's `turn_context`). The server
+  reads the `turn_context` and skips the rest.
+- **A tail that starts inside a turn sends the whole rollout again.** That is a tail with
+  an assistant message, a tool call or a tool's output before its first user message: a
+  sweep shipped the turn half written, or its last records landed after the hook had
+  read. The turn's start is before the cursor, and the server drops the turns it already
+  holds. Before, when the same tail also held a later user message, the rest of the turn
+  was cut away with the tail's start and never sent.
+- **A tail of lifecycle events alone is sent as it is.** It used to send the whole
+  rollout again.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.13. Nothing to migrate, nothing on the server.
+
+**Proven**
+
+- Tests: `tests/test_codex_ingest_retry.py` (a later turn is posted with its
+  `turn_context`, and the server's parser gives its episode the model and cwd) and
+  `tests/test_client_server_rule_parity.py` (the hook and the server's parser agree on
+  what belongs to a turn). Each of the hook's new rules was taken out in turn (7
+  changes); the tests failed every time.
+
+**Still open**
+
+- Episodes already stored keep their empty model and cwd. This change repairs none.
+- A turn shipped half written and then whole is stored twice, once as the half: the two
+  end on different items, so the server takes them for two turns. That was already so
+  for a tail with no user message in it.
+- Sending the rollout whole is one large request for a long session. It happens only for
+  a tail that starts inside a turn.
+- A user message whose text Codex carries as `output_text` is a turn for the server and
+  not for the hook (a known difference, marked in the parity test).
+- Not run in a real Codex session: Codex on cortex cannot run either configured model.
+  The shapes come from the 30 rollouts on cortex: in each of their 79 later turns the
+  `turn_context` sits between the turn before and the user message.
+
+## 2026-11-13 — hooks: the shipper reads from its cursor, and the waiting hooks import less (plugin 0.24.12)
+
+**What changed** (the detail and the measurements are in the pull request)
+
+- **Claude Code's shipper reads from its cursor.** After every turn the detached
+  worker parsed the whole transcript to find the few records past its cursor. It now
+  looks at the size first (an unchanged file is not opened) and reads from the cursor
+  on. On a 32.6 MB transcript: about 0.4 s and 95 MB before, 10 to 20 ms and 20 MB
+  after.
+- **The private check is as strict as before.** A transcript is held back while any
+  session id its records carry is in private mode. The cursor entry now keeps those
+  ids (`sids`, in `ingest_cursors.json`), so the ones before the cursor still count.
+  An entry with no ids (from an older plugin, or after a failed first upload), a file
+  with more than 64 ids and a truncated file are read whole.
+- **The hooks a user waits for import less.** The six hooks that run at each prompt,
+  after each recall and after each turn loaded the request stack and `dataclasses`
+  without using them. They take about half the time now (each prompt: 130 ms before,
+  69 ms after, on cortex).
+- **For code that uses the core:** `Settings` is an immutable class written out by
+  hand. A changed copy is `settings.replace(...)`; `dataclasses.replace(settings, ...)`
+  no longer works. `config.SURFACE` is worked out at its first read, and Codex's
+  `common.SURFACE`, which had no reader, is gone.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.12. No setting to change and nothing to migrate: the
+   cursor file is read as it is, and each entry gains its ids at its next upload.
+2. Nothing on the server.
+
+**Proven**
+
+- Tests: `tests/test_ingest_hook_cursor.py` (the cursor read and the private check),
+  `tests/test_hook_imports.py` (runs the six hooks and fails when one loads the request
+  stack again), `tests/test_client_core_settings.py`. 42 single changes to the new
+  rules were tried, and the tests failed on each.
+- Measured on cortex on a real 32.6 MB transcript, and over 40 runs of each hook, old
+  and new taken in turn.
+
+**Still open**
+
+- **The flag hooks still load the settings.** What is left is `json`, `pathlib`, `typing`
+  and `hashlib` (the device token's fingerprint). A module that only reads flags would
+  bring the four hooks closer to a bare interpreter. Not done: it is about 20 ms a
+  prompt, for a parity test on every flag.
+- **A file rewritten in place without shrinking below its cursor.** The records before
+  the cursor are not read again, so a session id that only the new content holds there
+  is not seen. No record of a private session is sent either way: each batch is checked
+  where it leaves (`_post_records`). What is lost in that case is holding back the rest
+  of the file.
+- The two shippers are still two files; merging them comes later.
+- Not run on Windows or in a real Codex session.
+
 ## 2026-11-13 — session start: the board and the preferences are one request (plugin 0.24.11)
 
 **What changed** (the detail is in the pull request and `docs/client-harnesses.md`)
