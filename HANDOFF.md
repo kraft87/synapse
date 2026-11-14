@@ -57,18 +57,13 @@ two, and everything that is still open.
   `test_hermes_private_lineage.py`, `test_hermes_private_moves.py` and
   `test_hermes_turn_starts.py`; a real Hermes checkout (bca51750) in
   `test_hermes_integration.py` and `test_hermes_checkout_names.py`. Each rule was taken
-  out of the code in turn (282 changes, one at a time); the tests failed every time.
+  out of the code in turn (288 changes, one at a time); the tests failed every time.
 - Reviewed ten times by a separate agent that tried to make private turns leave. Nine
-  were under an earlier rule that tried to keep the turns of a private stretch out
-  after `off --forget`, turn by turn. Hermes passes nothing that says which turns those
-  are (no session id at `on_turn_start`, no upload for a stopped turn, uploads that run
-  late), and each fix opened another order of hooks, so that rule was cut. What those
-  reviews found about new session ids, copies, flushes and agents built later is fixed
-  here, with tests. The tenth, on this version, found no order that puts a private
-  turn on the record, and five smaller things that are fixed here too. The two that
-  change what the code does: a session whose marker could not be written was recorded
-  as asked about, so the next agent sent its turns to a server that dropped them; and
-  `off --forget <id>` was refused with the flag before the id.
+  were under an earlier rule (keep the turns of a private stretch out after
+  `off --forget`, turn by turn), which was cut: Hermes passes nothing that says which
+  turns those are. The tenth, on this version, found no order that puts a private
+  turn on the record. The five smaller things it found are fixed, and a last look at
+  those fixes found them sound.
 
 **Still open**
 
@@ -90,9 +85,10 @@ two, and everything that is still open.
   they are not uploaded under the new one, which looks back ten turns of its own.
 - While the server is down, each upload for a session it has not answered about, or
   has not been told about, waits up to 5 seconds per request. For the upload that ends
-  a turn that is on Hermes's background worker. A flush (`on_pre_compress`,
-  `on_session_end`) and a switch to a new id wait on the turn's own thread. A session
-  the server has not been told about writes a WARNING line each turn.
+  a turn that is on Hermes's background worker, and so is the flush at `/new`. At a
+  compression the flush and the switch to the new id wait on the turn's own thread,
+  and at exit the flush waits on the thread that closes the agent. A session the
+  server has not been told about writes a WARNING line each turn.
 - A session from before this version is asked about once too, up its whole chain (one
   request per session in it). A branch made before a session above it went private then
   turns private, as does one bound but not yet answered about when its parent goes
@@ -104,7 +100,10 @@ two, and everything that is still open.
   lived), the session is asked about again: it turns private again while the session
   it came from is. In the last case the session is private by its own marker only,
   which runs out after twelve hours: from then on it is private for as long as the
-  session it came from is (read off the code, not tested).
+  session it came from is (read off the code, not tested). A session whose marker
+  could not be written has the server's row and nothing on this machine once its
+  agent is gone: if the session it came from was put back with `off --forget` by
+  then, the next agent sends its turns and the row drops them, as after a plain `off`.
 - An agent built for a session with a record under `copied/` looks back at nothing,
   and so does the agent of every session that goes on from it. A turn whose
   `sync_turn` had not run when the agent before was replaced is not picked up, the
@@ -162,15 +161,15 @@ two, and everything that is still open.
   session: the row's text is the summary's too, and the two are not told apart here.
   Its reply lands on the turn before. That was so before this version.
 - A turn start with no upload to end it stays counted, for as long as the agent
-  lives. The turn was stopped: Hermes makes no upload for an interrupted turn, and
-  nothing tells the provider that one was interrupted. Or its upload was skipped
-  because Hermes's session store could not be read then. The count is read only at
-  the first upload of a session that holds copies, where one start too many lets
-  through a last turn that ended with no turn start seen. No order of Hermes's hooks
-  was found that gets there. The count also rests on two things nothing here checks:
-  the uploads that end turns come in the order the turns began (Hermes's one worker
-  takes them first in, first out), and each shows the turn it ends as the last in its
-  messages.
+  lives. The turn was stopped, or ended with no reply text: Hermes makes no upload for
+  either, and nothing tells the provider. Or Hermes held the upload back because it
+  counted the provider as stalled, or the upload was skipped because Hermes's session
+  store could not be read then. The count is read only at the first upload of a
+  session that holds copies, where one start too many lets through a last turn that
+  ended with no turn start seen. No order of Hermes's hooks was found that gets
+  there. The count also rests on two things nothing here checks: the uploads that end
+  turns come in the order the turns began (Hermes's one worker takes them first in,
+  first out), and each shows the turn it ends as the last in its messages.
 - Copies are not context: the first turn uploaded after them goes alone, also the
   first one under a new id after a later compression.
 - A branch Hermes says is new (its agent is told the session is not resumed) uploads

@@ -150,10 +150,7 @@ class Toggle:
         except ValueError as err:
             return self._fail(str(err), _UNCHANGED)
         if not removed:
-            return self._fail(
-                f"could not remove the marker for {session_id!r}",
-                "The marker is still there: this session stays off the record.",
-            )
+            return self._fail(f"could not remove the marker for {session_id!r}", _UNCHANGED)
         if not forget:
             self._say(f"private mode OFF for {session_id} (marker removed)")
             self._say("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
@@ -245,23 +242,28 @@ class Toggle:
         code: 0 done, 1 failed, 2 not a command."""
         if argv and argv[0] == "--session-end":
             return self.session_end(stdin)
-        # `--forget` counts wherever it stands: `off --forget <id>` is how it is spoken of.
-        names = [arg for arg in argv[1:] if arg != "--forget"]
+        # `--forget` counts before or after the id: `off --forget <id>` is how it is
+        # spoken of.
+        names = [arg.strip() for arg in argv[1:] if arg != "--forget"]
         if not names or argv[0] not in ("on", "off", "status"):
             self._warn("Private mode: take a session off the record.")
             self._warn(f"usage: {self.program} {_USAGE}")
             return 2
-        action, session_id = argv[0], names[0].strip()
+        action, session_id = argv[0], names[0]
         closing = _NOT_PRIVATE if action == "on" else _UNCHANGED
-        if not session_id or not private.plain_name(session_id):
-            return self._fail(f"invalid session id {session_id!r}", closing)
-        if session_id.startswith("-"):
+        flag = next((name for name in names if name.startswith("-")), "")
+        if flag:
             # A flag that is not known is not read as the id: the action would be done
             # to a session of that name while the real one stays as it was.
             return self._fail(
-                f"session id {session_id!r} looks like a flag — usage: {self.program} {_USAGE}",
+                f"session id {flag!r} looks like a flag — usage: {self.program} {_USAGE}",
                 closing,
             )
+        if len(names) > 1:
+            # Run for the first alone, `on` would leave the others on the record unsaid.
+            return self._fail(f"one session id at a time, got {len(names)}", closing)
+        if not session_id or not private.plain_name(session_id):
+            return self._fail(f"invalid session id {session_id!r}", closing)
         if action == "on":
             return self.on(session_id)
         if action == "off":

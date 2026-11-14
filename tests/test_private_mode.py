@@ -750,6 +750,16 @@ def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys, action)
     assert stub_server.calls == [] and (toggle.PRIVATE_DIR / "s-abc").exists()
 
 
+def test_two_session_ids_are_refused(toggle, stub_server, capsys):
+    # `on s-abc s-def` run for the first alone would leave s-def on the record, unsaid.
+    assert toggle.main(["on", "s-abc", "s-def"]) == 1
+    err = capsys.readouterr().err
+    assert "one session id at a time" in err and "NOT off the record" in err
+    assert stub_server.calls == [] and not (toggle.PRIVATE_DIR / "s-abc").exists()
+    assert toggle.main(["off", "s-abc", "--forgte"]) == 1  # a flag is said to be one
+    assert "looks like a flag" in capsys.readouterr().err
+
+
 def test_a_flag_shaped_session_id_for_on_says_the_session_is_not_private(toggle, capsys):
     assert toggle.main(["on", "--private", "s-abc"]) == 1
     err = capsys.readouterr().err

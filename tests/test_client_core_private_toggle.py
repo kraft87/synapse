@@ -104,10 +104,41 @@ def test_a_marker_that_will_not_go_is_said_not_raised(tmp_path):
     (stuck / "inside").mkdir(parents=True)  # a folder where the marker would be
     assert private.unmark(toggle.client.settings, "s-1") is False
     assert toggle.off("s-1") == 1
-    assert "could not remove the marker for 's-1'" in err.getvalue()
-    # Said as it is: the marker is what keeps the session's turns on this machine.
-    assert "this session stays off the record" in err.getvalue()
-    assert "NOT off the record" not in err.getvalue()
+    # Said as it is: "NOT off the record" would be false of a session still marked.
+    assert err.getvalue().splitlines() == [
+        "private mode FAILED: could not remove the marker for 's-1'",
+        "Nothing was changed.",
+    ]
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 0)() == 0, reason="needs a folder its owner cannot search"
+)
+def test_a_marker_in_a_folder_that_cannot_be_searched_is_not_said_to_be_removed(tmp_path):
+    """Nothing can be seen in such a folder, the marker included: not seeing it is not
+    its being gone. The uploaders take a marker they cannot read for a private one."""
+    toggle, _, out, err = _toggle(tmp_path)
+    assert toggle.on("s-1") == 0
+    folder = tmp_path / "private"
+    folder.chmod(0o000)
+    try:
+        assert private.unmark(toggle.client.settings, "s-1") is False
+        assert toggle.off("s-1") == 1
+    finally:
+        folder.chmod(0o700)
+    assert (folder / "s-1").is_file() and "private mode OFF" not in out.getvalue()
+    assert err.getvalue().splitlines()[-1] == "Nothing was changed."
+
+
+def test_a_marker_that_was_never_there_counts_as_removed(tmp_path):
+    toggle, _, _, _ = _toggle(tmp_path)
+    settings = toggle.client.settings
+    assert private.unmark(settings, "s-1") is True  # no folder yet
+    assert toggle.on("s-2") == 0 and private.unmark(settings, "s-1") is True
+    (tmp_path / "private" / "s-2").unlink()
+    (tmp_path / "private").rmdir()
+    (tmp_path / "private").write_text("a file where the folder would be")
+    assert private.unmark(settings, "s-1") is True
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +204,23 @@ def test_forget_is_read_wherever_it_stands(tmp_path):
     assert toggle.main(["off", "s-2", "--forget"]) == 0 and rows.rows == set()
     assert toggle.main(["off", "--forget"]) == 2 and err.getvalue().count("usage:") == 1
     assert rows.calls[-4:] == [("DELETE", "s-1"), ("GET", "s-1"), ("DELETE", "s-2"), ("GET", "s-2")]
+
+
+@pytest.mark.parametrize("action", ["on", "off", "status"])
+def test_one_session_id_at_a_time(tmp_path, action):
+    """Run for the first id alone, `on` would leave the second on the record and say
+    it was done."""
+    toggle, rows, _, err = _toggle(tmp_path)
+    assert toggle.on("s-0") == 0
+    calls = list(rows.calls)
+    assert toggle.main([action, "s-1", "s-2"]) == 1
+    assert toggle.main([action, "--forget", "s-1", "s-0"]) == 1
+    assert rows.calls == calls and os.listdir(tmp_path / "private") == ["s-0"]
+    closing = "Nothing was changed."
+    if action == "on":
+        closing = "This session is NOT off the record. Do not tell the user it is."
+    said = "private mode FAILED: one session id at a time, got 2"
+    assert err.getvalue().splitlines() == [said, closing] * 2
 
 
 def test_a_refused_off_or_status_says_nothing_was_changed(tmp_path):

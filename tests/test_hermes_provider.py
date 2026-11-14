@@ -688,11 +688,10 @@ def test_another_conversation_does_not_inherit_private_mode(plugin, server, tmp_
 def test_a_carried_session_whose_marker_goes_is_looked_back_at_like_any_other(
     plugin, server, tmp_path, resumed
 ):
-    """Private mode covers whole sessions, and nothing is noted of the turns a private
-    one shows. The new id's marker goes (`private off`, or its twelve hours): its next
-    upload sends every finished turn not sent yet, as far as the look-back reaches,
-    the ones spoken under the id it came from too. The server's row is what drops
-    them from then on."""
+    """Private mode covers whole sessions. The new id's marker goes (`private off`, or
+    its twelve hours): its next upload sends every finished turn not sent yet, as far
+    as the look-back reaches, the ones spoken under the id it came from too. The
+    server's row is what drops them from then on."""
     provider = _start(_new(plugin), tmp_path / "hermes-a", resumed=resumed)
     _private(tmp_path, _SID)
     _say(provider, _conversation(1))
