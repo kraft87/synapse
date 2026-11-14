@@ -27,6 +27,7 @@ The fixtures and helpers are those of tests/test_hermes_private_moves.py.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -350,6 +351,32 @@ def test_an_agent_built_for_an_id_no_agent_was_moved_to_reads_the_forks_record(
     _say(later, _conversation(5), _LATER)
     assert _posted(server)[sent:] == [(_LATER, ["question 5"])]
     assert pl.carried.copied(home, _LATER)
+
+
+@pytest.mark.parametrize("noted", [True, False], ids=["noted", "no note could be kept"])
+def test_a_switch_from_a_fork_this_agent_knows_nothing_of_goes_by_the_forks_record(
+    plugin, server, tmp_path, monkeypatch, noted
+):
+    """The switch names the session the new id goes on from, and this agent has seen
+    nothing of it: Hermes pointed it at the fork without a call, and the compaction
+    at the start of the next turn moves it on before a hook has named the fork. What
+    another agent recorded of the fork is all that says the new id holds copies. The
+    new id is noted as one that does; where that note cannot be kept, what the switch
+    read still holds for this agent."""
+    fork, home = _fork(plugin, server, tmp_path)
+    _say(fork, _conversation(4), _FORK)
+    sent = len(server.posts())
+    _store(home, _NEXT, source="tui", receipt=False, chat_id="")
+    # Resumed: a session said to be new would leave the doubt to its first turn start.
+    other = _open(plugin, home, _NEXT, resumed=True, message_count=4)
+    if not noted:
+        module = sys.modules[type(other).__module__]  # the provider's own copy
+        monkeypatch.setattr(module.carried, "note_copied", lambda home, session_id: None)
+    _store(home, _LATER, source="acp", receipt=False, chat_id="")  # no parent named
+    other.on_session_switch(_LATER, parent_session_id=_FORK, reason="compression")
+    _say(other, _conversation(5), _LATER)
+    assert _posted(server)[sent:] == [(_LATER, ["question 5"])]
+    assert pl.carried.copied(home, _LATER) is noted
 
 
 def test_a_fork_resumed_in_place_by_a_later_agent_keeps_the_copies_out(plugin, server, tmp_path):

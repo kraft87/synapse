@@ -724,9 +724,34 @@ def test_status_reports_both_halves(toggle, stub_server, capsys):
     assert "marker=yes server=yes" in capsys.readouterr().out
 
 
-def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
-    # `off --forget s-abc` (flag before id) must not no-op against a session
-    # literally named "--forget" while s-abc silently stays private.
-    assert toggle.main(["off", "--forget", "s-abc"]) == 1
-    assert "looks like a flag" in capsys.readouterr().err
-    assert stub_server.calls == []
+def test_forget_counts_before_the_session_id_too(toggle, stub_server):
+    """`off --forget <id>` is how the command is spoken of and how the README prints it.
+    Read as an id, the flag would name a session "--forget" and leave the real one."""
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.calls.clear()
+    assert toggle.main(["off", "--forget", sid]) == 0
+    assert [c[0] for c in stub_server.calls] == ["DELETE", "GET"]
+    assert sid not in stub_server.rows and not (toggle.PRIVATE_DIR / sid).exists()
+    assert toggle.main(["off", "--forget"]) == 2  # no session named
+
+
+@pytest.mark.parametrize("action", ["off", "status"])
+def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys, action):
+    # A flag that is not known must not be taken for the id: the action would be done
+    # to a session of that name while s-abc silently stays as it was.
+    assert toggle.main(["on", "s-abc"]) == 0
+    stub_server.calls.clear()
+    capsys.readouterr()
+    assert toggle.main([action, "--forgte", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert "looks like a flag" in err and "Nothing was changed." in err
+    assert "NOT off the record" not in err  # the session is as private as it was
+    assert stub_server.calls == [] and (toggle.PRIVATE_DIR / "s-abc").exists()
+
+
+def test_a_flag_shaped_session_id_for_on_says_the_session_is_not_private(toggle, capsys):
+    assert toggle.main(["on", "--private", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert "looks like a flag" in err and "NOT off the record" in err
+    assert not (toggle.PRIVATE_DIR / "s-abc").exists()

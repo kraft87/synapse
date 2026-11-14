@@ -2,7 +2,8 @@
 
     on  <session_id>            nothing from this session is ingested, ever
     off <session_id>            stop skipping locally (the server row stays)
-    off <session_id> --forget   also delete the server row (see below)
+    off <session_id> --forget   also delete the server row (see below); the flag
+                                counts before the id too
     status <session_id>
     --session-end               a SessionEnd hook: reads the payload on stdin
 
@@ -45,6 +46,8 @@ from .api import Client
 #: the JSON object the route returns.
 _FAILED = (urllib.error.URLError, OSError, ValueError)
 _USAGE = "on|off|status <session_id> [--forget]"
+_NOT_PRIVATE = "This session is NOT off the record. Do not tell the user it is."
+_UNCHANGED = "Nothing was changed."
 
 
 def _why(err: BaseException) -> str:
@@ -78,9 +81,11 @@ class Toggle:
     def _warn(self, line: str) -> None:
         print(line, file=self._err or sys.stderr)
 
-    def _fail(self, message: str) -> int:
+    def _fail(self, message: str, closing: str = _NOT_PRIVATE) -> int:
+        """Say what failed and where that leaves the session. Only a failed ``on`` leaves
+        one that was meant to be off the record on it."""
         self._warn(f"private mode FAILED: {message}")
-        self._warn("This session is NOT off the record. Do not tell the user it is.")
+        self._warn(closing)
         return 1
 
     def _marker_removed_note(self) -> None:
@@ -143,9 +148,12 @@ class Toggle:
         try:
             removed = private.unmark(self.client.settings, session_id)
         except ValueError as err:
-            return self._fail(str(err))
+            return self._fail(str(err), _UNCHANGED)
         if not removed:
-            return self._fail(f"could not remove the marker for {session_id!r}")
+            return self._fail(
+                f"could not remove the marker for {session_id!r}",
+                "The marker is still there: this session stays off the record.",
+            )
         if not forget:
             self._say(f"private mode OFF for {session_id} (marker removed)")
             self._say("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
@@ -237,21 +245,25 @@ class Toggle:
         code: 0 done, 1 failed, 2 not a command."""
         if argv and argv[0] == "--session-end":
             return self.session_end(stdin)
-        if len(argv) < 2 or argv[0] not in ("on", "off", "status"):
+        # `--forget` counts wherever it stands: `off --forget <id>` is how it is spoken of.
+        names = [arg for arg in argv[1:] if arg != "--forget"]
+        if not names or argv[0] not in ("on", "off", "status"):
             self._warn("Private mode: take a session off the record.")
             self._warn(f"usage: {self.program} {_USAGE}")
             return 2
-        action, session_id = argv[0], argv[1].strip()
+        action, session_id = argv[0], names[0].strip()
+        closing = _NOT_PRIVATE if action == "on" else _UNCHANGED
         if not session_id or not private.plain_name(session_id):
-            return self._fail(f"invalid session id {session_id!r}")
+            return self._fail(f"invalid session id {session_id!r}", closing)
         if session_id.startswith("-"):
-            # `off --forget <id>` would otherwise read the flag as the id, and do nothing
-            # to a session named "--forget" while the real one stays as it was.
+            # A flag that is not known is not read as the id: the action would be done
+            # to a session of that name while the real one stays as it was.
             return self._fail(
-                f"session id {session_id!r} looks like a flag — usage: {self.program} {_USAGE}"
+                f"session id {session_id!r} looks like a flag — usage: {self.program} {_USAGE}",
+                closing,
             )
         if action == "on":
             return self.on(session_id)
         if action == "off":
-            return self.off(session_id, forget="--forget" in argv[2:])
+            return self.off(session_id, forget="--forget" in argv[1:])
         return self.status(session_id)

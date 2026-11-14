@@ -522,6 +522,35 @@ def test_while_the_server_does_not_answer_nothing_leaves_and_the_next_agent_asks
     assert (tmp_path / "private" / _CHILD).is_file() and carried.settled(home, _CHILD)
 
 
+def test_a_session_whose_marker_could_not_be_written_is_asked_about_by_the_next_agent(
+    plugin, server, tmp_path, monkeypatch
+):
+    """No marker says the session is private: the agent that made it so holds it
+    itself, and keeps no record that it was asked about. Finding one, the next agent
+    would ask nothing and send what it looks back at (to a server whose row drops it)."""
+    home = tmp_path / "hermes-a"
+    _child(home)
+    _marker(tmp_path, _PARENT)
+    first = _new(plugin)
+    core = type(first).__module__.rsplit(".harnesses.", 1)[0]  # the provider's own copy
+
+    def refuse(settings: Any, session_id: str) -> Path:
+        raise PermissionError(13, "read-only", session_id)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(sys.modules[f"{core}.private"], "mark", refuse)
+        first.initialize(_CHILD, hermes_home=str(home), **gs._in_process(resumed=True))
+        _say(first, _conversation(4), _CHILD)
+    assert server.puts() == [f"/private-sessions/{_CHILD}"]  # the server has its row
+    assert server.posts() == [] and not (tmp_path / "private" / _CHILD).exists()
+    assert not carried.settled(home, _CHILD)
+
+    again = _open(plugin, home, resumed=True)  # a restart, and the folder can be written
+    _say(again, _conversation(5), _CHILD)
+    assert server.posts() == [] and (tmp_path / "private" / _CHILD).is_file()
+    assert carried.settled(home, _CHILD)
+
+
 def test_turns_finished_while_the_server_did_not_answer_go_up_when_it_does(
     plugin, server, tmp_path
 ):

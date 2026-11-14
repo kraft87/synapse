@@ -795,6 +795,30 @@ def test_settled_is_not_called_before_the_server_has_the_row(tmp_path):
     assert up.settle_private("s-new") is True and done == [True]
 
 
+@pytest.mark.parametrize("known", ["marker", "row"])
+def test_settled_is_not_called_for_a_session_whose_marker_could_not_be_written(
+    tmp_path, monkeypatch, known
+):
+    """The caller's note says the session need not be asked about again. With no
+    marker, the uploader that made it private is all that keeps its turns on this
+    machine: the next one finds the note, asks nothing and sends them."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    done: list[bool] = []
+    if known == "marker":
+        _mark(tmp_path, "s-old")
+    else:
+        wire.rows.add("s-old")
+    _no_marker_written(monkeypatch)
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is (known == "marker")
+    assert up.settle_private("s-new") is True and up.is_private("s-new")
+    assert wire.requests[-1] == _put("s-new")  # the server has its row
+    assert done == [] and not (tmp_path / "private" / "s-new").exists()
+    # Nor at a later carry, or a later settle.
+    assert up.carry_private(["s-old"], "s-new", settled=done.append) is True
+    assert up.settle_private("s-new") is True and done == []
+
+
 def test_a_settled_that_raises_changes_nothing(tmp_path):
     client, _ = _client(tmp_path)
     up = upload.Uploader(client)
@@ -1097,6 +1121,31 @@ def test_a_server_that_cannot_be_told_is_told_again_at_the_next_turn(tmp_path):
     assert up.settle_private("s-new") is True and len(wire.requests) == 4
     assert up.settle_private("s-never-carried") is True and len(wire.requests) == 4
     assert len(warned) == 3 and lines == []
+
+
+@pytest.mark.parametrize("found", ["at the carry", "at the answer"])
+def test_a_session_the_server_was_never_told_of_makes_the_next_one_private(tmp_path, found):
+    """Its marker is gone (`private off`, its twelve hours) and the server could not
+    be told: this uploader's hold is all that says the session is private. A session
+    that goes on from it is private by that hold, where a server asked for a row would
+    say it has none."""
+    client, wire = _client(tmp_path)
+    up = upload.Uploader(client)
+    if found == "at the answer":
+        assert up.carry_private(["s-2"], "s-3") is False  # asked at its next upload
+    _mark(tmp_path, "s-1")
+    wire.fail_private = urllib.error.URLError("down")
+    assert up.carry_private(["s-1"], "s-2") is True
+    wire.fail_private = None
+    for gone in ("s-1", "s-2"):
+        (tmp_path / "private" / gone).unlink()
+    if found == "at the carry":
+        assert up.carry_private(["s-2"], "s-3") is True
+    else:
+        assert up.settle("s-3") == upload.PRIVATE
+    assert (tmp_path / "private" / "s-3").is_file() and wire.rows == {"s-2", "s-3"}
+    # Told of both, and asked about neither.
+    assert wire.requests[1:] == [_put("s-3"), _put("s-2")]
 
 
 def _no_marker_written(monkeypatch) -> None:

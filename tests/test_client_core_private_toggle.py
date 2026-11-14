@@ -105,6 +105,9 @@ def test_a_marker_that_will_not_go_is_said_not_raised(tmp_path):
     assert private.unmark(toggle.client.settings, "s-1") is False
     assert toggle.off("s-1") == 1
     assert "could not remove the marker for 's-1'" in err.getvalue()
+    # Said as it is: the marker is what keeps the session's turns on this machine.
+    assert "this session stays off the record" in err.getvalue()
+    assert "NOT off the record" not in err.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +162,33 @@ def test_main_runs_the_action_named(tmp_path):
     assert toggle.main(["status", "s-1"]) == 0
     assert out.getvalue().splitlines()[-1] == "s-1: marker=no server=no"
     assert toggle.main(["sideways", "s-1"]) == 2 and toggle.main(["on"]) == 2
-    assert toggle.main(["on", "../s-1"]) == 1 and toggle.main(["off", "--forget", "s-1"]) == 1
-    assert "looks like a flag" in err.getvalue() and rows.rows == set()
+    assert toggle.main(["on", "../s-1"]) == 1 and rows.rows == set()
+    assert err.getvalue().splitlines()[-1].startswith("This session is NOT off the record.")
+
+
+def test_forget_is_read_wherever_it_stands(tmp_path):
+    toggle, rows, _, err = _toggle(tmp_path)
+    assert toggle.main(["on", "s-1"]) == 0 and toggle.main(["on", "s-2"]) == 0
+    assert toggle.main(["off", "--forget", "s-1"]) == 0 and rows.rows == {"s-2"}
+    assert toggle.main(["off", "s-2", "--forget"]) == 0 and rows.rows == set()
+    assert toggle.main(["off", "--forget"]) == 2 and err.getvalue().count("usage:") == 1
+    assert rows.calls[-4:] == [("DELETE", "s-1"), ("GET", "s-1"), ("DELETE", "s-2"), ("GET", "s-2")]
+
+
+def test_a_refused_off_or_status_says_nothing_was_changed(tmp_path):
+    """Only a failed `on` leaves a session on the record that was meant to be off it.
+    Of an `off` that was not run, "NOT off the record" would be false for a private one."""
+    toggle, rows, _, err = _toggle(tmp_path)
+    assert toggle.main(["on", "s-1"]) == 0
+    calls = list(rows.calls)
+    for argv in (["off", "--forgte", "s-1"], ["off", "../s-1"], ["status", "-v", "s-1"]):
+        assert toggle.main(argv) == 1
+    lines = err.getvalue().splitlines()
+    assert lines[1::2] == ["Nothing was changed."] * 3
+    assert "looks like a flag" in lines[0] and "invalid session id" in lines[2]
+    assert rows.calls == calls and (tmp_path / "private" / "s-1").is_file()
+    assert toggle.off("../s-1") == 1  # past main's own check of the id
+    assert err.getvalue().splitlines()[-1] == "Nothing was changed."
 
 
 def test_a_session_end_removes_the_marker_and_never_fails(tmp_path):

@@ -161,7 +161,9 @@ class Uploader:
         after that, it stays there, whole. A session carried again while its question
         is open (the server has not answered, or is still to be told) has each call's
         ``settled`` called. Not called when there was nothing to ask, nor for a session
-        made private here whose question closed before the call. Never raises."""
+        made private here whose question closed before the call, nor for one whose
+        marker could not be written: nothing but this uploader keeps that one private
+        on this machine, so the next has to ask again. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
         failed = ""
         lines: list[str] = []
@@ -238,10 +240,14 @@ class Uploader:
             )
 
     def _close(self, session_id: str) -> None:
-        """Nothing is left open for ``session_id``: tell whoever asked to know."""
+        """Nothing is left open for ``session_id``: tell whoever asked to know. No one
+        is told of a session whose marker could not be written: this uploader alone
+        keeps it private here, and the next one has to ask again."""
         with self._holding:
             asked = self._settled.pop(session_id, ())
             made = session_id in self._made
+            if session_id in self._unmarked:
+                return
         for settled in asked:
             try:
                 settled(made)

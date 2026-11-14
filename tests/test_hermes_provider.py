@@ -684,23 +684,28 @@ def test_another_conversation_does_not_inherit_private_mode(plugin, server, tmp_
     assert body["session_id"] == _NEXT
 
 
-def test_turns_spoken_off_the_record_are_not_looked_back_at(plugin, server, tmp_path):
-    """The new id's marker goes (`private off`, or its twelve hours): what was said
-    before stays unsent, where any other switch looks back LOOKBACK turns. The turn that
-    ends next is the first on the record, and goes up without the one before it."""
-    provider = _start(_new(plugin), tmp_path / "hermes-a")
+@pytest.mark.parametrize("resumed", [False, True], ids=["new here", "resumed"])
+def test_a_carried_session_whose_marker_goes_is_looked_back_at_like_any_other(
+    plugin, server, tmp_path, resumed
+):
+    """Private mode covers whole sessions, and nothing is noted of the turns a private
+    one shows. The new id's marker goes (`private off`, or its twelve hours): its next
+    upload sends every finished turn not sent yet, as far as the look-back reaches,
+    the ones spoken under the id it came from too. The server's row is what drops
+    them from then on."""
+    provider = _start(_new(plugin), tmp_path / "hermes-a", resumed=resumed)
     _private(tmp_path, _SID)
+    _say(provider, _conversation(1))
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason="compression")
     _say(provider, _conversation(2))
+    assert server.posts() == [] and server.puts() == [f"/private-sessions/{_NEXT}"]
     (tmp_path / "private" / _NEXT).unlink()
     _say(provider, _conversation(3))
     (body,) = server.posts()
-    assert body["session_id"] == _NEXT and _users(body["records"]) == ["question 3"]
+    assert body["session_id"] == _NEXT
+    assert _users(body["records"]) == ["question 1", "question 2", "question 3"]
     _say(provider, _conversation(4))
-    assert [_users(body["records"]) for body in server.posts()] == [
-        ["question 3"],
-        ["question 3", "question 4"],
-    ]
+    assert _users(server.posts()[1]["records"]) == ["question 3", "question 4"]
 
 
 def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tmp_path):
@@ -734,18 +739,19 @@ def test_with_no_marker_the_server_says_whether_the_new_id_is_private(
 ):
     """`private off` removed the marker, or its twelve hours passed: the server's row
     still drops the old id's turns, and the new id starts with copies of them."""
-    provider = _start(_new(plugin), tmp_path / "hermes-a")
+    provider = _start(_new(plugin), tmp_path / "hermes-a", resumed=True)
     server.private_rows.add(_SID)
     provider.on_session_switch(_NEXT, parent_session_id=_SID, reason=reason)
     assert server.asked() == [] and server.puts() == []  # asked at the next upload
     _say(provider, _conversation(3))
     assert server.asked() == [_SID] and server.puts() == [f"/private-sessions/{_NEXT}"]
     assert server.posts() == [] and (tmp_path / "private" / _NEXT).is_file()
-    # What was said before the answer is not looked back at once the marker goes, and
-    # is not sent beside the next turn either.
+    # The new id is private as a whole from here, and asked about once. With its marker
+    # gone it is looked back at like any session, and the server's row drops its turns.
     (tmp_path / "private" / _NEXT).unlink()
     _say(provider, _conversation(4))
-    assert [_users(body["records"]) for body in server.posts()] == [["question 4"]]
+    (body,) = server.posts()
+    assert _users(body["records"]) == [f"question {n}" for n in (1, 2, 3, 4)]
     assert server.asked() == [_SID]
 
 

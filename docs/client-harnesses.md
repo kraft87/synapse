@@ -497,7 +497,9 @@ The core ports the hooks' behaviour and wording, with these differences:
   is not called when there was nothing to ask. A session carried again while its
   question is open (the server has not answered, or is still to be told) has the hook
   of every carry called; for a session made private here whose question closed before
-  the call, none is.
+  the call, none is. Nor is any called for a session whose marker could not be
+  written: only that uploader keeps it private on the machine, so the next one must
+  ask again and not find it closed.
 - **A session that holds copies.** A harness can copy another session's turns into a
   new one and name no session they came from. A session with a look-back of 0 holds
   such turns: they are not its own to upload. Nothing in a turn's rows tells a copy
