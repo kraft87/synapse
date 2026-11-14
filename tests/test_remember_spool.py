@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -523,3 +524,32 @@ def test_hook_paths_never_fail_the_turn(tmp_path):
             env=env,
         )
         assert p.returncode == 0, p.stderr
+
+
+def test_hook_logs_stay_in_tmp_off_windows_and_go_to_the_temp_dir_on_windows(
+    monkeypatch, tmp_path, stub_server
+):
+    """Windows has no /tmp: there "/tmp/x.log" names a folder that is not there, so a
+    hook's log went nowhere. The ingest, spool and Codex Stop hooks share one rule."""
+    import tempfile
+    import types
+
+    spool = _load(monkeypatch, tmp_path, stub_server.url)
+    name = "synapse-remember-spool.log"
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        (root / rel).read_text(encoding="utf-8")
+        for rel in (
+            "plugin/scripts/ingest_hook.py",
+            "plugin/scripts/remember_spool.py",
+            "plugin-codex/hooks/synapse_stop_hook.py",
+        )
+    ]
+    rule = sources[1][sources[1].index("def _default_log") : sources[1].index("LOG_PATH =")]
+    assert all(rule in text for text in sources)
+    on_windows: dict = {"os": types.SimpleNamespace(name="nt", path=os.path)}
+    exec(rule, on_windows)  # the repository own source, run as on Windows
+    assert on_windows["_default_log"](name) == os.path.join(tempfile.gettempdir(), name)
+    if os.name != "nt":
+        assert spool._default_log(name) == "/tmp/" + name
+        assert spool.LOG_PATH == str(tmp_path / "spool.log")  # the variable still wins

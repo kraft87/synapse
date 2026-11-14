@@ -67,7 +67,7 @@ Env:
   SYNAPSE_PRIVATE_DIR         private markers    (default ~/.synapse/private)
   SYNAPSE_PRIVATE_TTL_HOURS   default 12 (an older private marker no longer
                               counts and is removed)
-  SYNAPSE_CODEX_HOOK_LOG      log file           (default /tmp/synapse-codex-hook.log)
+  SYNAPSE_CODEX_HOOK_LOG      log file           (default /tmp/synapse-codex-hook.log (Windows: the temp directory))
 """
 
 from __future__ import annotations
@@ -108,7 +108,19 @@ def _env_number(name: str, default: str, kind: type = float) -> Any:
 
 
 TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
-LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
+
+
+def _default_log(name: str) -> str:
+    """/tmp/<name> on Linux and macOS, as always; the temp directory on Windows,
+    which has no /tmp (a path starting with / there names a folder that is not there)."""
+    if os.name != "nt":
+        return "/tmp/" + name
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", _default_log("synapse-codex-hook.log"))
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )

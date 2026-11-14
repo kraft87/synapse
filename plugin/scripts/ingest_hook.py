@@ -76,7 +76,7 @@ config.py's precedence. The detached child re-imports config, so the same
 resolution applies there.
 
 Env (all optional):
-  SYNAPSE_INGEST_LOG           default /tmp/synapse-ingest-hook.log
+  SYNAPSE_INGEST_LOG           default /tmp/synapse-ingest-hook.log (Windows: the temp directory)
   SYNAPSE_INGEST_TIMEOUT       default 30 (seconds per POST)
   SYNAPSE_INGEST_TAIL          default 400 (records per POST chunk; also the
                                first-run seed window on the Stop path)
@@ -127,7 +127,19 @@ def _env_number(name: str, default: str, kind: type = float) -> Any:
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
-LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
+
+
+def _default_log(name: str) -> str:
+    """/tmp/<name> on Linux and macOS, as always; the temp directory on Windows,
+    which has no /tmp (a path starting with / there names a folder that is not there)."""
+    if os.name != "nt":
+        return "/tmp/" + name
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", _default_log("synapse-ingest-hook.log"))
 TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
 TAIL_RECORDS = _env_number("SYNAPSE_INGEST_TAIL", "400", int)
 CATCHUP_DAYS = _env_number("SYNAPSE_INGEST_CATCHUP_DAYS", "3")

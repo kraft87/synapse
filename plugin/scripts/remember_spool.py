@@ -44,7 +44,7 @@ spool must never break a turn — but it must also never quietly drop a memory w
 CLI paths (add/flush) DO report failure on stderr and exit nonzero.
 
 Env (all optional):
-  SYNAPSE_SPOOL_LOG            default /tmp/synapse-remember-spool.log
+  SYNAPSE_SPOOL_LOG            default /tmp/synapse-remember-spool.log (Windows: the temp directory)
   SYNAPSE_SPOOL_TIMEOUT        default 10   (seconds per replay POST)
   SYNAPSE_SPOOL_PROBE_TIMEOUT  default 4    (seconds for the SessionStart reachability probe)
   SYNAPSE_SPOOL_BUDGET         default 12   (seconds a SessionStart flush may spend)
@@ -79,7 +79,19 @@ def _env_number(name: str, default: str, kind: type = float) -> Any:
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"
 FLUSH_LOCK_PATH = str(SPOOL_PATH) + ".flush.lock"
-LOG_PATH = os.environ.get("SYNAPSE_SPOOL_LOG", "/tmp/synapse-remember-spool.log")
+
+
+def _default_log(name: str) -> str:
+    """/tmp/<name> on Linux and macOS, as always; the temp directory on Windows,
+    which has no /tmp (a path starting with / there names a folder that is not there)."""
+    if os.name != "nt":
+        return "/tmp/" + name
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+LOG_PATH = os.environ.get("SYNAPSE_SPOOL_LOG", _default_log("synapse-remember-spool.log"))
 TIMEOUT = _env_number("SYNAPSE_SPOOL_TIMEOUT", "10")
 PROBE_TIMEOUT = _env_number("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4")
 BUDGET = _env_number("SYNAPSE_SPOOL_BUDGET", "12")
@@ -427,13 +439,15 @@ def _session_start() -> int:
 
     if not ok:
         script = os.path.abspath(__file__)
+        # On Windows `python3` is often the Microsoft Store stand-in: name this interpreter.
+        run = f"python3 {script}" if os.name != "nt" else f'"{sys.executable}" "{script}"'
         extra = f" {len(queued)} memory write(s) are already queued." if queued else ""
         _log(f"SESSIONSTART server unreachable ({detail}); {len(queued)} queued")
         print(
             f"[Synapse] The memory server is NOT reachable over HTTP ({detail}), so the "
             f"remember() MCP tool is probably down too — a memory write attempted now can be "
             f"silently lost.{extra} Until it is back, route every durable memory write through "
-            f'the spool instead: `python3 {script} add --hook "<one-line hook>" --body "<full '
+            f'the spool instead: `{run} add --hook "<one-line hook>" --body "<full '
             f'note>" --type user|feedback|project|reference [--project <slug>]`. Spooled writes '
             f"flush automatically at the next session start. Tell the user a write is QUEUED, "
             f"never that it is saved."
