@@ -24,11 +24,12 @@ changed, what to do on each machine, what was proven, and what is still open.
   byte-for-byte what it was.
 - **`scripts/rename_owner_in_facts.py`** rewrites the facts stored before the rule. It
   numbers each "user" word of a fact ("User", "the user", "user's"; never part of a
-  longer word such as "users", "user_id", "end-user"), a classifier names the numbers
-  that mean the owner, and the script swaps exactly those for the name. No other
-  character can change. Each fact is classified twice, among different neighbours, and a
-  word is renamed only when both passes name it. Retired facts, web facts, entity names
-  and summaries, edges, dates and labels are not touched.
+  longer word such as "users", "user_id", "end-user"; never "a user" or "user input",
+  where a name cannot stand), a classifier names the numbers that mean the owner, and
+  the script swaps exactly those for the name. No other character can change. Each fact
+  is classified twice, among different neighbours, and a word is renamed only when both
+  passes name it. Retired facts, web facts, entity names and summaries, edges, dates and
+  labels are not touched.
 - **The ingest guard drops two more of Synapse's own prompts.** `is_harness_call`
   (`ingestion/contamination.py`) now refuses a single-turn session that opens "A personal
   AI memory stores ...": the rename classifier's prompt and the golden-question
@@ -65,7 +66,7 @@ text the script wrote.
 
 - `tests/test_extractor.py`: the default prompt has no naming rule and still writes
   "User"; a configured name replaces every owner "User" in the prompt and adds the rule.
-  `tests/test_rename_owner_in_facts.py` (21) and `tests/test_rename_owner_in_facts_db.py`
+  `tests/test_rename_owner_in_facts.py` (27) and `tests/test_rename_owner_in_facts_db.py`
   (4, scratch database): which words are numbered, only a picked word changes, a reply
   that cannot be lined up renames nothing, one pass alone renames nothing; dry run writes
   nothing, apply backs up then writes text and embedding, a row changed since the plan is
@@ -86,6 +87,11 @@ text the script wrote.
   thing); a second single pass got those right and 2 others wrong; two passes in
   different orders renamed 186, none of the 7 among them, and left 5 facts that do mean
   the owner.
+- Two passes over all 5,551 candidate facts on prod, read-only: 4,320 to rename, 1,231
+  left, 280 the passes read differently, none unclassified. Of 170 renames drawn at
+  random, all were the owner. A search of the plan for the word before a system noun or
+  after "a" / "one" found about ten that were not ("a user's config", "user turns"):
+  those two shapes are now never numbered.
 
 **Open**
 
