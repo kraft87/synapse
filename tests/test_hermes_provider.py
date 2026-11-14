@@ -143,9 +143,15 @@ def hermes_stub(monkeypatch) -> types.ModuleType:
 class _Ctx:
     def __init__(self) -> None:
         self.providers: list[Any] = []
+        self.commands: dict[str, dict[str, Any]] = {}
 
     def register_memory_provider(self, provider: Any) -> None:
         self.providers.append(provider)
+
+    def register_command(
+        self, name: str, handler: Any, description: str = "", args_hint: str = "", **more: Any
+    ) -> None:
+        self.commands[name] = {"handler": handler, "description": description, "hint": args_hint}
 
 
 def _load(folder: Path) -> types.ModuleType:

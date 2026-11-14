@@ -2,12 +2,27 @@
 
 Hermes loads this folder as the memory provider "synapse" when config.yaml selects it
 (memory.provider: synapse). The code is the synapse_client package beside this file;
-this module only hands Hermes a new provider through register_memory_provider.
+this module hands Hermes a new provider through register_memory_provider, and the
+/private command (synapse_client/harnesses/hermes/command.py).
 `synapse update` rebuilds the folder, so edits here do not last.
 """
 
+import logging
+
+from .synapse_client.harnesses.hermes import command
 from .synapse_client.harnesses.hermes.provider import SynapseMemoryProvider
 
 
 def register(ctx):
     ctx.register_memory_provider(SynapseMemoryProvider())
+    # After the provider, and on its own: a Hermes that takes no plugin command, or
+    # refuses this one, still gets its memory.
+    try:
+        ctx.register_command(
+            command.NAME,
+            command.private_command,
+            description=command.DESCRIPTION,
+            args_hint=command.ARGS_HINT,
+        )
+    except Exception:
+        logging.getLogger(__name__).warning("synapse: /private was not registered", exc_info=True)

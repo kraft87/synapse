@@ -85,7 +85,8 @@ server-only change leaves the version alone. The rules live in `scripts/release_
 7. **One private-mode toggle, for whole sessions.** `private_toggle.Toggle` is the
    toggle of every harness: the marker (`private.mark`), the server row
    (`Client.private_put`), the read-back, and what `off` and `--forget` leave behind.
-   `synapse private`, and the `private_mode.py` of the Claude Code and Codex plugins,
+   `synapse private`, the `private_mode.py` of the Claude Code and Codex plugins, and
+   Hermes's `/private` (`harnesses/hermes/command.py`, `on` and `status` only)
    only build the client and hand it the arguments. Private mode covers a session as a
    whole: the core keeps no list of the turns spoken while it was on, and a session
    put back on the record (`off --forget`) is back with all of them. A harness that
@@ -320,7 +321,7 @@ provider:
 ```
 $HERMES_HOME/plugins/synapse/
   plugin.yaml                    name, version, kind: exclusive
-  __init__.py                    register(ctx) -> SynapseMemoryProvider()
+  __init__.py                    register(ctx): SynapseMemoryProvider(), and /private
   synapse_client/                copy of the core + harnesses/hermes
 ```
 
@@ -346,6 +347,44 @@ like every other harness, so there is no Hermes setup wizard step.
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `self_since` on `recall` and `recall_full_turns`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
 | `handle_tool_call(name, args)` | `tools.call()`: adds the session id, and the compression time where there is one, the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
 
+**The `/private` command.** `register(ctx)` also registers a slash command
+(`ctx.register_command`, `harnesses/hermes/command.py`). Hermes hands a plugin command
+the id of the session it was typed in, so `/private on` is `synapse private on <that
+id>`: the marker, the server's row, and "ON" only when the row was read back.
+`/private` alone and `/private status` say where the session stands. There is no `off`:
+private mode covers whole sessions (rule 7), the server's delete is admin-scoped, and
+the way back on the record is a new session; `/private off` says so and makes no
+request. The handler keeps no state: Hermes holds one handler per process, and a later
+registration replaces the earlier one, so it serves every session by the id it is given.
+
+Hermes runs a plugin command on every surface, a messaging chat included, where anyone
+in the chat can type it and the request would carry the owner's token. So the handler
+applies the scope rule above to the facts Hermes passes it (`source`, `platform`,
+`session_key`), through `sessions.from_keywords`, and refuses anywhere but the owner's
+own local session, before any request or file. Anything it cannot place is refused.
+Run at Hermes bca51750, with the plugin in-process and in the plugin host: the gateway
+calls the handler for `slash.exec` (what the classic CLI, the TUI and Desktop send),
+for `command.dispatch`, and for a prompt an ACP editor sends that starts with the
+command; each passes the stored session id and a `source` of platform `local`, also for
+a session that has had no turn yet. A surface that runs the command in its own process
+(the classic CLI off the gateway, the stand-alone TUI backend) passes no `source` and
+its own platform name.
+
+Two limits come from Hermes. Its plugin discovery skips an `exclusive` plugin, and a
+memory provider is loaded as the first agent of the process is built. The gateway's
+`commands.catalog`, which the classic CLI reads before it sends a plugin command (and
+reads again when a typed name is not in it), lists `private` from then on, not before.
+So in a gateway started just now, Hermes answers that `/private` is unknown until the
+first message of the first session has been sent, and that message is uploaded. A
+gateway a client started exits after `gateway.unmanaged_idle_exit_seconds` (600) with
+nothing to do, so this is the first session after a break. A stand-alone plugin that
+registers the command would be loaded at discovery; there is none yet. And the
+stand-alone TUI backend (`python -m tui_gateway.entry`) takes the gateway's lock for
+its home, so the provider takes its agents for the daemon's side tasks and uploads
+nothing there; the command still answers. At bca51750 no product code starts that
+backend (its own docstring says so, and a search of the checkout agrees): the TUI and
+Desktop attach to the gateway.
+
 **What is uploaded.** Hermes passes the whole conversation on every turn, as live message
 dicts, after scrubbing secrets from them. The normaliser keeps only `role`, the text
 content, tool-call names and arguments (capped at 1000 characters), tool results (capped
@@ -366,9 +405,7 @@ interim text, the interrupt placeholder) keeps only its tool calls.
 
 **Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
 spool (a `remember` call that fails is reported to the model, not queued), the
-recall-feedback nudge, a Hermes command for private mode (the toggle is
-`synapse private on|off|status <session-id>` in a terminal, the one Claude Code and Codex
-use; there is no slash command or tool for it), skills sync into `$HERMES_HOME/skills`,
+recall-feedback nudge, skills sync into `$HERMES_HOME/skills`,
 config sync, a history
 importer for `state.db`, and Synapse in messaging-gateway and API-server sessions
 (above). Skill invocations are uploaded as Hermes hands them over: the manager strips
@@ -386,6 +423,7 @@ for a new agent bound to such a session), `test_hermes_private_moves.py` (a flus
 move Hermes did not announce, and a session put back on the record with `off --forget`),
 `test_hermes_turn_starts.py` (which turns a session that holds copies uploads, in
 Hermes's own order of hooks),
+`test_hermes_private_command.py` (`/private`: what it does and who may run it),
 `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` and
 `test_hermes_install_selection.py`. `tests/test_hermes_integration.py` runs only with
 `SYNAPSE_HERMES_CHECKOUT` set to a Hermes checkout with its `.venv`: it installs into a
