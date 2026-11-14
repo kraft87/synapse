@@ -8,38 +8,21 @@ two, and everything that is still open.
 
 ## 2026-11-13 — session start: the board and the preferences are one request (plugin 0.24.11)
 
-**What changed**
+**What changed** (the detail is in the pull request and `docs/client-harnesses.md`)
 
-- **Before, a session start made two requests.** `GET /context` returned the board as
-  text the server had rendered. `GET /preferences/top` returned items, and every client
-  rendered the preferences block from them. In Claude Code that was two hooks, so two
-  Python processes at every session start; Codex and Hermes ran the two requests side by
-  side.
-- **Now one request returns both.** `GET /context?parts=board,preferences` answers with
-  the board as `text` and the preferences block as `preferences`. The server renders the
-  block (`mcp_server/preferences_routes.render_block`): the same header and the same
-  lines the clients printed, at most seven preferences.
-- **Only the parts asked for are built.** `parts=preferences` builds no board. A name
-  the server does not know is ignored, so a later client can ask this server for a part
-  it does not have. A request with no `parts` gets the board alone: that is what every
-  client released so far sends, and their replies are unchanged.
-- **The preferences never cost the board.** If the block cannot be built the reply holds
-  `"preferences": ""` and the board. A board that cannot be built is a 500, as before.
+- **A session start is one request.** `GET /context?parts=board,preferences` returns
+  the board and the preferences block together, and the server renders the block.
+  Before, every client also read `/preferences/top` and rendered the block itself; in
+  Claude Code that was a second hook and a second Python process.
+- **Only the parts asked for are built.** A request with no `parts` gets the board
+  alone, which is what every client released so far sends: their replies are unchanged.
 - **Who is served what is unchanged.** The block comes from the query behind
-  `/preferences/top`, with the trust the caller's token resolves to: a full-trust device
-  sees every preference, a restricted device those of its allowlisted projects, the root
-  token none.
-- **The clients.** `synapse_client.context.server_parts` makes the request and returns
-  the two pieces; `session_block` is built on it. Claude Code: `board_block.py` prints
-  both, and the `preferences_block.py` hook and script are gone. Codex's session-start
-  hook and the Hermes provider make the one request.
-- **A piece switched off is not asked for.** `SYNAPSE_PREFS_BLOCK=0` asks for the board
-  alone. `SYNAPSE_BOARD=0` asks for the preferences alone and sends no project. With
-  both off there is no request.
-- **An older server still works.** It answers with the board and no `preferences` key.
-  The client then reads `/preferences/top` and renders the block itself, in what is left
-  of the same timeout. The route stays (the dashboard reads it); the client's fallback is
-  kept for one release.
+  `/preferences/top`, with the trust the caller's token resolves to.
+- **Claude Code's `preferences_block.py` hook and script are gone**: `board_block.py`
+  prints both. `SYNAPSE_PREFS_BLOCK=0` and `SYNAPSE_BOARD=0` each leave their piece out
+  of the request; with both off there is no request.
+- **An older server still works.** Its reply has no `preferences`, and the client then
+  reads `/preferences/top` itself. That fallback is kept for one release.
 
 **On each machine**
 
@@ -49,27 +32,11 @@ two, and everything that is still open.
 
 **Proven**
 
-- `tests/test_context_parts.py` (no database): the parts a request names; the reply for
-  each (no parameter is the board alone, byte for byte what a released client gets; both
-  parts; the preferences alone build no board; an unknown name builds nothing);
-  preferences that cannot be built leave `""` and the board; a board that cannot be
-  built is a 500 with no preferences built; no token is a 401.
-- `tests/test_board.py`, `tests/test_preferences_routes.py` (ParadeDB, schema 069): the
-  route against a real database, with and without `parts`, for a full-trust device and
-  for an unknown caller; the block for full, restricted and unknown trust is what
-  `/preferences/top` serves each; the block holds the strongest seven.
-- `tests/test_client_core_context.py`: one request for both pieces; the server's block
-  is shown as it came; a piece switched off is not asked for; an older server is asked
-  for `/preferences/top` with what is left of the timeout, and a failure there keeps
-  the board; a reply of the wrong shape never raises. The server's renderer and the
-  client's fallback give the same text for the same items.
-- `tests/test_claude_on_core.py`, `tests/test_codex_on_core.py`,
-  `tests/test_hermes_provider.py`: each harness makes one request, prints both blocks in
-  order, honours the two switches, and works against an older server. Claude Code has no
-  preferences hook left, and with the board off its hook does not read the payload.
-- 25 changes tried against the new rules (each should break a test): all 25 caught.
-- The database suite (1581 passed) against a local ParadeDB with every schema file
-  applied, and the full non-database suite.
+- Tests: the route in `tests/test_context_parts.py` and, against a real database, in
+  `tests/test_board.py` and `tests/test_preferences_routes.py`; the clients in
+  `tests/test_client_core_context.py`, `test_claude_on_core.py`, `test_codex_on_core.py`
+  and `test_hermes_provider.py`. 25 single changes to the new rules were tried, and the
+  tests failed on each.
 
 **Still open**
 
