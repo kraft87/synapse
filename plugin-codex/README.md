@@ -99,9 +99,12 @@ synapse login                                            # or: synapse login --t
 `synapse login` enrolls the machine (or stores a token minted with
 `docker compose exec mcp-server synapse-admin bootstrap "<label>"`), saves its settings in
 `~/.synapse/config.json`, and writes six hook blocks plus the `synapse` MCP server into
-`~/.codex/config.toml` (`synapse install codex` does that step alone). Then start `codex`,
-run `/hooks`, and trust the new hooks — Codex refuses unreviewed hooks. Nothing about this
-needs `~/.claude`.
+`~/.codex/config.toml` (`synapse install codex` does that step alone). Start `codex`: after the folder-trust prompt it shows "Hooks need review"; choose "Trust all
+and continue" (dismissed it? run `/hooks` and press `t`). Untrusted hooks are skipped with no
+message, so that session gets no memory and uploads nothing. The first time Codex calls each
+Synapse tool (`recall`, `remember`, `fetch`, `recall_feedback`) it asks for approval: choose
+"Always allow", or a stray keypress can cancel a memory write.
+Nothing about this needs `~/.claude`.
 
 From a git checkout, `python3 plugin-codex/install.py --synapse-url http://your-synapse:8765`
 writes the same blocks pointing at the checkout; re-run it after upgrades.

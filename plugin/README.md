@@ -22,13 +22,15 @@ The per-hook table, the MCP tool list, every configuration variable, and exactly
 your machine: **[docs/tools.md](../docs/tools.md)**.
 
 The dream→skills lane (mines your transcripts → proposes new skills, retunes triggers,
-nominates merges) runs server-side in the `dream` container — you don't run a cron. You
-just review what it proposes with `/synapse:skill-review`.
+nominates merges) runs server-side in the `dream` container and is off by default: set
+`SKILLS_LANE_ENABLED=1` in the server's `.env` to turn it on, then review what it proposes
+with `/synapse:skill-review`.
 
 ## Setup
 
-Prerequisites: a running Synapse server, Claude Code (and/or Codex), and Python 3.11+ on
-PATH — everything is stdlib, no `pip install`.
+Prerequisites: a running Synapse server, Claude Code, Codex or Hermes, and Python 3.11 or
+newer as `python3` on PATH (the hooks run `python3`; check with `python3 --version`).
+Everything is stdlib, no `pip install`.
 
 ### 1. Stand up the server
 
@@ -268,7 +270,7 @@ The same client wires [Hermes](https://github.com/NousResearch/hermes-agent) as 
 provider. `synapse login` does it when it finds Hermes; to do it alone:
 
 ```
-synapse install hermes                         # the home is $HERMES_HOME, else ~/.hermes
+synapse install hermes                         # $HERMES_HOME, else ~/.hermes (Windows: %LOCALAPPDATA%\hermes)
 synapse install hermes --hermes-home PATH      # another home (a Hermes profile)
 synapse install hermes --replace               # take over from another external provider
 ```
@@ -282,6 +284,9 @@ either way. `synapse update` rebuilds the folder for a new client version, and `
 status` says whether it is wired. Restart Hermes to load it: `hermes chat` and the TUI run
 their turns in Hermes's gateway daemon, so stop it with `hermes gateway stop` (the next
 `hermes chat` starts it again).
+
+Not on Windows yet: Hermes runs `hermes chat` and the TUI in its gateway, and Synapse cannot
+match a Windows account to those sessions, so they get nothing.
 
 **What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
 ACP editor): the board and your preferences in the system prompt at session start, the

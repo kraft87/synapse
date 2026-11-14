@@ -2,3 +2,5 @@
 plugin/bin/* text eol=lf
 # Windows batch launchers stay CRLF.
 *.cmd text eol=crlf
+# Shell scripts run inside Linux containers (schema init); a CRLF checkout on Windows breaks them.
+*.sh text eol=lf

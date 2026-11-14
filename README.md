@@ -68,7 +68,8 @@ Single box, everything local:
 
 ```bash
 git clone https://github.com/kraft87/synapse.git synapse && cd synapse
-cp .env.example .env                 # or a preset from examples/env/
+cp examples/env/voyage.env .env      # or local.env / openrouter.env; then fill in the
+                                     # CHANGEMEs, your keys and SYNAPSE_OWNER_NAME
 docker compose up -d --build         # builds the image, starts Postgres + poller + MCP server
 docker compose exec mcp-server synapse-admin bootstrap "this laptop"
 ```
@@ -86,8 +87,9 @@ synapse login --token     # paste the token above when asked; plain `synapse log
 
 `synapse login` asks this machine's questions once (personal or work; sync skills here?),
 keeps the answers and the credential in `~/.synapse/config.json`, and wires up every coding
-harness it finds: the Claude Code plugin and Codex's hooks and MCP entry. Restart Claude
-Code (or run `/reload-plugins`); in Codex, trust the new hooks with `/hooks`.
+harness it finds: the Claude Code plugin, Codex's hooks and MCP entry, and the Hermes memory
+provider. Restart Claude Code (or run `/reload-plugins`). In Codex, choose "Trust all and
+continue" when it asks about the new hooks. For Hermes, run `hermes gateway stop`.
 
 Required values, verification steps, importing your existing history, upgrades, and
 troubleshooting: **[docs/install.md](docs/install.md)**.
