@@ -44,7 +44,10 @@ It differs where Codex works differently:
 - **The recall-feedback hook checks the tool name itself** (`recall` or
   `recall_full_turns`), whatever the hook's matcher.
 - **Uploads read Codex rollouts**, with this hook's own cursor file and cursor rules; the
-  retry and warning rules are shared (below).
+  retry and warning rules are shared (below). The records past the cursor are sent as
+  read, so a turn goes with the `turn_context` Codex writes before it (its model and
+  cwd). When they start inside a turn, the whole rollout is sent again and the server
+  drops the turns it holds.
 
 Skills sync shares the Claude plugin's engine and its opt-in (`skills_sync` in
 `~/.synapse/config.json`; `synapse login` asks). It syncs Synapse's global skills two-way

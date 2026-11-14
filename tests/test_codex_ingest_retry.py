@@ -39,6 +39,8 @@ from types import ModuleType
 
 import pytest
 
+from ingestion.codex_client import CodexRolloutParser
+
 _REPO = Path(__file__).resolve().parents[1]
 _STOP_HOOK = _REPO / "plugin-codex" / "hooks" / "synapse_stop_hook.py"
 _SESSION_START = _REPO / "plugin-codex" / "hooks" / "session_start.py"
@@ -550,6 +552,156 @@ def test_session_start_end_to_end(env, tmp_path):
     out = json.loads(proc.stdout)
     assert "(connection refused)" in out["systemMessage"]
     assert out["hookSpecificOutput"]["additionalContext"] == out["systemMessage"]
+
+
+# ---------------------------------------------------------------------------
+# What a shipped tail holds
+# ---------------------------------------------------------------------------
+
+
+def _event(kind: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": kind}}
+
+
+def _context(model: str, cwd: str) -> dict:
+    return {"type": "turn_context", "payload": {"cwd": cwd, "model": model}}
+
+
+def _tool_output(text: str) -> dict:
+    return {
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call-1", "output": text},
+    }
+
+
+def _append(path: str, records: list[dict]) -> None:
+    with open(path, "ab") as f:
+        for r in records:
+            f.write(json.dumps(r).encode() + b"\n")
+
+
+def _rollout(sessions: Path, records: list[dict]) -> str:
+    day = sessions / "2026" / "01" / "31"
+    day.mkdir(parents=True, exist_ok=True)
+    path = str(day / f"rollout-2026-01-31T09-12-00-{uuid.uuid4()}.jsonl")
+    _append(path, records)
+    return path
+
+
+def _episodes(records: list[dict], path: str) -> list:
+    """What the server stores for ``records``, as the /ingest route parses a push."""
+    return CodexRolloutParser().parse_records(records, "codex-hook", session_id_hint=_sid(path))
+
+
+def test_a_later_turn_is_shipped_with_its_turn_context(hook, monkeypatch):
+    """Codex writes a turn's turn_context before its user message. It carries the turn's
+    model and cwd, and the server reads them from the records it is sent: a tail trimmed
+    forward to the user message stored the turn with neither."""
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    first = [
+        _event("task_started"),
+        _context("model-a", "/work/one"),
+        _user("q1"),
+        _assistant("r1"),
+        _event("task_complete"),
+    ]
+    path = _rollout(hook.SESSIONS_ROOT, first)
+    assert _stop(hook, path) == (1, len(first))
+    second = [
+        _event("thread_settings_applied"),
+        _event("task_started"),
+        _context("model-b", "/work/two"),
+        _user("q2"),
+        _assistant("r2"),
+        _event("task_complete"),
+    ]
+    _append(path, second)
+    assert _stop(hook, path) == (1, len(second))
+    assert posted == [first, second]
+    (episode,) = _episodes(posted[1], path)
+    assert (episode.human_turn, episode.assistant_turn) == ("q2", "r2")
+    assert (episode.model, episode.metadata["cwd"]) == ("model-b", "/work/two")
+
+
+def test_what_codex_injects_before_a_turn_is_not_the_middle_of_one(hook, monkeypatch):
+    """Instructions for the model, the environment block and the world state come before
+    a turn's user message too. None of them is part of a turn."""
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    first = [_user("q1"), _assistant("r1")]
+    path = _rollout(hook.SESSIONS_ROOT, first)
+    _stop(hook, path)
+    developer = _assistant("instructions for the model")
+    developer["payload"]["role"] = "developer"
+    second = [
+        _event("task_started"),
+        developer,
+        _user(hook._MACHINERY_PREFIXES[0] + " not something the user typed"),
+        {"type": "world_state", "payload": {"cwd": "/work"}},
+        {"type": "response_item", "payload": {"type": "reasoning", "summary": []}},
+        _context("model-b", "/work/two"),
+        _user("q2"),
+        _assistant("r2"),
+    ]
+    _append(path, second)
+    assert _stop(hook, path) == (1, len(second))
+    assert posted == [first, second]
+
+
+@pytest.mark.parametrize(
+    ("rest", "later"),
+    [
+        pytest.param(
+            [
+                _tool_output("what the tool printed"),
+                _assistant("r1 in full"),
+                _event("task_complete"),
+                _event("task_started"),
+                _context("model-b", "/work/two"),
+                _user("q2"),
+                _assistant("r2"),
+            ],
+            ["q2"],
+            id="the next turn follows",
+        ),
+        pytest.param([_assistant("r1 in full"), _event("task_complete")], [], id="nothing follows"),
+    ],
+)
+def test_a_tail_that_starts_inside_a_turn_is_reshipped_from_the_start(
+    hook, monkeypatch, rest, later
+):
+    """A sweep can ship a rollout while a turn is still being written. The rest of that
+    turn then leads the next tail, and the turn's start is before the cursor. Trimmed
+    forward to the next user message, the rest was never sent."""
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    first = [_user("q1"), _assistant("r1 so far")]
+    path = _rollout(hook.SESSIONS_ROOT, first)
+    assert _stop(hook, path) == (1, len(first))
+    _append(path, rest)
+    assert _stop(hook, path) == (1, len(first) + len(rest))
+    assert posted == [first, [*first, *rest]]
+    episodes = _episodes(posted[1], path)
+    assert episodes[0].human_turn == "q1" and episodes[0].assistant_turn == "r1 in full"
+    assert [e.human_turn for e in episodes[1:]] == later
+    assert _stop(hook, path) == (0, 0)  # the cursor is at the end of the file
+
+
+def test_a_tail_of_lifecycle_records_alone_is_shipped_as_read(hook, monkeypatch):
+    """Events Codex writes after the hook has read (the turn's token count, its
+    completion) are no part of a turn: they are not a reason to send the whole file
+    again."""
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    first = [_user("q1"), _assistant("r1")]
+    path = _rollout(hook.SESSIONS_ROOT, first)
+    _stop(hook, path)
+    late = [_event("token_count"), _event("task_complete")]
+    _append(path, late)
+    assert _stop(hook, path) == (1, len(late))
+    assert posted == [first, late] and _episodes(late, path) == []
+    assert _stop(hook, path) == (0, 0)
 
 
 # ---------------------------------------------------------------------------
