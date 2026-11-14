@@ -106,6 +106,7 @@ _DB_FILES = {
     "test_span_prefix_migration_db.py",
     "test_web_audience_db.py",
     "test_repair_numbered_entity_magnets_db.py",
+    "test_rename_owner_in_facts_db.py",
     "test_one_memory_merge_067_db.py",
     "test_one_memory_cleanup_069_db.py",
     "test_note_tiers_db.py",

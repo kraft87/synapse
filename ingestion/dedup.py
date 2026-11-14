@@ -114,8 +114,13 @@ _DEFAULT_LLM_MODEL = "claude-haiku-4-5"
 # not reversible at this layer.
 
 
+def owner_name() -> str:
+    """The name the owner's entity is stored under: SYNAPSE_OWNER_NAME, default "User"."""
+    return (os.getenv("SYNAPSE_OWNER_NAME") or "User").strip() or "User"
+
+
 def _build_canonical_aliases() -> dict[str, str]:
-    owner = (os.getenv("SYNAPSE_OWNER_NAME") or "User").strip() or "User"
+    owner = owner_name()
     aliases = {"user": owner, "the user": owner}
     for spelling in (os.getenv("SYNAPSE_OWNER_ALIASES") or "").split(","):
         spelling = _normalize_name(spelling)
