@@ -29,6 +29,7 @@ import os
 import subprocess
 import textwrap
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -105,6 +106,7 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"null")
         self._record(body)
         if self.path == "/ingest":
+            time.sleep(self.server.ingest_delay)
             self._send(200, {"status": "ok", "episodes": 1})
         elif self.path == "/mcp":
             text = json.dumps({"served": body["params"]["arguments"]})
@@ -125,6 +127,8 @@ class _Server(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         self.seen: list[dict[str, Any]] = []
+        #: Seconds an ``/ingest`` request waits for its answer.
+        self.ingest_delay = 0.0
 
     @property
     def url(self) -> str:
@@ -230,6 +234,15 @@ _DRIVER = textwrap.dedent(
 
     provider = load_memory_provider("synapse")
     out["loaded"] = provider is not None and provider.name == "synapse"
+
+
+    def uploaded():
+        # Hermes's worker has run the hook, and the provider's own thread has no upload
+        # left. In Hermes's plugin host the provider is in another process: there only
+        # Hermes's shutdown waits for it (shutdown_all).
+        done = manager.flush_pending(timeout=60)
+        return done and (sys.argv[5] == "host" or provider._later.wait(60))
+
     out["available"] = bool(provider and provider.is_available())
 
     manager = MemoryManager()
@@ -258,11 +271,11 @@ _DRIVER = textwrap.dedent(
 
     messages = [{"role": "system", "content": "You are Hermes."}] + turn(1, tool=True)
     manager.sync_all("question 1", "answer 1", session_id=sid, messages=messages)
-    out["flushed_1"] = manager.flush_pending(timeout=60)
+    out["flushed_1"] = uploaded()
 
     messages += turn(2)
     manager.sync_all("question 2", "answer 2", session_id=sid, messages=messages)
-    out["flushed_2"] = manager.flush_pending(timeout=60)
+    out["flushed_2"] = uploaded()
 
     messages += [
         {
@@ -330,7 +343,14 @@ _SWITCH_DRIVER = textwrap.dedent(
 
 
     manager = MemoryManager()
-    manager.add_provider(load_memory_provider("synapse"))
+    provider = load_memory_provider("synapse")
+    manager.add_provider(provider)
+
+
+    def uploaded():  # as in the driver above
+        done = manager.flush_pending(timeout=60)
+        return done and (sys.argv[5] == "host" or provider._later.wait(60))
+
     manager.initialize_all(
         session_id=sid,
         platform="cli",
@@ -346,14 +366,91 @@ _SWITCH_DRIVER = textwrap.dedent(
     )
     messages = [{"role": "system", "content": "You are Hermes."}] + turn(1)
     manager.sync_all("question 1", "answer 1", session_id=sid, messages=messages)
-    manager.flush_pending(timeout=60)
+    uploaded()
     manager.on_pre_compress(messages)
     manager.on_session_switch(child, parent_session_id=sid, reset=False, reason="compression")
     messages += turn(2)
     manager.sync_all("question 2", "answer 2", session_id=child, messages=messages)
-    out["flushed"] = manager.flush_pending(timeout=60)
+    out["flushed"] = uploaded()
     manager.on_session_end(messages)
     manager.shutdown_all()
+
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        host = get_plugin_manager()._running_plugin_host()
+        out["host_pid"] = host.pid if host is not None else None
+        if host is not None:
+            host.shutdown()
+    except Exception as exc:
+        out["host_error"] = repr(exc)
+    print("RESULT " + json.dumps(out))
+    """
+)
+
+
+#: A turn whose upload is still in flight when Hermes closes the session: the calls
+#: run_agent.py makes (``_sync_external_memory_for_turn``, ``shutdown_memory_provider``).
+_CLOSE_DRIVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+    import time
+
+    from agent.memory_manager import MemoryManager
+    from plugins.memory import load_memory_provider
+
+    sid, model, secret, cwd = sys.argv[1:5]
+    home = os.environ["HERMES_HOME"]
+    outbox = os.path.join(home, "synapse", "outbox")
+    out = {"warnings": []}
+
+
+    def in_flight():
+        names = os.listdir(outbox) if os.path.isdir(outbox) else []
+        return [name for name in names if name.endswith(".sending")]
+
+
+    manager = MemoryManager()
+    manager.add_provider(load_memory_provider("synapse"))
+    manager.initialize_all(
+        session_id=sid,
+        platform="cli",
+        hermes_home=home,
+        agent_context="primary",
+        warning_callback=out["warnings"].append,
+        status_callback=lambda *args: None,
+        resumed=False,
+        message_count=0,
+        cwd=cwd,
+        agent_identity="default",
+        agent_workspace="hermes",
+    )
+    manager.on_turn_start(
+        1, "question 1", model=model, author_id=None, author_name=None,
+        author_is_bot=False, previous_message="",
+    )
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "question 1", "timestamp": 1001.0},
+        {"role": "assistant", "content": "answer 1"},
+    ]
+    began = time.monotonic()
+    manager.sync_all("question 1", "answer 1", session_id=sid, messages=messages)
+    out["flushed"] = manager.flush_pending(timeout=60)
+    out["hook_seconds"] = time.monotonic() - began
+
+    deadline = time.monotonic() + 30
+    while not in_flight() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    out["in_flight"] = len(in_flight())
+
+    began = time.monotonic()
+    manager.on_session_end(messages)
+    manager.shutdown_all()
+    out["close_seconds"] = time.monotonic() - began
+    out["left"] = sorted(os.listdir(outbox))
 
     try:
         from hermes_cli.plugins import get_plugin_manager
@@ -430,7 +527,7 @@ def _run(
         "SYNAPSE_TEST_NETWORK_LOG": str(network_log),
     }
     done = subprocess.run(
-        [str(python), str(driver), _SID, _MODEL, _SECRET, str(project)],
+        [str(python), str(driver), _SID, _MODEL, _SECRET, str(project), isolation],
         cwd=str(checkout),
         env=env,
         capture_output=True,
@@ -561,3 +658,26 @@ def test_a_private_conversation_stays_private_when_hermes_compresses_it(
     assert [r["path"] for r in server.requests("PUT", "/")] == [f"/private-sessions/{child}"]
     assert server.requests("POST", "/ingest") == []
     assert server.requests("GET", "/context")  # the session itself was a working one
+
+
+@pytest.mark.parametrize("isolation", ["in_process", "host"])
+def test_hermes_does_not_wait_for_an_upload_until_it_closes(
+    tmp_path: Path, server: _Server, isolation: str
+) -> None:
+    """The server takes 1.5 seconds to answer an upload. Hermes's worker has run
+    ``sync_turn`` long before that: the provider handed the upload to its own thread.
+    Hermes then closes the session with the request still in flight, and its
+    ``shutdown`` call waits for it: the turn is delivered, and nothing is left in the
+    outbox for a later drain. In the plugin host too, where the wait is in another
+    process and the host is stopped right after."""
+    server.ingest_delay = 1.5
+    out = _run(tmp_path, server, isolation, _CLOSE_DRIVER)
+    assert out["network"] == "" and out["warnings"] == []
+    if isolation == "host":
+        assert out.get("host_pid"), "the provider did not run in Hermes's plugin host"
+    assert out["flushed"] and out["hook_seconds"] < 1.0
+    assert out["in_flight"] == 1
+    assert 0.3 < out["close_seconds"] < 5.0
+    assert out["left"] == []
+    (post,) = server.requests("POST", "/ingest")
+    assert [e.human_turn for e in _stored([post["body"]])] == ["question 1"]

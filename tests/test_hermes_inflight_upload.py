@@ -1,8 +1,9 @@
 """An upload in flight when its process exits is not lost.
 
-Hermes calls ``sync_turn`` on a background worker that an exiting process does not wait
-for, and the provider marks a turn sent before its request so that a concurrent hook
-cannot send it twice; a request cut off by the exit used to take the turn with it. Each
+A turn's upload runs on a thread of the provider's own (background.py) that an exiting
+process waits for a few seconds at most, and the provider marks a turn sent before its
+request so that a concurrent hook cannot send it twice; a request cut off by the exit
+used to take the turn with it. Each
 batch is now written to the outbox before its request and removed once delivered, so
 the batch of a request that never finished waits there for a later drain.
 
