@@ -286,8 +286,9 @@ the active one (`synapse ← active`). Start a new `hermes` session to use it; a
 already open stays without it. After `synapse update`, run `hermes gateway stop` first, so
 the gateway loads the new code (the next `hermes` starts it again).
 
-Not on Windows yet: Hermes runs `hermes chat` and the TUI in its gateway, and Synapse cannot
-match a Windows account to those sessions, so they get nothing.
+On Windows, Hermes names the owner by the account's SID. Synapse reads the same SID,
+and a Windows test checks it against Hermes's own identity code. A full chat has not
+been run on Windows yet.
 
 **What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
 ACP editor): the board and your preferences in the system prompt at session start, the

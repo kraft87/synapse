@@ -62,12 +62,14 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
   (gateway/session_execution.py ``_build_fresh_agent``; gateway/run_turn_runner.py maps
   ``Platform.LOCAL`` to "cli"/"tui"/"desktop"/"acp"): ``chat_type`` "dm", ``chat_id``
   ``local-<64 hex>`` (hermes_state_keys.py ``local_identity``), ``gateway_session_key``
-  ``agent:<profile>:local:dm:<chat_id>``, and ``user_id`` this machine's owner,
-  ``uid:<os.getuid()>``. That is the subject gateway/control_socket.py mints for a peer
-  of the same OS user (SO_PEERCRED), and also the one every dashboard or Webapp login
-  acts as (gateway/owner_identity.py ``principal_subject``): Hermes treats whoever
-  signs in to its dashboard as the machine's owner, and so does this rule. POSIX only:
-  on Windows the subject is a SID and such a session is INERT.
+  ``agent:<profile>:local:dm:<chat_id>``, and ``user_id`` this machine's owner:
+  ``uid:<os.getuid()>`` on POSIX, ``sid:<the process user's SID>`` on Windows
+  (winsid.py). That is the subject Hermes mints for a peer of the same OS user
+  (gateway/control_socket.py, SO_PEERCRED; gateway/runtime_bootstrap_windows.py
+  ``_peer_subject``, the named pipe), and also the one every dashboard or Webapp login
+  acts as (gateway/owner_identity.py ``principal_subject``, ``host_owner_subject``):
+  Hermes treats whoever signs in to its dashboard as the machine's owner, and so does
+  this rule. When the subject cannot be read, no session matches it: INERT.
 
 The session store (``check_session``)
 -------------------------------------
@@ -151,6 +153,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from . import winsid
+from .install import default_home
 from .lineage import Parent, chain, lineage
 from .marks import mark, marked
 
@@ -216,9 +220,13 @@ def _word(value: Any) -> str:
 
 
 def owner_subject() -> str | None:
-    """The gateway's subject for this machine's owner, ``uid:<n>``; None off POSIX."""
+    """The gateway's subject for this machine's owner: ``uid:<n>`` on POSIX,
+    ``sid:<sid>`` on Windows; None when it cannot be read, which matches no session."""
     getuid = getattr(os, "getuid", None)
-    return f"uid:{getuid()}" if getuid is not None else None
+    if getuid is not None:
+        return f"uid:{getuid()}"
+    sid = winsid.process_sid()
+    return f"sid:{sid}" if sid else None
 
 
 def foreign(owner_id: str | None, author_id: Any, author_name: Any, is_bot: Any) -> bool:
@@ -272,8 +280,7 @@ def gateway_daemon(home: Any) -> bool:
     ``gateway.pid`` record under ``home`` or the process's own Hermes home names it."""
     homes = [str(home)] if home else []
     try:
-        own = os.environ.get("HERMES_HOME", "").strip() or str(Path.home() / ".hermes")
-        homes.append(os.path.expanduser(os.path.expandvars(own)))
+        homes.append(str(default_home()))
     except RuntimeError:  # no home directory to fall back on
         pass
     pid = os.getpid()

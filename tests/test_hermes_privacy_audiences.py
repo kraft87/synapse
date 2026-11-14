@@ -82,7 +82,7 @@ def _row(
                 sid,
                 source,
                 source,
-                f"uid:{os.getuid()}",
+                gs._owner(),
                 chat,
                 "dm" if chat else None,
                 f"agent:main:local:dm:{chat}" if chat else None,

@@ -40,7 +40,9 @@ _conversation = base._conversation
 _say = base._say
 _users = base._users
 
-pytestmark = pytest.mark.skipif(not hasattr(os, "getuid"), reason="the owner subject is POSIX")
+pytestmark = pytest.mark.skipif(
+    hs.owner_subject() is None, reason="this machine's owner subject cannot be read"
+)
 
 _HEX = "3e92f8ba0647c963b66d514db0cb594ffd73a1931bcff8f210f4f544d435ca66"
 _LOCAL = f"local-{_HEX}"
@@ -49,7 +51,11 @@ _WORK = "/home/kyle/work/hermes-scratch"
 
 
 def _owner() -> str:
-    return f"uid:{os.getuid()}"
+    """This machine's owner as the gateway names it: ``uid:<n>``, or ``sid:<sid>`` on
+    Windows."""
+    owner = hs.owner_subject()
+    assert owner is not None
+    return owner
 
 
 def _gateway(sid: str = _LOCAL, **extra: Any) -> dict[str, Any]:
@@ -254,12 +260,99 @@ def test_a_cron_job_is_inert_with_or_without_a_chat():
         assert verdict.mode == hs.INERT and "cron job" in verdict.reason
 
 
-def test_off_posix_a_gateway_session_is_inert(monkeypatch):
+_SID = "S-1-5-21-3623811015-3361044348-30300820-1013"
+
+
+def _windows(monkeypatch, sid: Any) -> None:
+    """This process as Windows: no ``os.getuid``, and the SID lookup answering ``sid``
+    (an exception instance is raised instead)."""
+    if hasattr(os, "getuid"):
+        monkeypatch.delattr(os, "getuid")
+
+    def lookup() -> Any:
+        if isinstance(sid, BaseException):
+            raise sid
+        return sid
+
+    monkeypatch.setattr(hs.winsid, "_lookup", lookup)
+    monkeypatch.setattr(hs.winsid, "WINDOWS", True)
+
+
+def test_on_windows_the_owner_is_the_process_users_sid(monkeypatch):
+    """gateway/session_worker_reservation.py ``owner_worker_subject``: ``"sid:" +
+    _process_sid(os.getpid())``; the control pipe mints the same for a same-user peer."""
+    _windows(monkeypatch, _SID)
+    assert hs.owner_subject() == f"sid:{_SID}"
+    assert hs.from_keywords(_gateway(user_id=f"sid:{_SID}")).mode == hs.ACTIVE
+
+
+def test_on_windows_only_that_exact_sid_matches(monkeypatch):
+    _windows(monkeypatch, _SID)
+    for other in (
+        "sid:S-1-5-21-3623811015-3361044348-30300820-1014",  # another account
+        f"sid:{_SID.lower()}",
+        _SID,
+        f"uid:{_SID}",
+        "uid:1000",
+        f"sid:{_SID} ",
+        "",
+        None,
+    ):
+        assert hs.from_keywords(_gateway(user_id=other)).mode == hs.INERT, other
+
+
+def test_on_windows_a_failed_lookup_matches_no_one(monkeypatch):
+    """Any error, or an answer that is not a SID, is no owner: every gateway session is
+    inert (fail closed). An in-process session never needed the subject."""
+    shapes = [_gateway(user_id="sid:None"), _gateway(user_id="sid:"), _gateway()]
+    for answer in (
+        OSError(5, "Access is denied"),
+        AttributeError("WinDLL"),
+        RuntimeError("anything"),
+        None,
+        "",
+        "S-1-",
+        "s-1-5-21-1",
+        "S-1-5-21-1\n",
+        "sid:S-1-5-21-1",
+        b"S-1-5-21-1",
+    ):
+        _windows(monkeypatch, answer)
+        assert hs.owner_subject() is None, answer
+        for shape in shapes:
+            assert hs.from_keywords(shape).mode == hs.INERT
+        assert hs.from_keywords(_in_process()).mode == hs.ACTIVE
+
+
+def test_off_windows_and_off_posix_there_is_no_owner(monkeypatch):
     shape = _gateway()
-    monkeypatch.delattr(os, "getuid")
+    if hasattr(os, "getuid"):
+        monkeypatch.delattr(os, "getuid")
+    monkeypatch.setattr(hs.winsid, "WINDOWS", False)
+    monkeypatch.setattr(hs.winsid, "_lookup", lambda: _SID)
     assert hs.owner_subject() is None
     assert hs.from_keywords(shape).mode == hs.INERT
-    assert hs.from_keywords(_in_process()).mode == hs.ACTIVE
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX")
+def test_on_posix_the_uid_wins_over_any_sid(monkeypatch):
+    monkeypatch.setattr(hs.winsid, "process_sid", lambda: _SID)
+    assert hs.owner_subject() == f"uid:{os.getuid()}"
+    assert hs.from_keywords(_gateway(user_id=f"sid:{_SID}")).mode == hs.INERT
+
+
+def test_on_windows_a_receipt_must_name_the_sid(tmp_path, monkeypatch):
+    """The creation receipt's ``principal_id`` is held to the same subject."""
+    _windows(monkeypatch, _SID)
+    owner = f"sid:{_SID}"
+    _store(tmp_path, _LOCAL, principal=owner)
+    verdict = hs.check_session(str(tmp_path), _LOCAL, _gateway(user_id=owner))
+    assert verdict.mode == hs.ACTIVE, verdict
+    other = tmp_path / "other"
+    other.mkdir()
+    _store(other, _LOCAL, principal="sid:S-1-5-21-1-2-3-500")
+    verdict = hs.check_session(str(other), _LOCAL, _gateway(user_id=owner))
+    assert verdict.mode == hs.INERT and "someone other" in verdict.reason
 
 
 # ---------------------------------------------------------------------------
