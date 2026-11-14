@@ -61,6 +61,7 @@ two, and everything that is still open.
   so the provider uploads nothing from it. At bca51750 no product code starts it: the
   TUI and Desktop attach to the gateway. The backend takes the same lock at upstream
   head d3d4ee4c (read, not run).
+
 ## 2026-11-14 — recall: callers are told the name to use in a query about the owner (no schema change)
 
 **What changed**
