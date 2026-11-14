@@ -111,6 +111,20 @@ def test_banner_says_how_to_word_a_query_about_the_owner(conn, db_url, monkeypat
     assert text.index("Absence from this board") < text.index("Memory is written in third person")
 
 
+def test_banner_has_no_owner_hint_without_a_name_or_on_a_restricted_surface(
+    conn, db_url, monkeypatch
+):
+    """No name set: the facts say "User" and no hint was measured for that. A restricted
+    surface is not served the owner's facts and is not told the owner's name."""
+    _wipe(conn)
+    monkeypatch.delenv("SYNAPSE_OWNER_NAME", raising=False)
+    assert "third person" not in _board(db_url, None)["text"]
+    monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
+    restricted = build_board(db_url, None, register_restricted(conn, ["alpha"]))
+    assert restricted["trust"] == "restricted"
+    assert "Sam" not in restricted["text"]
+
+
 def test_banner_counts_and_recent_projects(conn, db_url):
     _wipe(conn)
     _episode(conn, "s1", 1, "alpha", days_ago=5)

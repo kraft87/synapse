@@ -280,6 +280,9 @@ def _request_trust(request: Request) -> SurfaceTrust:
     )
 
 
+# Empty on an install with no owner name set.
+_OWNER_HINT = f"{hint} " if (hint := owner_query_hint(owner_name())) else ""
+
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
 # this string load at session start — it is the always-loaded orientation surface that
 # tells the model these tools exist and when to reach for them. Claude Code truncates
@@ -292,7 +295,7 @@ _INSTRUCTIONS = (
     "session start where the client supports it; note bodies expand by id. "
     "BEFORE answering anything that references past work — a prior decision, "
     "device, purchase, tool, project, person, or preference — search with "
-    f"recall(query) first. {owner_query_hint(owner_name())} "
+    f"recall(query) first. {_OWNER_HINT}"
     "fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results; recall_full_turns searches complete raw turns — "
     "the retry when an overview recall comes back thin. WHEN the user states a "

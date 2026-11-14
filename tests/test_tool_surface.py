@@ -145,12 +145,21 @@ def test_instructions_say_how_to_word_a_query_about_the_owner():
     """A first-person question shares no name with third-person facts, and every recall
     query is written by a model: the one text every MCP client always loads tells it the
     name the memory uses."""
-    hint = owner_query_hint(owner_name())
-    assert hint in (server.mcp.instructions or "")
     assert owner_query_hint("Sam") == (
         'Memory is written in third person and calls the user "Sam": in a recall query '
         'about the user, write "Sam", not "I" or "my".'
     )
+    instructions = server.mcp.instructions or ""
+    if owner_name() == "User":
+        assert "third person" not in instructions
+    else:
+        assert f"recall(query) first. {owner_query_hint(owner_name())} fetch(ids)" in instructions
+
+
+def test_an_install_with_no_owner_name_gets_no_query_hint():
+    """Its facts say "User", which a first-person query already finds: telling a caller to
+    write "User" was never measured, so nothing is said."""
+    assert owner_query_hint("User") == ""
 
 
 def test_fetch_session_schema_stays_short():

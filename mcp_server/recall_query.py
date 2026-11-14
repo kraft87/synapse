@@ -14,9 +14,14 @@ _RERANK_WINDOW_SIZE = 1024
 
 
 def owner_query_hint(owner: str) -> str:
-    """How a caller words a recall query about the owner. Facts and notes are third-person
-    sentences under the owner's stored name, so a first-person question shares no name with
-    them and matches whatever else uses its other words."""
+    """How a caller words a recall query about the owner, or "" when no owner name is set.
+
+    Facts are third-person sentences under the owner's stored name, so a first-person
+    question shares no name with them and matches whatever else uses its other words. An
+    install with no name set stores "User", which a first-person query already finds, so
+    it gets no hint."""
+    if owner == "User":
+        return ""
     return (
         f'Memory is written in third person and calls the user "{owner}": in a recall query '
         f'about the user, write "{owner}", not "I" or "my".'

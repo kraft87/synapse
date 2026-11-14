@@ -10,7 +10,7 @@ two, and everything that is still open.
 
 **What changed**
 
-- **The fault.** Facts and notes are third-person sentences under the owner's name. Every
+- **The fault.** Facts are third-person sentences under the owner's name. Every
   recall query is written by a model, and a model asked "what do I like?" searches for
   "what do I like": a query with no name in it and no word a stored fact shares. Vague
   owner questions ("what do I own?", "what am I working on?") came back with whatever
@@ -19,8 +19,10 @@ two, and everything that is still open.
 - **One sentence, in two places.** The server instructions (the only text every MCP
   client always loads) and the board (for a client that reads only the board) now say:
   `Memory is written in third person and calls the user "<name>": in a recall query about
-  the user, write "<name>", not "I" or "my".` The name is `SYNAPSE_OWNER_NAME`, "User"
-  when unset, which is what such an install's facts say.
+  the user, write "<name>", not "I" or "my".` The name is `SYNAPSE_OWNER_NAME`.
+- **Who is not told.** An install with no name set gets no sentence: its facts say "User",
+  which a first-person query already finds. A restricted surface gets none on its board:
+  it is not served the owner's facts and is not told the owner's name.
 - **The query is not rewritten on the server.** The caller knows whether an "I" in its
   query is the owner or part of a quoted phrase; the server would be guessing.
 - This had to wait for the facts. With half of them worded "User", naming the owner
@@ -28,13 +30,17 @@ two, and everything that is still open.
 
 **What to do on each machine**
 
-Take the new image. No client change: the board text is the server's.
+An install that set `SYNAPSE_OWNER_NAME` after it had stored facts runs
+`scripts/rename_owner_in_facts.py` first (entry below): while old facts still say "User",
+a query that names the owner loses them (rank 1.05 -> 5.85 on the 20 such questions).
+Then take the new image. No client change: the board text is the server's.
 
 **What was proven**
 
 - `tests/test_tool_surface.py`: the instructions carry the sentence and still fit Claude
   Code's 2 KB cut (1,345 bytes with a four-letter name). `tests/test_board.py`: the board
-  carries it, with the configured name.
+  carries it, with the configured name, and not when no name is set or the surface is
+  restricted.
 - The stored facts were renamed on prod on 2026-11-14 (entry below). Two full
   classification runs proposed 4,320 and 4,326 facts. The plan that was applied kept only
   the words both runs named, 4,212 facts, after 97 facts the runs disagreed on and 14
@@ -50,10 +56,15 @@ Take the new image. No client change: the board text is the server's.
 
 **Open**
 
-- The 140 golden-generator calls ingested on 2026-11-09 are still stored. They list facts
-  beside the owner's name, so a question that names the owner draws them: 91 of the 333
-  episodes served for the 60 named questions, against 6 of 319 in the first person.
+- The 140 golden-generator calls ingested on 2026-11-09 listed facts beside the owner's
+  name, so a question that names the owner drew them: 91 of the 333 episodes served for
+  the 60 named questions, against 6 of 319 in the first person. They were deleted from
+  prod on 2026-11-14 (no chunk or fact cited them; backup in
+  `episodes_harness_purge_20261114`). The contamination guard keeps new ones out.
+- A first name also matches a namesake's older facts; the extraction rule that tells
+  them apart covers new facts only.
 - The same sentence is not in the clients' own prompt nudges.
+
 ## 2026-11-13 — codex: a turn is uploaded with its model and cwd (plugin 0.24.13)
 
 **What changed**
