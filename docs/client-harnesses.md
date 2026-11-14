@@ -419,11 +419,29 @@ or one holding only the bare notice) is not a reply, so a failed turn is never u
 its user message included; an assistant row of any other `display_kind` (a held turn's
 interim text, the interrupt placeholder) keeps only its tool calls.
 
+**Past sessions.** `synapse import hermes` (plugin/scripts/import_hermes.py) reads
+`<hermes_home>/state.db` read-only, in one transaction, and refuses a schema version it
+does not know. `harnesses/hermes/history.py` holds the rules. A session is imported when
+the provider would have been active in it, judged from what the store keeps: the row's
+chat identity through `sessions.from_keywords`, the row, receipt, title and lineage
+through `sessions._judge`, the marks (read, never written), and `session_admissions`
+(every turn the gateway admitted came from the owner or from the session's own
+automation). A row with no chat identity is an in-process session, unless it is an ACP
+one or a side agent (`bg_`, `btw_`, `preview_` ids). Private mode is checked for the
+session and every session whose turns it holds, by marker and by the server's row. The
+rows read are the live ones and those an in-place compaction archived, once per
+`message_uid`; a rewound row is left out. They become records through `to_records`,
+so a turn's span id is the one the provider gives it. A turn whose opening row belongs
+to a session the row continues (a branch or compression clone keeps its uid) is a copy
+and is left out. After a background `delegate_task` reports back, the follow-up reply
+lands on the turn that dispatched it: the import sends that turn once, under the key of
+its last reply. The provider sends the same turn under that key, and once before under
+the key of its first reply, so it leaves two episodes where the import leaves one.
+
 **Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
 spool (a `remember` call that fails is reported to the model, not queued), the
 recall-feedback nudge, skills sync into `$HERMES_HOME/skills`,
-config sync, a history
-importer for `state.db`, and Synapse in messaging-gateway and API-server sessions
+config sync, and Synapse in messaging-gateway and API-server sessions
 (above). Skill invocations are uploaded as Hermes hands them over: the manager strips
 the skill body from the user text it passes, not from `messages`.
 
@@ -442,7 +460,8 @@ the look-back of every first upload, and the `copied/` records of earlier client
 Hermes's own order of hooks),
 `test_hermes_private_command.py` (`/private`: what it does and who may run it),
 `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` and
-`test_hermes_install_selection.py`. `tests/test_hermes_integration.py` runs only with
+`test_hermes_install_selection.py`, and `test_hermes_history_import.py` (the importer,
+over a `state.db` built like Hermes's). `tests/test_hermes_integration.py` runs only with
 `SYNAPSE_HERMES_CHECKOUT` set to a Hermes checkout with its `.venv`: it installs into a
 temp home, loads the provider with Hermes's own loader and drives Hermes's
 `MemoryManager`, in-process and with `plugins.isolation: host`, against a local fake

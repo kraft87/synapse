@@ -21,6 +21,8 @@ Usage:
     synapse-import --yes                 # scripted: no prompts, import everything
     synapse-import --projects-dir DIR    # transcript root (default ~/.claude/projects)
     synapse-import --batch-size N        # records per POST (default 500)
+    synapse import hermes [--hermes-home PATH] [--yes] [--dry-run]
+                                         # past Hermes sessions instead (import_hermes.py)
 
 The interactive run offers a date-range prompt (by each file's last-activity
 date) before the cost summary, so a first import can be bounded — extraction
@@ -214,6 +216,11 @@ def _fmt_size(n: float) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "hermes":
+        import import_hermes  # past Hermes sessions, from its state.db
+
+        return import_hermes.main(argv[1:])
     ap = argparse.ArgumentParser(
         prog="synapse-import",
         description="Bulk-import existing Claude Code transcripts into Synapse "
