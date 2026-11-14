@@ -182,7 +182,8 @@ passes and, for a session they allow, Hermes's own record of who created it
   (`acp_adapter/server.py`, `gateway_server.py`; `tests/test_hermes_checkout_names.py`
   checks that this still holds).
 - **Inert**, a session served by managed workers (`gateway.managed_workers: true`, off
-  by default; Hermes allows it for a CLI session on a custom provider). Hermes runs
+  by default; Hermes allows it for a CLI session on a custom provider, and always runs
+  its safe-mode and Kanban sessions that way). Hermes runs
   each turn in a worker process and hands its agent the route, the user and the chat id
   but no `chat_type` (`agent/managed_worker.py`; run at bca51750), so the session does
   not have the shape of a local one. Not decided: whether to take the route's word for

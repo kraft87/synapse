@@ -47,7 +47,7 @@ two, and everything that is still open.
 
 **Proven**
 
-- Tests: `tests/test_hermes_copied_turns.py` (17) replays Hermes's recorded orders of
+- Tests: `tests/test_hermes_copied_turns.py` (18) replays Hermes's recorded orders of
   hooks: both rules, the turns the guessing lost, and the old `copied/` records. Eleven
   mutations (each rule out, each read of an old record out, the last-turn exception
   widened) were each caught.
