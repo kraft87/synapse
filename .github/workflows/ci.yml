@@ -88,6 +88,10 @@ jobs:
     env:
       HERMES_REF: v0.23.1
     steps:
+      # The files as the repository holds them: the client ships LF files, and tests pin
+      # their bytes.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
@@ -108,7 +112,7 @@ jobs:
         run: uv run pytest tests/test_hermes_windows_owner.py -v -rs -p no:cacheprovider
       - name: Client tests
         run: |
-          uv run pytest -n auto --dist loadfile -p no:cacheprovider -rs \
+          uv run pytest -n auto --dist loadfile -p no:cacheprovider -rfEs --tb=short \
             -m "not db and not integration and not slow" \
             tests/test_hermes_*.py \
             tests/test_board_block.py tests/test_claude_on_core.py \
