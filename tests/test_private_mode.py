@@ -488,6 +488,15 @@ def test_on_exits_nonzero_when_the_server_write_does_not_land(toggle, stub_serve
     assert "NOT off the record" in capsys.readouterr().err
 
 
+def test_run_as_synapse_private_the_toggle_names_that_command(monkeypatch, tmp_path, capsys):
+    # `synapse private` hands over the name it was typed as (synapse_cli._NAMED).
+    mod = _load_toggle(_TOGGLE, monkeypatch, tmp_path, "http://127.0.0.1:1")  # no listener
+    assert mod.main([], program="synapse private") == 2
+    assert "usage: synapse private on|off|status" in capsys.readouterr().err
+    assert mod.main([]) == 2
+    assert "usage: private_mode.py on|off|status" in capsys.readouterr().err
+
+
 def test_on_exits_nonzero_when_the_server_is_unreachable(
     toggle_script, monkeypatch, tmp_path, capsys
 ):
@@ -647,6 +656,50 @@ def test_session_end_removes_marker_but_not_the_row(toggle, stub_server, monkeyp
     assert sid in stub_server.rows
 
 
+# A server URL urlsplit rejects ("Invalid IPv6 URL"). The toggle builds its client before it
+# knows whether it will make a request: the URL must fail the requests, not the command.
+_UNREADABLE = "http://[bad"
+
+
+def test_on_with_a_server_url_that_cannot_be_read_keeps_the_marker_and_says_so(
+    toggle_script, monkeypatch, tmp_path, capsys
+):
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert (mod.PRIVATE_DIR / "s-abc").exists()
+    assert "NOT off the record" in err
+    assert "ValueError" in err
+
+
+def test_status_with_a_server_url_that_cannot_be_read_reports_the_marker(
+    toggle_script, monkeypatch, tmp_path, capsys
+):
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", "s-abc"]) == 1
+    capsys.readouterr()
+    mod.main(["status", "s-abc"])
+    assert "marker=yes server=unknown (ValueError)" in capsys.readouterr().out
+
+
+def test_session_end_with_a_server_url_that_cannot_be_read_still_removes_the_marker(
+    toggle_script, monkeypatch, tmp_path
+):
+    sid = "s-abc"
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, _UNREADABLE)
+    assert mod.main(["on", sid]) == 1
+    assert (mod.PRIVATE_DIR / sid).exists()
+
+    class _Stdin:
+        @staticmethod
+        def read() -> str:
+            return json.dumps({"session_id": sid, "reason": "clear"})
+
+    monkeypatch.setattr(mod.sys, "stdin", _Stdin())
+    assert mod.main(["--session-end"]) == 0  # a hook must never break session teardown
+    assert not (mod.PRIVATE_DIR / sid).exists()
+
+
 def test_session_end_is_fail_soft_on_garbage_payload(toggle, monkeypatch):
     class _Stdin:
         @staticmethod
@@ -671,9 +724,44 @@ def test_status_reports_both_halves(toggle, stub_server, capsys):
     assert "marker=yes server=yes" in capsys.readouterr().out
 
 
-def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
-    # `off --forget s-abc` (flag before id) must not no-op against a session
-    # literally named "--forget" while s-abc silently stays private.
-    assert toggle.main(["off", "--forget", "s-abc"]) == 1
+def test_forget_counts_before_the_session_id_too(toggle, stub_server):
+    """`off --forget <id>` is how the command is spoken of and how the README prints it.
+    Read as an id, the flag would name a session "--forget" and leave the real one."""
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.calls.clear()
+    assert toggle.main(["off", "--forget", sid]) == 0
+    assert [c[0] for c in stub_server.calls] == ["DELETE", "GET"]
+    assert sid not in stub_server.rows and not (toggle.PRIVATE_DIR / sid).exists()
+    assert toggle.main(["off", "--forget"]) == 2  # no session named
+
+
+@pytest.mark.parametrize("action", ["off", "status"])
+def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys, action):
+    # A flag that is not known must not be taken for the id: the action would be done
+    # to a session of that name while s-abc silently stays as it was.
+    assert toggle.main(["on", "s-abc"]) == 0
+    stub_server.calls.clear()
+    capsys.readouterr()
+    assert toggle.main([action, "--forgte", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert "looks like a flag" in err and "Nothing was changed." in err
+    assert "NOT off the record" not in err  # the session is as private as it was
+    assert stub_server.calls == [] and (toggle.PRIVATE_DIR / "s-abc").exists()
+
+
+def test_two_session_ids_are_refused(toggle, stub_server, capsys):
+    # `on s-abc s-def` run for the first alone would leave s-def on the record, unsaid.
+    assert toggle.main(["on", "s-abc", "s-def"]) == 1
+    err = capsys.readouterr().err
+    assert "one session id at a time" in err and "NOT off the record" in err
+    assert stub_server.calls == [] and not (toggle.PRIVATE_DIR / "s-abc").exists()
+    assert toggle.main(["off", "s-abc", "--forgte"]) == 1  # a flag is said to be one
     assert "looks like a flag" in capsys.readouterr().err
-    assert stub_server.calls == []
+
+
+def test_a_flag_shaped_session_id_for_on_says_the_session_is_not_private(toggle, capsys):
+    assert toggle.main(["on", "--private", "s-abc"]) == 1
+    err = capsys.readouterr().err
+    assert "looks like a flag" in err and "NOT off the record" in err
+    assert not (toggle.PRIVATE_DIR / "s-abc").exists()

@@ -4,7 +4,7 @@ Private mode keeps one marker per session at PRIVATE_DIR/<session_id>. The id co
 from a transcript record, a hook payload or the command line, so ``..``, an absolute
 path or a backslash form would otherwise stat, write or delete a file outside
 PRIVATE_DIR. Every hook applies the client core's rule (synapse_client/private.py
-``_plain_name``): the Claude ingest hook and the Codex stop hook read such an id as not
+``plain_name``): the Claude ingest hook and the Codex stop hook read such an id as not
 private and touch nothing; both private_mode.py toggles refuse it, their SessionEnd
 handler leaves it alone, and the id is URL-quoted in /private-sessions/{id}. An ordinary
 uuid works as before throughout. The config review CLI's file key, which also comes from
@@ -98,25 +98,21 @@ def _private_mode(harness: str) -> ModuleType:
 
 
 # ---------------------------------------------------------------------------
-# One rule: every copy agrees with the core's
+# One rule: the core's, and nobody keeps a copy
 # ---------------------------------------------------------------------------
 
 
-def test_every_copy_of_the_rule_agrees_with_the_core(scratch):
+def test_the_rule_is_the_cores_and_no_toggle_keeps_a_copy(scratch):
     use_core()
-    from synapse_client.private import _plain_name as core
+    from synapse_client.private import plain_name as core
 
-    # The Claude ingest hook keeps no copy: its _is_private is the core's is_private
-    # (the tests below run it through the hook).
-    copies = {
-        "claude private_mode": _private_mode("claude")._plain_name,
-        "codex private_mode": _private_mode("codex")._plain_name,
-    }
     ids = ["s-1", _UUID, "...", ".hidden", "a.b", "C:x", ".", "..", "../x", "/etc/x"]
     ids += ["a/b", "..\\x", "C:\\x", "a\\b", "a\0b"]
-    for name, rule in copies.items():
-        assert [rule(i) for i in ids] == [core(i) for i in ids], name
     assert [core(i) for i in ids] == [True] * 6 + [False] * 9
+    # The hooks' _is_private is the core's is_private, and both private_mode.py scripts
+    # run the core's toggle (the tests below go through all four).
+    for harness in ("claude", "codex"):
+        assert not hasattr(_private_mode(harness), "_plain_name")
 
 
 # ---------------------------------------------------------------------------

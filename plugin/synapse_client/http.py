@@ -7,11 +7,12 @@ redirect handler forwards every header, Authorization included, wherever a serve
 redirects; this module's handler does not, and ``urlopen`` lends it to the hook scripts
 that still build their own requests (plugin/scripts/config.py and the rest).
 
-Everything here RAISES: urllib.error.HTTPError for an HTTP error status, URLError or
+Every request here RAISES: urllib.error.HTTPError for an HTTP error status, URLError or
 OSError (TimeoutError included) when the server cannot be reached, ValueError for a
-reply that is not what the protocol promises, and ``ToolError`` when the server answered
-an MCP call with an error. Callers decide whether to fail open (a hook) or surface it (a
-CLI or a tool handler).
+reply that is not what the protocol promises or a server URL that cannot be read, and
+``ToolError`` when the server answered an MCP call with an error. Callers decide whether
+to fail open (a hook) or surface it (a CLI or a tool handler). Building a ``Transport``
+never raises: a server URL that cannot be read fails the requests made to it.
 
 MCP: the server runs streamable HTTP in stateless mode (mcp_server/server.py), where
 every request is served by a fresh session that starts out initialized. A ``tools/call``
@@ -174,6 +175,21 @@ def tool_text(tool: str, reply: Mapping[str, Any]) -> str:
     return text
 
 
+def _origins(urls: Iterable[str]) -> frozenset[Origin]:
+    """The origins of ``urls``. A URL no origin can be read from (one urlsplit rejects)
+    adds none: the bearer goes nowhere on its account, and a request to it raises when
+    it is made, where the caller expects a failure."""
+    found = set()
+    for url in urls:
+        if not url:
+            continue
+        try:
+            found.add(origin(url))
+        except ValueError:
+            continue
+    return frozenset(found)
+
+
 class Transport:
     """JSON over HTTP to the Synapse server at ``base_url``, with ``token`` as the bearer.
 
@@ -196,9 +212,7 @@ class Transport:
         self._token = token
         self.user_agent = user_agent
         self.default_timeout = default_timeout
-        self._origins: frozenset[Origin] = frozenset(
-            origin(url) for url in (self.base_url, *token_origins) if url
-        )
+        self._origins = _origins((self.base_url, *token_origins))
 
     def __repr__(self) -> str:
         return f"Transport({self.base_url!r}, user_agent={self.user_agent!r})"

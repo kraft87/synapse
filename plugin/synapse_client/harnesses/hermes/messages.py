@@ -12,8 +12,10 @@ as ``{"name", "arguments"}``, a tool row's tool ``name``, ``ts`` from ``timestam
 actually sent, with the memory context it injected, our own nudge included), not
 ``display_metadata``, reasoning, or provider-specific blobs.
 
-- A row carrying ``_compressed_summary`` is a compaction summary or marker, not
-  something anyone said: dropped.
+- A row carrying ``_compressed_summary`` is a compaction summary or marker, or a row
+  Hermes folded one into (agent/context_compressor.py ``_merge_summary_into_tail_row``):
+  its text is not sent. A user row of that kind stays, as a ``synthetic`` row with no
+  text; any other is dropped.
 - Every ``<memory-context>...</memory-context>`` block is removed from the text.
 - A user row is ``synthetic`` when Hermes injected it in the user's place. The server
   skips such a row, so it neither opens a turn nor renders. The markers mirror Hermes
@@ -24,6 +26,18 @@ actually sent, with the memory context it injected, our own nudge included), not
   ``agent/context_compressor._SYNTHETIC_USER_ROW_PREFIXES``,
   ``agent/conversation_compression_scaffolding._SYNTHETIC_USER_PREFIXES``). The flags are
   not persisted, so a resumed session's rows are recognised by their text.
+- A user row with no text (a picture alone) is sent as a ``synthetic`` row as well. It
+  opens no turn, so its reply lands on the turn before; the row stays in the records to
+  show that this reply answers something later than that turn (the core's
+  ``messages.joined``). No user row is left out, whatever it holds.
+- A user row Hermes folded another message into holds messages typed at different
+  times: one typed after a message that got no reply (agent/agent_runtime_helpers.py
+  ``_merge_consecutive_users``, which leaves ``_merged_turn_prefix`` on the row, and
+  ``_absorbed_message_uids`` in the store too), or rows a compression merged
+  (agent/conversation_compression.py and agent/micro_compaction.py leave
+  ``_absorbed_message_uids`` as well). It is sent as it is, followed by a ``synthetic``
+  row with no text, which says so to the core: ``messages.joined`` cannot read it off
+  one row.
 - An assistant row is a reply only when it shows what the user got. Hermes types the
   two kinds of assistant row that are not (agent/turn_failure_copy.py and its writers):
   ``display_kind`` "failed_turn", the boundary Hermes appends when a turn fails ("This
@@ -40,7 +54,7 @@ actually sent, with the memory context it injected, our own nudge included), not
   server renders less of either. User and assistant text are sent whole.
 
 The records are cut into turns, and the finished ones uploaded, by the core
-(``synapse_client/messages.py``, ``upload.TurnUploader``). Two of the rules above exist
+(``synapse_client/messages.py``, ``turn_upload.TurnUploader``). Two of the rules above exist
 for that cut. Synthetic rows do not count towards a turn's key: Hermes adds them after a
 finished turn (a task-list snapshot after compression), and that must neither reopen the
 turn nor make it look new. And a failed turn never completes, so its user message is not
@@ -66,6 +80,7 @@ _ROLES = ("user", "assistant", "tool")
 _TEXT_PARTS = ("text", "input_text", "output_text")
 _MEMORY_CONTEXT = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL)
 _SUMMARY_KEY = "_compressed_summary"
+_MERGED_KEYS = ("_merged_turn_prefix", "_absorbed_message_uids")
 _SYNTHETIC_FLAGS = (
     "_todo_snapshot_synthetic",
     "_empty_recovery_synthetic",
@@ -159,17 +174,16 @@ def _synthetic(message: Mapping[str, Any], text: str) -> bool:
 
 def _record(message: Any) -> Record | None:
     """The record for one message, or None for a message that is not sent."""
-    if not isinstance(message, Mapping) or message.get(_SUMMARY_KEY):
+    if not isinstance(message, Mapping):
         return None
     role = message.get("role")
-    if role not in _ROLES:
+    summary = bool(message.get(_SUMMARY_KEY))
+    if role not in _ROLES or (summary and role != "user"):
         return None
-    text = _text(message.get("content"))
+    text = "" if summary else _text(message.get("content"))
     record: Record = {"role": role, "content": text}
     if role == "user":
-        if not text:
-            return None
-        if _synthetic(message, text):
+        if not text or _synthetic(message, text):
             record["synthetic"] = True
     elif role == "assistant":
         calls = _tool_calls(message.get("tool_calls"))
@@ -199,6 +213,16 @@ def _record(message: Any) -> Record | None:
 def to_records(messages: Iterable[Any] | None) -> list[Record]:
     """The ``/ingest`` records for Hermes's ``messages``, in order. Never modifies them,
     never raises over a malformed entry (it is skipped)."""
-    if not messages:
-        return []
-    return [rec for message in messages if (rec := _record(message)) is not None]
+    records: list[Record] = []
+    for message in messages or ():
+        record = _record(message)
+        if record is None:
+            continue
+        records.append(record)
+        if (
+            record["role"] == "user"
+            and not record.get("synthetic")
+            and any(message.get(key) for key in _MERGED_KEYS)
+        ):
+            records.append({"role": "user", "content": "", "synthetic": True})
+    return records

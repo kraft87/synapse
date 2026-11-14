@@ -1,8 +1,9 @@
 """Whether a session is off the record, from its local marker file.
 
 Private mode is a marker at ``<private_dir>/<session_id>``, written by the private-mode
-command alongside the durable server-side flag. This local check is the fast half: it
-keeps the turns from ever leaving the machine, and it works while the server is down.
+toggle (private_toggle.py) alongside the durable server-side flag. This local check is
+the fast half: it keeps the turns from ever leaving the machine, and it works while the
+server is down. ``mark`` and ``unmark`` write and remove the marker.
 
 The check sits where a payload leaves: ``Client.ingest`` runs ``check_payload`` before
 its request, and so do the Claude Code and Codex hooks' own senders
@@ -15,6 +16,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 from .settings import Settings
@@ -52,14 +54,47 @@ def _say(log: Callable[[str], None] | None, line: str) -> None:
         pass
 
 
-def _plain_name(session_id: str) -> bool:
-    """One ordinary path component: no separator, not ``.``/``..``, no NUL."""
+def plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The id is
+    joined onto the private dir, and ``../x`` would name a file outside it."""
     seps = {"/", "\\", os.sep, os.altsep or "/"}
     return (
         session_id not in (".", "..")
         and "\0" not in session_id
         and not any(sep in session_id for sep in seps)
     )
+
+
+def marker(settings: Settings, session_id: str) -> Path:
+    """Where ``session_id``'s marker is kept. RAISES ValueError for an id that is empty
+    or not a plain file name: nothing may be written or removed by such a name."""
+    if not session_id or not plain_name(session_id):
+        raise ValueError(f"not a session id: {session_id[:80]!r}")
+    return Path(settings.private_dir) / session_id
+
+
+def mark(settings: Settings, session_id: str) -> Path:
+    """Write ``session_id``'s marker, the local half of private mode, and return its
+    path. A marker already there is written again, so its age starts over. RAISES
+    OSError, or ValueError for an id ``marker`` refuses."""
+    path = marker(settings, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def unmark(settings: Settings, session_id: str) -> bool:
+    """Remove ``session_id``'s marker. True when none is there afterwards (one that was
+    never there counts); False when it could not be removed, or its folder could not
+    be looked into. RAISES ValueError for an id ``marker`` refuses."""
+    path = marker(settings, session_id)
+    try:
+        path.unlink()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def state(
@@ -85,7 +120,7 @@ def state(
     ``log`` receives one line per event worth keeping (same wording as the hook)."""
     if not session_id:
         return OPEN
-    if not _plain_name(session_id):
+    if not plain_name(session_id):
         _say(log, f"PRIVATE ignored a session id that is not a file name: {session_id[:80]!r}")
         return OPEN
     marker = os.path.join(str(settings.private_dir), session_id)

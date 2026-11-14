@@ -3,7 +3,7 @@
 A harness that can hand over its chat messages uploads them as ``messages`` records: no
 server parser of its own. Its adapter builds the records from the harness's own shapes
 (harnesses/hermes/messages.py is one); this module cuts them into turns and says which
-are finished, and ``upload.TurnUploader`` sends those.
+are finished, and ``turn_upload.TurnUploader`` sends those.
 
 A record is a dict: ``role`` ("user", "assistant" or "tool"), ``content`` (text), and
 where they apply an assistant row's ``tool_calls`` (``{"name", "arguments"}`` each), a
@@ -17,7 +17,13 @@ and no tool calls: an assistant row that calls tools is followed by their result
 turn ending in one is still running (a harness's list may be read mid-turn). Only
 complete turns are uploaded, each with the complete turn before it as its context.
 Synthetic rows do not count towards a turn's key either, so one added after a finished
-turn neither reopens it nor makes it look new.
+turn neither reopens it nor makes it look new. The reply to one does: it lands on the
+turn before, which then has a new key, as does the reply to a user row with no text.
+The row that opens a turn stays its own however the turn goes on (``opening_key``), and
+``joined`` says a turn holds more than its own exchange. For that an adapter keeps
+every user row, also one that opens no turn: left out, the reply to it would read as the
+reply of the turn before. And a row its harness folded two user messages into is
+followed by a synthetic row with no text: one row cannot show that it holds two.
 """
 
 from __future__ import annotations
@@ -51,14 +57,39 @@ def _real(turn: Sequence[Record]) -> list[Record]:
     return [record for record in turn if not record.get("synthetic")]
 
 
+def _final(record: Record) -> bool:
+    """Whether ``record`` ends a turn: an assistant row with text and no tool calls."""
+    return (
+        record["role"] == "assistant" and bool(record["content"]) and not record.get("tool_calls")
+    )
+
+
 def complete(turn: Sequence[Record]) -> bool:
     """Whether ``turn`` has finished: its last record that is not synthetic is an
     assistant row with text and no tool calls."""
     real = _real(turn)
-    if not real:
-        return False
-    last = real[-1]
-    return last["role"] == "assistant" and bool(last["content"]) and not last.get("tool_calls")
+    return bool(real) and _final(real[-1])
+
+
+def joined(turn: Sequence[Record]) -> bool:
+    """Whether ``turn`` holds more than the exchange its first row opens: a user row
+    besides that one, or any row after its reply. Such a row began something later
+    than the turn did, which landed on it: a row written in the user's place, or a
+    user row with no text. A synthetic row counts too, also when nothing follows it:
+    the harness may have begun a turn with it that left no other row."""
+    replied = False
+    for record in turn[1:]:
+        if replied or record["role"] == "user":
+            return True
+        replied = _final(record)
+    return False
+
+
+def opening_key(turn: Sequence[Record]) -> str:
+    """A stable key for the row that opens ``turn``: its ``id``, else a hash of the row
+    (two rows that read the same are then one). ``turn_key`` changes when a turn goes
+    on; this one does not, so it says the turn is the same one, however it ends."""
+    return turn_key(turn[:1])
 
 
 def turn_key(turn: Sequence[Record]) -> str:

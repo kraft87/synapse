@@ -37,6 +37,7 @@ plugin = base.plugin
 server = base.server
 _new = base._new
 _conversation = base._conversation
+_say = base._say
 _users = base._users
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "getuid"), reason="the owner subject is POSIX")
@@ -426,12 +427,12 @@ def test_the_owners_gateway_session_gets_everything(plugin, server, tmp_path):
     (ctx,) = [r for r in server.seen if r["path"].startswith("/context")]
     assert "project=hermes-scratch" in ctx["path"]
     assert "Call remember FIRST" in provider.prefetch("x")
-    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1))
+    _say(provider, _conversation(1), _LOCAL)
     (payload,) = server.posts()
     assert payload["session_id"] == _LOCAL
     assert payload["project"] == "hermes-scratch" and payload["cwd"] == _WORK
     assert _users(payload["records"]) == ["question 1"]
-    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(2))
+    _say(provider, _conversation(2), _LOCAL)
     assert _users(server.posts()[1]["records"]) == ["question 1", "question 2"]  # 1 is context
     out = json.loads(provider.handle_tool_call("recall", {"query": "x"}))
     assert out == {"query": "x", "self_session": _LOCAL}
@@ -481,7 +482,7 @@ def test_a_session_renamed_to_the_bot_chat_turns_off_for_good(plugin, server, tm
     home = tmp_path / "hermes-a"
     _store(home)
     provider = _start_gateway(_new(plugin), home)
-    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1))
+    _say(provider, _conversation(1), _LOCAL)
     assert len(server.posts()) == 1
     _retitle(home, _LOCAL, "Bot Chat")
     assert provider.prefetch("x") == ""
@@ -498,7 +499,7 @@ def test_a_switch_to_a_session_that_is_not_the_owners_turns_off(plugin, server, 
     _store(home)
     _store(home, _TELEGRAM, source="telegram", chat_id="123456789", receipt=False)
     provider = _start_gateway(_new(plugin), home)
-    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1))
+    _say(provider, _conversation(1), _LOCAL)
     assert len(server.posts()) == 1
     provider.on_session_switch(_TELEGRAM, parent_session_id=_LOCAL, reset=False)
     provider.sync_turn("q", "a", session_id=_TELEGRAM, messages=_conversation(3))
@@ -514,7 +515,7 @@ def test_a_switch_to_another_of_the_owners_sessions_keeps_working(plugin, server
     _store(home, first, source="cli", chat_id="", receipt=False)
     provider = _new(plugin)
     provider.initialize(first, hermes_home=str(home), **_in_process(platform="cli"))
-    provider.sync_turn("q", "a", messages=_conversation(1))
+    _say(provider, _conversation(1))
     _store(home, second, source="cli", chat_id="", receipt=False)
     provider.on_session_switch(second, parent_session_id=first, reset=True)
     provider.sync_turn("q", "a", messages=_conversation(2))
@@ -528,7 +529,7 @@ def test_an_unreadable_store_skips_a_call_without_turning_off(plugin, server, tm
     good = db.read_bytes()
     db.write_bytes(b"not a database" * 200)
     assert provider.prefetch("x") == ""
-    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1))
+    _say(provider, _conversation(1), _LOCAL)
     assert "error" in json.loads(provider.handle_tool_call("recall", {"query": "x"}))
     assert server.posts() == []
     db.write_bytes(good)
@@ -598,7 +599,7 @@ def test_concurrent_daemon_sessions_keep_their_own_turns(plugin, server, tmp_pat
 
     def run(provider: Any, tag: str) -> None:
         for count in range(1, 6):
-            provider.sync_turn("q", "a", messages=conversation(tag, count))
+            _say(provider, conversation(tag, count))
         provider.on_session_end(conversation(tag, 5))
 
     threads = [threading.Thread(target=run, args=(p, t)) for p, t in ((a, "A"), (b, "B"))]
@@ -619,9 +620,10 @@ def test_concurrent_daemon_sessions_keep_their_own_turns(plugin, server, tmp_pat
 
 
 def test_one_session_uploads_each_turn_once_under_concurrent_hooks(plugin, server, tmp_path):
+    """A resumed session: its four turns are within the look-back."""
     home = tmp_path / "hermes-a"
     _store(home)
-    provider = _start_gateway(_new(plugin), home)
+    provider = _start_gateway(_new(plugin), home, resumed=True, message_count=8)
     conversation = _conversation(4)
     threads = [
         threading.Thread(
