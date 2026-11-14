@@ -6,9 +6,12 @@ place, so a reader never sees half a payload; files and the directory are owner-
 POSIX.
 
 Draining claims each file by renaming it to ``<name>.<claim_ns>.claim``: of several
-processes draining at once, exactly one rename succeeds. A claim older than
+processes draining at once, exactly one rename succeeds on POSIX. A claim older than
 ``stale_claim`` seconds belongs to a process that died mid-send and is put back. No
-locks and no fcntl, so it works the same on Windows.
+locks and no fcntl. On Windows a rename is not an exclusive claim: two drains that
+listed the same name can both rename it, the second moving the first one's claim on. A
+claim that is gone or locked when it is read is then left to the other drain, never
+dropped, and a payload may be sent twice (the server's dedup absorbs that).
 
 ``put`` RAISES OSError (the caller must know a payload was lost). ``drain``,
 ``pending``, ``oldest_age``, ``dropped`` and ``failure_warning`` never raise over a
@@ -58,6 +61,7 @@ WARN_AFTER_HOURS = 24.0  # ...or an oldest payload this old
 #: deployed yet, a proxy in the way), says nothing about the payload: it is kept.
 _DROP_4XX = frozenset({400, 413, 422})
 _SUFFIX = ".json"
+_WINDOWS = os.name == "nt"
 _CLAIM = ".claim"
 _SENDING = ".sending"
 _LAST_ERROR = ".last_error"
@@ -395,6 +399,11 @@ class Outbox:
             try:
                 payload = json.loads(claimed.read_text(encoding="utf-8"))
             except (OSError, ValueError) as err:
+                if _WINDOWS and isinstance(err, (FileNotFoundError, PermissionError)):
+                    # Another drain renamed it on (or is renaming it): it holds the payload.
+                    self._release(claimed, name)
+                    done -= 1
+                    continue
                 self._drop(
                     claimed, f"outbox: dropped unreadable payload {name} ({type(err).__name__})"
                 )
