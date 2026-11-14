@@ -76,7 +76,9 @@ def _print_token(out: dict[str, Any], *, bootstrap: bool = False) -> None:
     s = out["surface"]
     print(f"minted {s['surface_id']} trust={s['trust']} label={s.get('label') or '-'}")
     print(f"token: {out['token']}")
-    print("Shown once — only the hash is stored.")
+    # ASCII only: a Windows console shows a UTF-8 dash from `docker compose exec` as
+    # mojibake.
+    print("Shown once: only the hash is stored.")
     if bootstrap:
         # The whole point of the command: a token nobody knows where to put is the same
         # as no token. Name the exact prompt, because that is where a new user is stuck.
@@ -84,7 +86,8 @@ def _print_token(out: dict[str, Any], *, bootstrap: bool = False) -> None:
         print("Store it on the machine that will use it:")
         print("  synapse login --token   (its SYNAPSE_INGEST_TOKEN, in ~/.synapse/config.json)")
         print("No client there yet? First: curl -sSL <this server>/install | python3 -")
-        print("Then start a new session — the board should stop coming back empty.")
+        print("  (Windows PowerShell: irm <this server>/install | python -)")
+        print("Then start a new session. The board should stop coming back empty.")
     else:
         print(
             "On that machine, run `synapse login --token`; use the\n"
