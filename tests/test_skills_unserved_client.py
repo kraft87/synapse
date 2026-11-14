@@ -43,12 +43,14 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import urllib.error
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -1203,6 +1205,7 @@ def test_a_global_pass_inside_a_repository_leaves_info_exclude_alone(engine, git
     assert _untracked(git, repo) == ["claude/skills/alpha/SKILL.md"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="* and ? cannot be in a Windows file name")
 def test_exclude_lines_escape_gitignore_wildcards_and_match_only_their_folder(
     engine, git, tmp_path
 ):
@@ -1362,6 +1365,16 @@ def test_git_exclude_leaves_a_folder_in_no_repository_alone(project, tmp_path):
     assert list(tmp_path.rglob("exclude")) == []
 
 
+def _remove_tree(path: Path) -> None:
+    """shutil.rmtree that also removes read-only files (git's objects on Windows)."""
+
+    def retry(func: Any, name: str, _exc: Any) -> None:
+        os.chmod(name, stat.S_IWRITE)
+        func(name)
+
+    shutil.rmtree(path, onexc=retry)
+
+
 @pytest.mark.parametrize(
     "breakage",
     ["exclude-is-a-directory", "info-is-a-file", "dot-git-garbage", "read-denied", "write-denied"],
@@ -1378,7 +1391,7 @@ def test_git_exclude_never_raises(project, git, tmp_path, monkeypatch, breakage)
         shutil.rmtree(info)
         info.write_text("not a directory\n", encoding="utf-8")
     elif breakage == "dot-git-garbage":
-        shutil.rmtree(repo / ".git")
+        _remove_tree(repo / ".git")
         (repo / ".git").write_text("this is not a gitdir line\n", encoding="utf-8")
     elif breakage == "read-denied":
         real = Path.read_text

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -176,6 +177,7 @@ def test_a_session_that_is_off_names_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
 def test_a_session_is_settled_once_it_is_recorded(tmp_path):
     assert not carried.settled(tmp_path, _CHILD)
     carried.settle(tmp_path, _CHILD)
@@ -255,6 +257,7 @@ def test_a_record_that_cannot_be_kept_leaves_the_session_unsettled(tmp_path):
     assert not carried.settled(tmp_path, "")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
 def test_a_session_found_to_hold_copies_has_a_record_of_its_own(tmp_path):
     """Kept apart from what was settled: it says what the session holds, and closes no
     question about a session its row may name."""

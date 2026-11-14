@@ -214,18 +214,35 @@ def test_normalize_url_rejects_what_is_not_a_plain_http_url(raw):
 
 
 def test_home_comes_from_the_argument_then_synapse_home_then_the_default(tmp_path):
-    env = {"HOME": str(tmp_path / "u"), "SYNAPSE_HOME": str(tmp_path / "alt")}
+    env = {
+        "HOME": str(tmp_path / "u"),
+        "USERPROFILE": str(tmp_path / "u"),
+        "SYNAPSE_HOME": str(tmp_path / "alt"),
+    }
     assert Settings.load(env=env, home=tmp_path / "arg").home == tmp_path / "arg"
     assert Settings.load(env=env).home == tmp_path / "alt"
-    assert Settings.load(env={"HOME": str(tmp_path / "u")}).home == tmp_path / "u" / ".synapse"
-    s = Settings.load(env={"HOME": str(tmp_path / "u"), "SYNAPSE_HOME": "~/elsewhere"})
+    assert (
+        Settings.load(env={"HOME": str(tmp_path / "u"), "USERPROFILE": str(tmp_path / "u")}).home
+        == tmp_path / "u" / ".synapse"
+    )
+    s = Settings.load(
+        env={
+            "HOME": str(tmp_path / "u"),
+            "USERPROFILE": str(tmp_path / "u"),
+            "SYNAPSE_HOME": "~/elsewhere",
+        }
+    )
     assert s.home == tmp_path / "u" / "elsewhere"
     assert s.config_file == s.home / "config.json"
 
 
 def test_the_private_dir_is_under_the_user_home_not_synapse_home(tmp_path):
     """As config.PRIVATE_DIR: SYNAPSE_HOME moves config.json, not the private markers."""
-    env = {"HOME": str(tmp_path / "u"), "SYNAPSE_HOME": str(tmp_path / "alt")}
+    env = {
+        "HOME": str(tmp_path / "u"),
+        "USERPROFILE": str(tmp_path / "u"),
+        "SYNAPSE_HOME": str(tmp_path / "alt"),
+    }
     assert Settings.load(env=env).private_dir == tmp_path / "u" / ".synapse" / "private"
     env["SYNAPSE_PRIVATE_DIR"] = str(tmp_path / "p")
     assert Settings.load(env=env).private_dir == tmp_path / "p"

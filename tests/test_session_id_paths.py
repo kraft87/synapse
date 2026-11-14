@@ -302,6 +302,7 @@ def test_session_end_is_fail_soft_on_an_id_that_is_not_text(toggle, monkeypatch)
     assert mod.main(["--session-end"]) == 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="? cannot be in a Windows file name")
 def test_the_session_id_is_quoted_in_the_route(toggle):
     """A plain file name can still hold ``?``, ``#``, ``%`` or a space: unquoted, the
     server read a different id (or urllib refused the URL) and the read-back lied."""

@@ -253,10 +253,12 @@ def _ensure_path(bin_dir):
     if _on_path(bin_dir):
         return
     if os.name == "nt":
-        if _add_to_windows_path(str(bin_dir)):
+        # As the ~/.local/bin link: only the default home takes the name. A SYNAPSE_HOME
+        # somewhere else is a side install and leaves the user PATH alone.
+        if _default_bin(bin_dir) and _add_to_windows_path(str(bin_dir)):
             _say("Added " + str(bin_dir) + " to your user PATH; open a new terminal to use it.")
             return
-        _say("Add " + str(bin_dir) + " to your PATH to run `synapse`.")
+        _say(str(bin_dir) + " is not on your PATH. Add it to run `synapse`.")
         return
     if _link_into_local_bin(bin_dir):
         return
@@ -284,6 +286,12 @@ def _ensure_path(bin_dir):
     _say(str(bin_dir) + " is not on your PATH. Add this line to " + rc + ":\n    " + line)
 
 
+def _default_bin(bin_dir):
+    """Whether ``bin_dir`` is the default home's (``~/.synapse/bin``)."""
+    default = Path(os.path.expanduser("~/.synapse")) / "bin"
+    return os.path.abspath(str(bin_dir)) == os.path.abspath(str(default))
+
+
 def _link_into_local_bin(bin_dir):
     """Link the shim into ``~/.local/bin`` when that directory is on PATH, so ``synapse``
     runs with no profile edit. True when the command now resolves through the link.
@@ -291,8 +299,7 @@ def _link_into_local_bin(bin_dir):
     Only for the default home: a ``SYNAPSE_HOME`` somewhere else is a side install and must
     not take the name. Never over anything that is not this link already."""
     local = Path(os.path.expanduser("~/.local/bin"))
-    default = Path(os.path.expanduser("~/.synapse")) / "bin"
-    if os.path.abspath(str(bin_dir)) != os.path.abspath(str(default)):
+    if not _default_bin(bin_dir):
         return False
     if not (local.is_dir() and _on_path(local)):
         return False

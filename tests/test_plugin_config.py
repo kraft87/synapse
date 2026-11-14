@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -137,4 +138,4 @@ def test_importing_config_makes_stdout_utf8(monkeypatch, tmp_path):
     _fresh_config(monkeypatch, tmp_path)  # import-time _force_utf8_stdio()
     print("→")
     sys.stdout.flush()
-    assert out.getvalue() == "→\n".encode()
+    assert out.getvalue() == ("→" + os.linesep).encode()

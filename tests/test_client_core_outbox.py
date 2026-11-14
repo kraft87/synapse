@@ -296,12 +296,11 @@ _WORKER = textwrap.dedent(
     log = sys.argv[3]
 
     def send(payload):
+        # One new file per delivery: an O_APPEND log is not atomic across processes on
+        # Windows, where concurrent appends overwrite each other.
         time.sleep(0.002)
-        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, (str(payload["n"]) + "\\n").encode())
-        finally:
-            os.close(fd)
+        name = "%s-%d-%d" % (payload["n"], os.getpid(), time.perf_counter_ns())
+        os.close(os.open(os.path.join(log, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
 
     while sys.argv[4] == "go" and box.pending():
         box.drain(send, max_items=7)
@@ -314,7 +313,8 @@ def test_concurrent_drains_deliver_each_payload_exactly_once(tmp_path):
     total = 120
     for n in range(total):
         box.put({"n": n})
-    log = tmp_path / "sent.log"
+    log = tmp_path / "sent"
+    log.mkdir()
     procs = [
         subprocess.Popen(
             [sys.executable, "-c", _WORKER, str(PLUGIN), str(box.directory), str(log), "go"]
@@ -323,7 +323,7 @@ def test_concurrent_drains_deliver_each_payload_exactly_once(tmp_path):
     ]
     for proc in procs:
         assert proc.wait(timeout=60) == 0
-    sent = [int(line) for line in log.read_text().split()]
+    sent = [int(entry.name.split("-")[0]) for entry in log.iterdir()]
     assert sorted(sent) == list(range(total))
     assert box.pending() == 0
 

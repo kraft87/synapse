@@ -107,6 +107,7 @@ def _setup(
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(data_dir))
     monkeypatch.setenv("SYNAPSE_SURFACE", "test-laptop")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))  # ~ on Windows
     monkeypatch.chdir(tmp_path)
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -529,6 +530,7 @@ def _codex_common(monkeypatch, tmp_path, *, record, env_token, plugin: bool = Tr
     if record is not None:
         (data / "device.json").write_text(json.dumps(record), encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # ~ on Windows
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(data))
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
