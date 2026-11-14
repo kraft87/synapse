@@ -1,10 +1,21 @@
 # Installing Synapse
 
-The full path from an empty directory to a Claude Code session that recalls your history.
-The short version lives in the [README](../README.md#quick-start).
+The full path from an empty directory to Claude Code, Codex or Hermes sessions that recall
+your history. The short version lives in the [README](../README.md#quick-start).
 
-Two halves, and both are needed: the **server** (Docker, one box) and the **plugin** (one
-install per Claude Code machine).
+Two halves, and both are needed: the **server** (Docker, one box) and the **client** (one
+install per machine you code on; it wires Claude Code, Codex and Hermes).
+
+**You need:**
+
+- On the server box: Docker with the Compose v2 plugin (`docker compose version` must work)
+  and git. About 3 minutes for the first build.
+- On each machine you code on: Python 3.11 or newer as `python3` (check with
+  `python3 --version`) and curl (PowerShell on Windows).
+- Accounts, depending on the `.env` you pick below: a Voyage AI key, and a Claude
+  subscription token (`claude setup-token`) or an Anthropic API key.
+
+One server holds one person's memory. Two people need two servers.
 
 ## 1. Clone and configure
 
@@ -32,11 +43,14 @@ Whichever you copied, fill in these values in `.env`. Everything else has a work
 
 | Variable | What to put there |
 |----------|-------------------|
-| `SYNAPSE_DB_PASSWORD` | Password for the bundled Postgres. Must match the password inside `SYNAPSE_DB_URL`. |
+| `SYNAPSE_DB_PASSWORD` | Password for the bundled Postgres. Must match the password inside `SYNAPSE_DB_URL`. Generate it with `openssl rand -hex 24`: characters such as `@`, `:` or `/` break the URL. |
 | `SYNAPSE_DB_URL` | Postgres DSN. The `.env.example` default just needs the same password filled in. |
 | `SYNAPSE_MACHINE_TOKEN` | The shared root bearer. `.env.example` ships it as `CHANGEME`; generate a real one with `openssl rand -hex 32`. |
 | `VOYAGE_API_KEY` | Voyage AI key, used for embeddings and rerank. Skip it only if you configure an alternative backend (see [local inference](#local-inference-no-external-accounts)). |
 | `CLAUDE_CODE_OAUTH_TOKEN` **or** `ANTHROPIC_API_KEY` | Auth for the extraction LLM. The subscription token wins if both are set. |
+| `SYNAPSE_LLM_API_KEY` | Only with `openrouter.env`: your OpenRouter key, in place of the Claude token. |
+| `SYNAPSE_TIMEZONE` | Your IANA zone, for example `Europe/London`. It decides which day "today" is. The default is `America/Toronto`. |
+| `SYNAPSE_OWNER_NAME` | Your first name, the way memory should refer to you (for example `Sam`). Commented out in the presets; uncomment it. Set it before your first session: facts stored while it is unset say "User" and need `scripts/rename_owner_in_facts.py` to fix later. |
 
 `SYNAPSE_MACHINE_TOKEN` is required: the server refuses to boot while it is blank or still
 the `CHANGEME` placeholder, and prints what to do about it. The one exception is
@@ -57,8 +71,8 @@ fully off.
 docker compose up -d --build
 ```
 
-This builds the image from public bases (no registry auth), starts Postgres, the poller, the
-MCP server, and the `dream` container, and applies the schema automatically on Postgres's
+This builds the image from public bases (no registry auth), starts Postgres, the two pollers,
+the MCP server and the `dream` container, and applies the schema automatically on Postgres's
 first boot.
 
 If the default ports are taken, set `MCP_PORT` and/or `POSTGRES_HOST_PORT` in `.env` before
@@ -81,7 +95,7 @@ step.
 It is shown once because only its hash is stored, so if you lose it, run `bootstrap` again
 for a new one and revoke the old row.
 
-Why this step exists: since schema 054, what a machine is served depends on **its own**
+Why this step exists: what a machine is served depends on **its own**
 device token, not on the shared machine token and not on any name it reports. The shared
 machine token identifies the deployment rather than a machine, so a caller presenting it is
 served restricted, which looks like an empty board and empty recalls. There is no fail-open
@@ -93,8 +107,12 @@ with plain `synapse login`, and the bootstrap command is the break-glass path. S
 
 ## 4. Install the client and log in
 
-On each machine you code on. The server serves its own client, so the version always
-matches:
+On each machine you code on. Use the address that machine reaches the server at:
+`localhost` works only on the server box itself, and the port is your `MCP_PORT` if you
+changed it. The installer records that address as this machine's server. The server serves
+its own client, so the `synapse` command and the Codex and Hermes wiring match the server's
+version. The Claude Code plugin comes from the GitHub marketplace instead, so keep the
+server on a recent release.
 
 ```bash
 curl -sSL http://localhost:8765/install | python3 -
@@ -107,7 +125,10 @@ That unpacks the client into `~/.synapse/lib/<version>/`, puts a `synapse` comma
 then does the least it can: where `~/.local/bin` is already on `PATH` it links `synapse`
 into it (never over a file of that name that is not its own link); otherwise it prints the
 line to add to your shell profile; on Windows it adds `~/.synapse/bin` to your user `PATH`.
-Python 3.11+ is the only requirement. Then:
+It needs Python 3.11 or newer as `python3` on `PATH`, because the hooks run `python3`, not
+the interpreter you install with. Check with `python3 --version`: macOS's built-in one is 3.9
+and Ubuntu 22.04's is 3.10, and with those the install succeeds but nothing is captured.
+Then:
 
 ```bash
 synapse login --token     # server without sign-in: paste the step 3 token when asked
@@ -119,27 +140,67 @@ answers in `~/.synapse/config.json`:
 
 - **personal or work**: `personal` (default, sees everything) or `work` (restricted:
   work-safe notes plus an allowlist of projects, so personal memory is never served there).
-  It is declared when the machine enrolls.
+  It is declared when the machine enrolls. With `--token` it is not asked: the token's trust
+  decides, and a `bootstrap` token is full trust.
 - **Sync skills to this machine?**: two-way sync of your skills library at session start.
 
-Then it wires every harness it finds. **Claude Code**: it installs the plugin
-(`claude plugin marketplace add kraft87/synapse`, `claude plugin install synapse@synapse`)
-with the server URL; restart Claude Code or run `/reload-plugins`. **Codex**: it writes the
-hooks and the `synapse` MCP server into `~/.codex/config.toml`; start `codex`, run `/hooks`
-and trust them. **Hermes**: it installs a memory provider in `$HERMES_HOME/plugins/synapse/`
-and selects it (`synapse install hermes [--hermes-home PATH] [--replace]` does that alone;
-local sessions only, see [plugin/README.md](../plugin/README.md#hermes)); restart Hermes.
-`synapse status` shows which harnesses are wired. Re-running `synapse login` wires a harness you install later and never asks
-for a new sign-in on an enrolled machine (`--reenroll` does that on purpose).
+Then it wires every harness it finds, and each needs one step from you:
+
+- **Claude Code**: it installs the plugin (`claude plugin marketplace add kraft87/synapse`,
+  `claude plugin install synapse@synapse`) with the server URL. Restart Claude Code or run
+  `/reload-plugins`.
+- **Codex**: it writes the hooks and the `synapse` MCP server into `~/.codex/config.toml`.
+  Start `codex`: after the folder-trust prompt it shows "Hooks need review"; choose "Trust
+  all and continue" (dismissed it? run `/hooks` and press `t`). Untrusted hooks are skipped
+  with no message, so that session gets no memory and uploads nothing. The first time Codex
+  calls each Synapse tool (`recall`, `remember`, `fetch`, `recall_feedback`) it asks for
+  approval: choose "Always allow", or a stray keypress can cancel a memory write.
+- **Hermes**: it installs a memory provider in `$HERMES_HOME/plugins/synapse/` and selects
+  it (`synapse install hermes` does that step alone). Start a new `hermes` session; one
+  already open stays without Synapse. `hermes memory status` should show
+  `synapse ← active`. Hermes runs one external memory provider at a time: if another one
+  (Honcho, Hindsight, mem0) is selected, the output says `left memory.provider at '<name>'`
+  and Synapse is not active. `synapse install hermes --replace` switches to Synapse, and
+  `hermes config set memory.provider <name>` switches back. Local sessions only, and not on
+  Windows yet: see [plugin/README.md](../plugin/README.md#hermes).
+
+`synapse status` shows which harnesses are wired. Re-running `synapse login` wires a harness
+you install later and never asks for a new sign-in on an enrolled machine (`--reenroll` does
+that on purpose).
 
 Settings live in `~/.synapse/config.json`, owned by no harness: `synapse config` lists
 them, `synapse config <key> <value>` changes one (`url`, `role`, `skills_sync`,
 `config_sync`, `config_paths`). Full client detail: [plugin/README.md](../plugin/README.md)
 and [plugin-codex/README.md](../plugin-codex/README.md).
 
-## 5. Verify
+### Another machine
+
+Each machine gets its own token. The `bootstrap` from step 3 is for the first one; mint the
+rest, then install there with the server's LAN or Tailscale address instead of `localhost`:
 
 ```bash
+# On the server box (or `/synapse-devices mint "<label>" --full` in Claude Code on a set-up machine):
+docker compose exec mcp-server synapse-admin mint "work laptop" --full
+
+# On the new machine:
+curl -sSL http://<server-address>:8765/install | python3 -
+synapse login --token
+```
+
+`--full` serves that machine everything, like the first one. Without it the machine is
+restricted: it sees only work-safe notes and the projects you allow with `--projects`. See
+[docs/auth.md](auth.md).
+
+## 5. Verify
+
+Run these from the repo directory on the server box. The first line loads
+`SYNAPSE_MACHINE_TOKEN` from `.env`; the second reads the device token that `synapse login`
+stored in step 4.
+
+```bash
+set -a; . ./.env; set +a
+SYNAPSE_DEVICE_TOKEN=$(python3 -c 'import json,pathlib;print(json.loads((pathlib.Path.home()/".synapse/config.json").read_text())["token"])')
+
 # Server is up:
 curl -fsS localhost:8765/health
 
@@ -154,13 +215,16 @@ curl -sX POST localhost:8765/recall -H 'Content-Type: application/json' \
 ```
 
 Recall is served according to the bearer, so use the device token from step 3 for the recall
-call, not the shared machine token.
+call, not the shared machine token. The test transcript stays in your memory as the project
+`synapse-install-test`. To keep memory clean, skip the two calls and check with a real
+session instead (below).
 
 Two timing expectations that look like bugs but aren't: **episodes** appear within seconds
 of ingest, but **knowledge-graph facts** are extracted from 4-turn sliding windows — a
 session with fewer than 4 human turns produces episodes and an *empty graph*. And extraction
 runs on a poll cycle (`POLL_INTERVAL_SECONDS`, default 300), so first facts land a few
-minutes after ingest, not instantly.
+minutes after ingest, not instantly. Embeddings wait for that cycle too, so for the first
+few minutes recall matches on words only.
 
 From inside Claude Code: start a fresh session. The SessionStart board block's banner reports
 the episode count and the most recently active projects, so yours should appear with a rising
@@ -173,8 +237,22 @@ transcripts already sit in `~/.claude/projects` — import them once and `recall
 history on day one:
 
 ```
-synapse import         # or `! synapse-import` inside a Claude Code session
+synapse import
 ```
+
+Run it in a terminal: the date range and the confirmation need a keyboard (`--yes` skips
+the confirmation in scripts). It imports Claude Code history only. Past Hermes sessions
+cannot be imported yet.
+
+Past Codex sessions go through a server-side backfill. On the server box, from the repo
+directory (`--dry-run` first shows the count; `--since-days N` bounds the spend):
+
+```bash
+docker compose run --rm -v ~/.codex/sessions:/codex:ro mcp-server \
+  python -m ingestion.codex_backfill /codex --dry-run
+```
+
+Drop `--dry-run` to import. Turns already uploaded by the hooks are skipped.
 
 It offers an optional date range (by each file's last-activity date), prints a summary
 (file count, size, estimated turns), and asks for confirmation before sending anything —
@@ -248,6 +326,12 @@ does the same for Postgres. To run a second stack on the same host (a test insta
 alongside a live one), set both plus `COMPOSE_PROJECT_NAME`, so the two get separate
 containers and volumes.
 
+Compose publishes Postgres on every interface of the host. On a laptop, or anywhere other
+machines can reach, keep it local with `POSTGRES_HOST_PORT=127.0.0.1:5432`. The MCP port has
+to stay reachable from your other machines, and plain http sends the device token
+unencrypted, so between machines use a VPN such as Tailscale or WireGuard, or put a TLS
+reverse proxy in front.
+
 ## Upgrading
 
 First-boot init never re-runs on an existing data volume. To bring an existing database up
@@ -276,7 +360,10 @@ applied and what is pending, and changes nothing.
 Every service verifies at boot that the database schema matches the code (the script keeps
 `synapse_meta.schema_version` at the highest number it has recorded; a database behind the
 code refuses to start with instructions rather than failing mid-request). So the upgrade
-order is: pull, run `apply_schema.sh`, restart.
+order is: `git pull`, run `apply_schema.sh`, then `docker compose up -d --build` (a plain
+restart keeps the old image). Run the script from the host with a DSN that points at
+`localhost:<POSTGRES_HOST_PORT>`: the one in `.env` names the compose service `postgres`,
+which only resolves inside the stack. The script needs `psql` and bash 4.4 or newer.
 `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
@@ -330,6 +417,10 @@ env var says so in its HANDOFF.md entry.
 
 ## Troubleshooting
 
+- **Services can't log in to Postgres, or report an embedding width mismatch, after you
+  edited `.env`.** Postgres keeps the password and the embedding width from its first start.
+  On a fresh install with nothing to keep, `docker compose down -v` (this deletes the
+  database) and then `docker compose up -d --build`.
 - **The board is empty but the URL is right, and recall returns nothing.** The machine is
   being served restricted: either it never enrolled, or it is presenting the shared machine
   token instead of a device token. Mint one with
@@ -379,8 +470,9 @@ env var says so in its HANDOFF.md entry.
   or a different `synapse` already sits there, it prints the line that adds `~/.synapse/bin`
   to `PATH` instead: add that line and open a new shell. Inside Claude Code sessions the
   plugin's own `bin/` provides `synapse` and `synapse-login` too.
-- **Codex hooks don't run.** Codex skips hooks nobody trusted: run `/hooks` in `codex` and
-  trust the Synapse ones. `synapse update` never changes their commands, so trust survives
+- **Codex hooks don't run** (no board, no `hook:` lines, nothing in
+  `/tmp/synapse-codex-hook.log`). Codex skips hooks nobody trusted, silently: run `/hooks` in
+  `codex` and press `t` to trust the Synapse ones. `synapse update` never changes their commands, so trust survives
   updates.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device

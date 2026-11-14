@@ -6,6 +6,27 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — docs: a new user's install works as written for Claude Code, Codex and Hermes (plugin 0.24.17)
+
+**What changed**
+
+- Docs only, no client code. The install guide, README Quick start, `.env` presets and
+  the client READMEs now match what a new user meets, found by a full rehearsal on a fresh
+  server with all three harnesses.
+- New in the guide: prerequisites, `SYNAPSE_OWNER_NAME` and `SYNAPSE_TIMEZONE` set before
+  the first session, a second machine (`mint --full`), Codex's trust and per-tool approval
+  prompts, the Codex history backfill, how Hermes picks up the provider and what
+  `--replace` does, and Postgres on loopback for a laptop.
+
+**What to do on each machine**
+
+- Nothing. `synapse update` brings the new READMEs.
+
+**Still open**
+
+- A Hermes background `delegate_task` uploads its turn twice; `synapse status` says Hermes
+  is wired while another provider is active; re-running login repeats the Codex trust nudge.
+
 ## 2026-11-14 — hermes: the client no longer guesses which sessions hold copied turns (plugin 0.24.16)
 
 **What changed**

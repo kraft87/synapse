@@ -529,7 +529,7 @@ Fix it in one minute:
   3. Restart:               docker compose up -d
   4. Mint this machine its own device token (printed once):
          docker compose exec mcp-server synapse-admin bootstrap "<label>"
-     and paste that token into the plugin's Synapse token prompt.
+     and store it on that machine with `synapse login --token`.
 
 Really want an open server (dev / stdio only)? Set SYNAPSE_ALLOW_OPEN=1. It still
 serves every caller `restricted` — this flag suppresses the check, not the effect.

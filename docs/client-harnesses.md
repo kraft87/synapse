@@ -318,7 +318,7 @@ synapse install hermes [--hermes-home PATH] [--replace] [--dry-run]
 Hermes home on disk), and `synapse update` rebuilds the folder when it was built by
 another client version. `synapse status` (new in 0.24.0) prints a line per harness:
 wired, found and not wired, or not found. The Hermes home is
-`--hermes-home`, else `$HERMES_HOME`, else Hermes's default (`~/.hermes`). Selecting the
+`--hermes-home`, else `$HERMES_HOME`, else Hermes's default (`~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows). Selecting the
 provider:
 
 - With the `hermes` program on PATH and a `config.yaml` already in the home, through

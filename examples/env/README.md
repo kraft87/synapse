@@ -7,7 +7,7 @@ one setting you cannot change after the database's first boot (`SYNAPSE_EMBED_DI
 [`.env.example`](../../.env.example) stays the full annotated reference for every variable.
 
 - `voyage.env`: the default. Voyage AI for embeddings and rerank, a Claude subscription token or an Anthropic key for extraction.
-- `local.env`: no retrieval signups. The bundled `local-inference` container does embeddings and rerank; extraction still uses the Claude token.
+- `local.env`: no retrieval signups. The bundled `local-inference` container does embeddings and rerank; extraction still uses the Claude token or an Anthropic key.
 - `openrouter.env`: no Claude subscription. Voyage for retrieval, OpenRouter for extraction.
 
 ```bash
