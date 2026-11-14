@@ -220,6 +220,7 @@ class _Cli:
         self.hermes_is_wired = False
         self.hermes_update: str | None = None
         self.real_core_registry = None
+        self.hook_note = ""  # what _hook_python_note says (Windows only, for real)
 
     def terminal(self, *answers: str) -> None:
         self.answers = list(answers)
@@ -233,6 +234,7 @@ class _Cli:
         harness = mod.harness
         mp = self.mp
         mp.setattr(mod, "_reload", lambda: None)
+        mp.setattr(mod, "_hook_python_note", lambda: self.hook_note)
         mp.setattr(mod, "_interactive", lambda: self.answers is not None)
         mp.setattr(builtins, "input", self._input)
         mp.setattr(harness, "detect", lambda: dict(self.found))
@@ -2109,6 +2111,70 @@ def test_status_has_a_line_per_harness(cli, capsys):
     cli.hermes_is_wired = True
     assert cli.run("status") == 0
     assert "Hermes: wired" in capsys.readouterr().out.splitlines()
+
+
+_NO_PYTHON = (
+    "Synapse: no Python 3.11 or newer found (tried python3, python and py -3). "
+    "Install Python from python.org, then start a new session."
+)
+
+
+def test_status_and_login_say_when_the_claude_hooks_will_find_no_python(cli, capsys):
+    """On Windows the hooks' Python is found by bin/synapse-python under Git Bash; when it
+    finds none, `synapse status` and the login that wires Claude Code say so, once."""
+    cli.found = {"claude": True, "codex": False, "hermes": False}
+    cli.plugin_id = "synapse@synapse"
+    cli.hook_note = "Claude Code hooks: no Python 3.11 or newer found."
+    assert cli.run("status") == 0
+    assert capsys.readouterr().out.splitlines()[:2] == ["Claude Code: wired", cli.hook_note]
+    assert cli.run("login", "--url", _URL) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count(cli.hook_note) == 1
+    assert (
+        out.index(cli.hook_note)
+        == out.index(f"Claude Code: plugin installed, SYNAPSE_URL={_URL}") + 1
+    )
+
+
+def _ran(code: int, err: str = ""):
+    return lambda argv, **kw: subprocess.CompletedProcess(argv, code, "", err)
+
+
+def test_the_hook_python_check_runs_the_hooks_own_launcher(tmp_path):
+    cli = _load("synapse_cli")
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "C:/Python313/python.exe\n", "")
+
+    assert cli._hook_python_note(windows=False, bash=lambda: "x", run=run) == ""
+    assert seen == []
+    assert cli._hook_python_note(windows=True, bash=lambda: "C:/Git/bin/bash.exe", run=run) == ""
+    assert seen == [
+        ["C:/Git/bin/bash.exe", str(_REPO / "plugin" / "bin" / "synapse-python"), "--check"]
+    ]
+    note = cli._hook_python_note(windows=True, bash=lambda: "b", run=_ran(1, _NO_PYTHON + "\n"))
+    assert note == "Claude Code hooks: " + _NO_PYTHON.removeprefix("Synapse: ")
+    assert "Install Git for Windows" in cli._hook_python_note(
+        windows=True, bash=lambda: "", run=run
+    )
+
+
+def test_git_bash_is_found_the_way_claude_code_finds_it(tmp_path):
+    cli = _load("synapse_cli")
+    git = tmp_path / "Git"
+    (git / "cmd").mkdir(parents=True)
+    (git / "bin").mkdir()
+    (git / "cmd" / "git.exe").write_bytes(b"")
+    (git / "bin" / "bash.exe").write_bytes(b"")
+    found = cli._git_bash(env={}, which=lambda name: str(git / "cmd" / "git.exe"))
+    assert found == str((git / "bin" / "bash.exe").resolve())
+    named = tmp_path / "elsewhere-bash.exe"
+    named.write_bytes(b"")
+    env = {"CLAUDE_CODE_GIT_BASH_PATH": str(named)}
+    assert cli._git_bash(env=env, which=lambda name: None) == str(named)
+    assert cli._git_bash(env={}, which=lambda name: None) == ""
 
 
 def test_a_codex_rewire_failure_after_an_update_is_reported_not_fatal(cli, capsys):
