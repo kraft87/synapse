@@ -682,6 +682,32 @@ class TestExtractionPromptDisciplines:
         # No hedging/reasoning/schema-echo bleed into fact or summary text.
         assert "OUTPUT DISCIPLINE" in prompt
 
+    def test_default_owner_is_written_user_and_gets_no_naming_rule(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_OWNER_NAME", raising=False)
+        prompt = self._rendered_prompt()
+        assert 'fact "User gave Mrs. Johnson spider plant cuttings' in prompt
+        assert 'source "User", target "Mrs. Johnson"' in prompt
+        assert "THE USER IS" not in prompt
+
+    def test_configured_owner_name_is_what_the_prompt_writes(self, monkeypatch):
+        """A fact that says "User" shares no name with a question about the owner, so an
+        install that names its owner has every example say that name, and a rule that the
+        name is the user's even when the text never says it."""
+        monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
+        prompt = self._rendered_prompt()
+        assert 'THE USER IS "Sam".' in prompt
+        assert 'fact "Sam gave Mrs. Johnson spider plant cuttings' in prompt
+        assert 'source "Sam", target "Mrs. Johnson"' in prompt
+        assert '("Sam ...", "Sam\'s ...")' in prompt
+        # A namesake is never written as the bare first name.
+        assert "Someone ELSE called Sam is a different" in prompt
+        # The assistant's own work is not credited to the named owner.
+        assert "is never Sam's doing" in prompt
+        assert "unless\n  Sam's own turn says Sam did it." in prompt
+        # "User" is left only where the rule forbids it.
+        assert prompt.count('"User"') == 1
+        assert "User " not in prompt and "User's" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # EntityResolver

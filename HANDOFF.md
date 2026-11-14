@@ -237,6 +237,111 @@ two, and everything that is still open.
 - From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
   uploaded and are lost at exit.
 
+## 2026-11-13 — extraction: the owner is written by name; a script renames the stored "User" facts (no schema change)
+
+**What changed**
+
+- **The fault.** Recall searches fact text. The extractor wrote "User ..." when a
+  conversation never said the owner's name and the name when it did, so one memory held
+  two wordings for one person. The alias map (`SYNAPSE_OWNER_NAME`,
+  `SYNAPSE_OWNER_ALIASES`) merged the entities; nothing made the text agree. Measured on
+  prod with 60 questions about the owner, each asked in the first person and again with
+  the owner named: facts worded with the name went from rank 1.70 to 1.00 when the
+  question named the owner, and facts worded "User" went from rank 1.05 to 5.85, with 4
+  of 20 no longer served. Neither way of asking finds every fact.
+- **The prompt names the owner.** With `SYNAPSE_OWNER_NAME` set, the extraction prompt
+  says that name in every example where it said "User", and one added rule
+  (`_OWNER_NAME_RULE`, `ingestion/extraction_llm.py`) says: the name is the user's
+  whether or not the text says it; someone else with the same first name is written with
+  a surname or a role, never the bare first name; the assistant's own work is stated
+  without a doer, not credited to the owner. Without the setting the prompt is
+  byte-for-byte what it was.
+- **`scripts/rename_owner_in_facts.py`** rewrites the facts stored before the rule. It
+  numbers each "user" word of a fact ("User", "the user", "user's"; never part of a
+  longer word such as "users", "user_id", "end-user"; never "a user" or "user input",
+  where a name cannot stand), a classifier names the numbers that mean the owner, and
+  the script swaps exactly those for the name. No other character can change. Each fact
+  is classified twice, among different neighbours, and a word is renamed only when both
+  passes name it. Retired facts, web facts, entity names and summaries, edges, dates and
+  labels are not touched.
+- **The ingest guard drops two more of Synapse's own prompts.** `is_harness_call`
+  (`ingestion/contamination.py`) now refuses a single-turn session that opens "A personal
+  AI memory stores ...": the rename classifier's prompt and the golden-question
+  generators'. 140 generator calls were ingested on 2026-11-09. They hold stored facts
+  beside the owner's name, so they answered a question that names the owner before real
+  history did.
+
+**What to do on each machine**
+
+1. Take the new image. Server only: no client change, no schema change. An install
+   without `SYNAPSE_OWNER_NAME` is done here.
+2. With `SYNAPSE_OWNER_NAME` set, rename the stored facts (the plan file holds private
+   fact text: keep it outside the repository; DSN from `--db-url` or `$SYNAPSE_DB_URL`):
+   - `scripts/rename_owner_in_facts.py --propose --out <outside>/plan.jsonl`, where the
+     pipeline's LLM settings are (`SYNAPSE_OWNER_RENAME_MODEL` beats `SYNAPSE_LLM_MODEL`).
+     It reads only. It prints how many facts it would rename, leave, could not classify,
+     and how many the two passes read differently.
+   - Read a sample of the plan (`old` / `new` per line) and delete any line you disagree
+     with.
+   - `--apply <plan> --dry-run`, then `--apply <plan>`, where the embedder's settings
+     are. Each row is first copied to `kg_owner_rename_<YYYYMMDD>`, then written with a
+     new embedding, only where the stored text still equals the plan's `old`. A run that
+     stops can be run again.
+   - A second `--propose` later picks up facts written between the first one and the new
+     image.
+
+**Rollback**
+
+The previous image writes "User" again. `scripts/rename_owner_in_facts.py --restore
+<YYYYMMDD>` puts back the text and embedding of every backed-up row that still holds the
+text the script wrote.
+
+**What was proven**
+
+- `tests/test_extractor.py`: the default prompt has no naming rule and still writes
+  "User"; a configured name replaces every owner "User" in the prompt and adds the rule.
+  `tests/test_rename_owner_in_facts.py` (27) and `tests/test_rename_owner_in_facts_db.py`
+  (4, scratch database): which words are numbered, only a picked word changes, a reply
+  that cannot be lined up renames nothing, one pass alone renames nothing; dry run writes
+  nothing, apply backs up then writes text and embedding, a row changed since the plan is
+  skipped, a second apply is a no-op, restore does not overwrite a later edit.
+- Extraction A/B, write-free, the prod model on 38 prod chunks (the owner unnamed in the
+  text, a namesake manager, "users" as a generic noun, the owner named): facts with a
+  capital "User" 58 -> 4 and 2 over two runs of the final rule (what is left is
+  "User-Agent" and "User interface"); facts that say the name 76 -> 199 and 178; total
+  facts 680 -> 717 and 720; edges on the owner's entity 38 -> 44 and 48, the added ones
+  standing facts about the owner that the old prompt left off the entity. The namesake
+  was written with his surname in every arm, and a generic "user" stayed "user".
+- The same A/B is why the rule has its last sentence. Without it the named owner was
+  credited with the assistant's work ("Sam built the package" for a package the
+  assistant built): 4 or more such facts in a run, against none before. A shorter
+  sentence gave 2, 5 and 12 over three runs; the final wording gave 2 and 2.
+- Classifier trial on the first 240 candidate facts, read against each line: one pass
+  renamed 196 with 5 wrong ("User Message", "user input": the word names a kind of
+  thing); a second single pass got those right and 2 others wrong; two passes in
+  different orders renamed 186, none of the 7 among them, and left 5 facts that do mean
+  the owner.
+- Two passes over all 5,551 candidate facts on prod, read-only: 4,320 to rename, 1,231
+  left, 280 the passes read differently, none unclassified. Of 170 renames drawn at
+  random, all were the owner. A search of the plan for the word before a system noun or
+  after "a" / "one" found about ten that were not ("a user's config", "user turns"):
+  those two shapes are now never numbered.
+
+**Open**
+
+- A recall query about the owner should name them, since facts are third person. That is
+  the caller's job; the hint to callers ships once the stored facts are renamed and the
+  owner questions are measured again.
+- About 2 facts in 700 still credit the owner with something the assistant did.
+- Not renamed: entity names and summaries that say "User" ("User's mother"), the text of
+  stored preferences, retired facts, and the owner words the two passes disagree on.
+- A rename reads "per Sam preference" where the fact said "per user preference": the
+  meaning holds, the grammar does not.
+- Entity rows already split for one person (a namesake stored twice, the owner's login
+  names) are not merged by this change.
+- The guard stops new generator calls at ingest; the 140 episodes already stored are
+  still there.
+
 ## 2026-11-13 — notes: a related note is kept beside the old one, and replaced text is kept (schema 070, optional)
 
 **What changed**
