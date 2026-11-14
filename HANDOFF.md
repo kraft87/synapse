@@ -6,6 +6,42 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — hermes: `synapse import hermes` imports past Hermes sessions (plugin 0.24.19)
+
+**What changed**
+
+- **New command.** `synapse import hermes` reads `<hermes_home>/state.db` and uploads the
+  turns of past Hermes sessions, with their original times. `--hermes-home PATH` names
+  another home, `--dry-run` shows the summary and sends nothing, `--yes` skips the
+  confirmation. Plain `synapse import` still imports Claude Code history.
+- **The live provider's rule decides what is imported.** Only local sessions of this
+  machine's owner. Chat platforms, the API server, cron, subagents, tool sessions, a
+  session another person or agent wrote a turn in, a private session and a session that
+  continues one are skipped, and the summary says how many and why.
+- **No duplicates.** A turn the provider already uploaded gets the same id from the
+  import, so importing after live use, or live use after an import, adds nothing. Copies a
+  branch or a compressed continuation holds of its parent's turns are left out.
+- The store is opened read-only and nothing under the Hermes home is written. A store
+  schema this client does not know stops the import before anything is read.
+
+**What to do on each machine**
+
+- `synapse update`, then `synapse import hermes` where Hermes has history worth keeping.
+  Each imported turn runs extraction on the server's LLM, so bound a first import by date.
+
+**What was proven**
+
+- On a real Hermes v0.23.1 store: sessions the provider had uploaded added nothing; a
+  session deleted on the server came back with the same ids and times; a live turn after
+  the import made no duplicate; private, API-server, subagent and tool sessions added
+  nothing.
+
+**Still open**
+
+- The model recorded is the session's last one, for every turn of a session that switched.
+- A store from before Hermes kept creation receipts has no record of who created a local
+  chat, so those chats are skipped.
+
 ## 2026-11-14 — hermes: Synapse works in Hermes on Windows, and Windows client fixes (plugin 0.24.18)
 
 **What changed**

@@ -179,6 +179,7 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
 - **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
+  `synapse import hermes` does the same for past Hermes sessions ([Hermes](#hermes)).
 - **`synapse private on|off|status <session-id>`** — private mode (below).
 
 ## Retiring a skill
@@ -369,6 +370,24 @@ compressions made from it afterwards, for every agent Hermes builds under this
 uploads from its next turn on: the turns that ended in it while it was private are not
 told from the copied ones.
 
+**Past sessions.** `synapse import hermes` imports the sessions already in Hermes's
+`state.db`, so a new install can recall them on day one (`--hermes-home PATH` for another
+home, `--dry-run` to list what it would send). It works like `synapse import`: an
+optional date range (by each session's last activity), a summary, and a confirmation
+before anything is sent (`--yes` skips the prompts). Each new turn costs one extraction
+on the server's LLM. It sends what the provider would have sent, in the same format:
+the finished turns of your local sessions, with their own time, model, working
+directory and project. It skips chat-platform, API-server, cron, subagent, side-agent
+and `--source tool` sessions, the Bot Chat and Group Chats, a chat noted under
+`synapse/inert/`, a session where the gateway ran a turn someone else sent, and a
+private session or one that continues a private one (by its marker and by the server's
+row). The summary counts the skipped sessions by reason. A turn the provider already
+uploaded keeps its id, so the server keeps one copy: an import after live use, a
+re-run after Ctrl-C, and live use after an import add nothing twice. A branch or a
+compressed continuation imports only the turns that ended in it. `state.db` is opened
+read-only and nothing under the Hermes home is written. On a store version the client
+does not know, it stops and sends nothing.
+
 **`/private`.** In a session you run on this machine, type `/private on` to take that
 session off the record. `/private` alone, or `/private status`, says whether it is. It
 is `synapse private on` for the session you type it in: it writes the marker, sets the
@@ -387,8 +406,7 @@ There, send a first message that may be stored, then `/private on`. After `synap
 update`, restart Hermes (`hermes gateway stop`) to get the command.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
-queued), the recall-feedback nudge, skills and config sync, and importing past Hermes
-sessions from its `state.db`.
+queued), the recall-feedback nudge, and skills and config sync.
 
 ## More
 

@@ -11,6 +11,7 @@
     synapse skill retire NAME
     synapse skill scope NAME global|project:LABEL
     synapse devices|private|import ...     (the synapse-devices/-private/-import tools)
+    synapse import hermes [--hermes-home PATH] [--yes] [--dry-run]
     synapse version
 
 `synapse login` is the one setup step on a machine: it signs in and enrolls (one

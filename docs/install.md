@@ -241,8 +241,15 @@ synapse import
 ```
 
 Run it in a terminal: the date range and the confirmation need a keyboard (`--yes` skips
-the confirmation in scripts). It imports Claude Code history only. Past Hermes sessions
-cannot be imported yet.
+the confirmation in scripts). It imports Claude Code history. Past Hermes sessions have
+their own command, with the same prompts:
+
+```
+synapse import hermes          # --hermes-home PATH for another Hermes home
+```
+
+It imports the local sessions the Hermes provider would have uploaded, and skips the
+rest: see [plugin/README.md](../plugin/README.md#hermes).
 
 Past Codex sessions go through a server-side backfill. On the server box, from the repo
 directory (`--dry-run` first shows the count; `--since-days N` bounds the spend):
