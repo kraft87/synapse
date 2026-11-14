@@ -98,6 +98,33 @@ def test_empty_db_renders_banner_only(conn, db_url):
     assert "##" not in text  # empty sections omitted
 
 
+def test_banner_says_how_to_word_a_query_about_the_owner(conn, db_url, monkeypatch):
+    """Facts and notes are third person under the owner's stored name. A client that reads
+    only the board (no MCP instructions) is told that name here, in the server's words."""
+    _wipe(conn)
+    monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
+    text = _board(db_url, None)["text"]
+    assert (
+        'Memory is written in third person and calls the user "Sam": in a recall query '
+        'about the user, write "Sam", not "I" or "my".'
+    ) in text
+    assert text.index("Absence from this board") < text.index("Memory is written in third person")
+
+
+def test_banner_has_no_owner_hint_without_a_name_or_on_a_restricted_surface(
+    conn, db_url, monkeypatch
+):
+    """No name set: the facts say "User" and no hint was measured for that. A restricted
+    surface is not served the owner's facts and is not told the owner's name."""
+    _wipe(conn)
+    monkeypatch.delenv("SYNAPSE_OWNER_NAME", raising=False)
+    assert "third person" not in _board(db_url, None)["text"]
+    monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
+    restricted = build_board(db_url, None, register_restricted(conn, ["alpha"]))
+    assert restricted["trust"] == "restricted"
+    assert "Sam" not in restricted["text"]
+
+
 def test_banner_counts_and_recent_projects(conn, db_url):
     _wipe(conn)
     _episode(conn, "s1", 1, "alpha", days_ago=5)

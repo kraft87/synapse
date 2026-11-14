@@ -41,6 +41,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.db_notes import note_helpful_counts, select_board_notes
+from ingestion.dedup import owner_name
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
@@ -53,6 +54,7 @@ from ingestion.surfaces import (
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.preferences_routes import top_block
+from mcp_server.recall_query import owner_query_hint
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
 
@@ -226,6 +228,7 @@ def _render(
     events: list[dict[str, Any]],
     notice: str | None = None,
     n_projects: int | None = None,
+    owner_hint: str = "",
 ) -> str:
     lines = [f"[Synapse board — project: {project or 'all'}]"]
     if notice:
@@ -238,6 +241,9 @@ def _render(
         "Absence from this board means SEARCH (recall), not doesn't-exist. "
         "Note bodies: fetch by id."
     )
+    if owner_hint:
+        # The same sentence as the server instructions, for a client that reads only the board.
+        lines.append(owner_hint)
 
     by_type: dict[str, list[dict[str, Any]]] = {}
     for n in notes:
@@ -320,6 +326,7 @@ def _fit_notes(
     events: list[dict[str, Any]],
     notice: str | None,
     n_projects: int | None = None,
+    owner_hint: str = "",
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Drop the fewest notes that brings the board under both caps: ``(text, kept,
     dropped)``. Notes leave in reverse ``_keep_order`` (the per-type quotas: the least
@@ -345,7 +352,15 @@ def _fit_notes(
 
     def render(kept: list[dict[str, Any]], dropped: int) -> str:
         return _render(
-            project, n_episodes, project_names, kept, dropped, events, notice, n_projects
+            project,
+            n_episodes,
+            project_names,
+            kept,
+            dropped,
+            events,
+            notice,
+            n_projects,
+            owner_hint,
         )
 
     text = render(notes, 0)
@@ -442,8 +457,10 @@ def build_board(
         db_url, allowed_projects=allowed, own_surface=own
     )
 
+    # A restricted surface is not served the owner's facts, and is not told the owner's name.
+    owner_hint = "" if st.restricted else owner_query_hint(owner_name())
     text, kept, dropped = _fit_notes(
-        project, n_episodes, project_names, notes, events, notice, n_projects
+        project, n_episodes, project_names, notes, events, notice, n_projects, owner_hint
     )
 
     out: dict[str, Any] = {
