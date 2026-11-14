@@ -48,18 +48,30 @@ def _quota_order(notes):
     return out
 
 
-def _old_cap_loop(project, n_episodes, project_names, notes, events, notice, n_projects=None):
+def _old_cap_loop(
+    project, n_episodes, project_names, notes, events, notice, n_projects=None, owner_hint=""
+):
     """The cap loop as it was before ``_fit_notes``, apart from the return, the banner's
-    project count passed through to ``_render``, and the victim: the last note of the
+    project count and owner hint passed through to ``_render``, and the victim: the last note of the
     quota order, not the old drop-class order."""
     kept = list(notes)
     dropped = 0
     order = _quota_order(notes)
-    floor = _render(project, n_episodes, project_names, [], len(notes), events, notice, n_projects)
+    floor = _render(
+        project, n_episodes, project_names, [], len(notes), events, notice, n_projects, owner_hint
+    )
     can_reach_cap = _fits(floor)
     while True:
         text = _render(
-            project, n_episodes, project_names, kept, dropped, events, notice, n_projects
+            project,
+            n_episodes,
+            project_names,
+            kept,
+            dropped,
+            events,
+            notice,
+            n_projects,
+            owner_hint,
         )
         if not kept or not can_reach_cap or _fits(text):
             break

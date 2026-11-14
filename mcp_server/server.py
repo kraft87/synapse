@@ -25,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
+from ingestion.dedup import owner_name
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.auth_tokens import (
     DEVICE_CLIENT_ID as _DEVICE_CLIENT_ID,
@@ -51,6 +52,7 @@ from mcp_server.hidden_tools import RetiredToolArgs as _RetiredToolArgs
 from mcp_server.http_auth import admin_authorized, authenticated, is_root, machine_authorized
 from mcp_server.http_auth import bearer as _bearer
 from mcp_server.ingest_route import register as _register_ingest_route
+from mcp_server.recall_query import owner_query_hint
 from mcp_server.recall_route import register as _register_recall_route
 from mcp_server.remember_tool import register as _register_remember_tool
 from mcp_server.retrieval_tools import register as _register_retrieval_tools
@@ -278,6 +280,9 @@ def _request_trust(request: Request) -> SurfaceTrust:
     )
 
 
+# Empty on an install with no owner name set.
+_OWNER_HINT = f"{hint} " if (hint := owner_query_hint(owner_name())) else ""
+
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
 # this string load at session start — it is the always-loaded orientation surface that
 # tells the model these tools exist and when to reach for them. Claude Code truncates
@@ -290,7 +295,8 @@ _INSTRUCTIONS = (
     "session start where the client supports it; note bodies expand by id. "
     "BEFORE answering anything that references past work — a prior decision, "
     "device, purchase, tool, project, person, or preference — search with "
-    "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
+    f"recall(query) first. {_OWNER_HINT}"
+    "fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results; recall_full_turns searches complete raw turns — "
     "the retry when an overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "

@@ -61,6 +61,64 @@ two, and everything that is still open.
   so the provider uploads nothing from it. At bca51750 no product code starts it: the
   TUI and Desktop attach to the gateway. The backend takes the same lock at upstream
   head d3d4ee4c (read, not run).
+## 2026-11-14 — recall: callers are told the name to use in a query about the owner (no schema change)
+
+**What changed**
+
+- **The fault.** Facts are third-person sentences under the owner's name. Every
+  recall query is written by a model, and a model asked "what do I like?" searches for
+  "what do I like": a query with no name in it and no word a stored fact shares. Vague
+  owner questions ("what do I own?", "what am I working on?") came back with whatever
+  else used their other words and no notes; the same questions with the owner named
+  returned the owner's facts and three notes each.
+- **One sentence, in two places.** The server instructions (the only text every MCP
+  client always loads) and the board (for a client that reads only the board) now say:
+  `Memory is written in third person and calls the user "<name>": in a recall query about
+  the user, write "<name>", not "I" or "my".` The name is `SYNAPSE_OWNER_NAME`.
+- **Who is not told.** An install with no name set gets no sentence: its facts say "User",
+  which a first-person query already finds. A restricted surface gets none on its board:
+  it is not served the owner's facts and is not told the owner's name.
+- **The query is not rewritten on the server.** The caller knows whether an "I" in its
+  query is the owner or part of a quoted phrase; the server would be guessing.
+- This had to wait for the facts. With half of them worded "User", naming the owner
+  found the named half and lost the rest (entry below).
+
+**What to do on each machine**
+
+An install that set `SYNAPSE_OWNER_NAME` after it had stored facts runs
+`scripts/rename_owner_in_facts.py` first (entry below): while old facts still say "User",
+a query that names the owner loses them (rank 1.05 -> 5.85 on the 20 such questions).
+Then take the new image. No client change: the board text is the server's.
+
+**What was proven**
+
+- `tests/test_tool_surface.py`: the instructions carry the sentence and still fit Claude
+  Code's 2 KB cut (1,345 bytes with a four-letter name). `tests/test_board.py`: the board
+  carries it, with the configured name, and not when no name is set or the surface is
+  restricted.
+- The stored facts were renamed on prod on 2026-11-14 (entry below). Two full
+  classification runs proposed 4,320 and 4,326 facts. The plan that was applied kept only
+  the words both runs named, 4,212 facts, after 97 facts the runs disagreed on and 14
+  read as wrong by hand were left out ("User and Sam are neither lexically nor
+  vector-similar": the word is talked about, not used). Backup in
+  `kg_owner_rename_20261114`. Live facts with a capital "User": 3,180 -> 221. Facts on
+  the owner's entity that say "user" and never the name: 1,304 -> 21.
+- The 60 owner questions on prod, before and after the rename (a fact not served counts
+  as rank 21). Asked with the owner named: 54/60 at rank 3.37 -> 60/60 at rank 1.15.
+  Asked in the first person: 58/60 at rank 1.70 -> 59/60 and 58/60 at ranks 1.40 and
+  1.73 over two runs, so the rename cost first-person questions nothing. The 20 questions
+  whose fact said "User": named 16/20 at rank 5.85 -> 20/20 at rank 1.10.
+
+**Open**
+
+- The 140 golden-generator calls ingested on 2026-11-09 listed facts beside the owner's
+  name, so a question that names the owner drew them: 91 of the 333 episodes served for
+  the 60 named questions, against 6 of 319 in the first person. They were deleted from
+  prod on 2026-11-14 (no chunk or fact cited them; backup in
+  `episodes_harness_purge_20261114`). The contamination guard keeps new ones out.
+- A first name also matches a namesake's older facts; the extraction rule that tells
+  them apart covers new facts only.
+- The same sentence is not in the clients' own prompt nudges.
 
 ## 2026-11-14 — hermes: a turn's upload runs after `sync_turn` has returned (plugin 0.24.14)
 
