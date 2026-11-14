@@ -330,8 +330,9 @@ finish are kept in memory.
 you left, and it is on the record unless you mark it or its own row says it continues a
 private session. An ACP fork names no session it came from: it is on the record, and
 uploads the turns begun in it, not the ones copied into it. A file under
-`$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds for the
-fork later keeps them out too. Narrow cases are left. The copy of a single turn
+`$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds later for
+the fork, or for a session that goes on from it, keeps them out too. Narrow cases are
+left. The copy of a single turn
 whose message had no text (a picture alone) can go up with the fork's first turn. An
 agent built again for the fork before its first turn (you pick another model before
 your first prompt, or the ACP adapter restarts) looks back ten turns. And when the
@@ -341,24 +342,21 @@ is taken for a resumed one: up to ten of the copied turns are uploaded, whatever
 session they came from was. A chat whose first message got no reply looks like a fork
 when you open it again: the agent built then does not upload that first exchange, and
 an agent Hermes builds for the chat later does.
-`synapse private off --forget <id>` puts a session back on the record with the turns
-spoken in it. A session that was private because of the one it continues keeps those
-turns out, and uploads the turns an agent sees begin on the record from then on. That
-holds for every agent Hermes builds for it under this `HERMES_HOME`, and for a branch
-or a compression made from it later: a file under `$HERMES_HOME/synapse/settled/` says
-the session holds turns from off the record, written once the server has had the
-session's row. Such an agent does not look back: a turn
-that had not been uploaded when Hermes replaced the agent before it is not picked up.
-The first turn back is left out when Hermes added a row of its own to it (a nudge, a
-reply to a background-process notice), when its message had no text, or when Hermes
-folded the message into an earlier one that got no reply. A message cut short off the
-record that you retry on the record is uploaded by an agent built since, as the gateway
-builds one for `/retry`, and not by the agent that saw the message begin. Once you
-have stopped a reply in such a session, the first turn after each `off --forget` is
-not uploaded, for as long as that agent runs. A turn from off the record can still go
-up after `off --forget` in a few narrow orders: when the uploads of the two turns
-before it were both still waiting as it began (a server that hangs), or after an
-`/undo` in the TUI that follows a failed turn with a compression in it (`HANDOFF.md`).
+Private mode covers a whole session. `synapse private off <id>` removes the marker and
+keeps the server's row, which goes on dropping that session's turns: to go back on the
+record, start a new session (`/new`). `synapse private off --forget <id>` deletes the
+row too and puts that session back on the record whole: its next turn uploads the
+finished turns not sent yet, the ones spoken while it was private among them (the last
+ten at most when Hermes resumed the session or moved the agent to it; a turn the
+server's row dropped after a plain `off` counts as sent for the agent that sent it).
+For a session that was private because of the one it continues, those are also the
+turns it took over from that session, which stays private under its own id only: to
+go on without them, start a new session instead. A session is made private because of
+the one it continues once: a file under `$HERMES_HOME/synapse/settled/` says it was
+asked about, so one you put back stays on the record, with the branches and
+compressions made from it afterwards, for every agent Hermes builds under this
+`HERMES_HOME`. An ACP fork you marked private and put back uploads from its next turn
+on: the turns that ended in it while it was private are not told from the copied ones.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

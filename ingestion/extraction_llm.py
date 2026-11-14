@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ingestion.dedup import owner_name
 from ingestion.llm_client import MalformedResponseError
 from ingestion.models import (
     CombinedExtraction,
@@ -45,11 +46,11 @@ Output ONLY valid JSON (no explanation, no markdown fence):
 Rules:
 - EVIDENCE FIELDS (every fact carries both):
   `ongoing` is true ONLY when the fact asserts something that is true now and can
-  stop being true without anyone saying so — a habit or routine ("User swims laps
+  stop being true without anyone saying so — a habit or routine ("{owner} swims laps
   before work"), a tool or service in use, a current job, an active subscription, a
   living arrangement. It is false for a dated happening, a one-time event, a permanent or
-  slow-moving trait ("User has ADHD", "User was born in Halifax"), a decision, a
-  config value, and for any DESCRIPTION OF AN ARTIFACT — "User's gym profile lists
+  slow-moving trait ("{owner} has ADHD", "{owner} was born in Halifax"), a decision, a
+  config value, and for any DESCRIPTION OF AN ARTIFACT — "{owner}'s gym profile lists
   rock climbing" describes the profile, not what the user does; keep such facts
   about the artifact and never promote the listed item into an activity.
   `attribution` is who asserted the fact in the summary: "user" when the user said
@@ -72,10 +73,10 @@ Rules:
   to Discord #briefings via discord-send.sh", "Voyage embeddings are 2048-dim".
 - DATED HAPPENINGS ARE FACTS, not operational chatter. The ban above is for
   routine tool churn, NOT for events someone would later ask "when did..." about.
-  DO emit first-person life events ("User attended their cousin's wedding as a
-  bridesmaid", "User repotted the spider plant"), shipped milestones ("the notes
+  DO emit first-person life events ("{owner} attended their cousin's wedding as a
+  bridesmaid", "{owner} repotted the spider plant"), shipped milestones ("the notes
   store shipped to production"), and one-time occurrences with a date anchor
-  ("User received a crystal chandelier from their aunt"). The line: "checked the
+  ("{owner} received a crystal chandelier from their aunt"). The line: "checked the
   inbox" recurs and teaches nothing; "gave spider plant cuttings to Mrs. Johnson"
   happened once and is the answer to a future when-question.
 - PLANNED IS NOT DONE. Never assert completion of an action the text only plans,
@@ -86,9 +87,9 @@ Rules:
   done / was sent / underwent" ONLY when the text states the action already
   happened. The meta-act is separate and may itself be complete: booking an MRI
   is a completed BOOKING ("the MRI was booked for June 16"), not a completed MRI.
-  BAD:  fact "An MRI was performed as part of User's mother's memory workup"
+  BAD:  fact "An MRI was performed as part of {owner}'s mother's memory workup"
         (source only listed the MRI as a planned workup component)
-  GOOD: fact "An MRI is a planned component of User's mother's memory workup,
+  GOOD: fact "An MRI is a planned component of {owner}'s mother's memory workup,
         booked for June 16 (meaning 2026-06-16)"
   When completion status is genuinely ambiguous in the text, phrase the fact with
   the weaker claim (planned/underway), never the stronger one.
@@ -114,80 +115,80 @@ Rules:
   does not clearly bind the outcome, drop the identifier rather than guess.
   BAD:  fact "Chunk size was reduced to resolve MAX_TOKENS truncation errors"
         (the user said "don't change chunk sizes")
-  GOOD: fact "User ruled out changing chunk sizes while fixing MAX_TOKENS truncation
+  GOOD: fact "{owner} ruled out changing chunk sizes while fixing MAX_TOKENS truncation
         errors"
   BAD:  fact "PR #12 was deployed to production"
         (PR #12 only changed a client-side plugin file; the deploy was other work)
   GOOD: fact "PR #12 changed a client-side plugin file"
 - EDGES CONNECT THE REAL PARTICIPANTS — the user is NOT the default source. The user
-  narrates nearly every turn, so routing every happening through a "User" node collapses
+  narrates nearly every turn, so routing every happening through a "{owner}" node collapses
   the graph into one hub that no longer discriminates. When an event or statement has a
   real counterparty or object (a person, org, place, thing), the EDGE joins THOSE, and
   the user survives in the `fact` TEXT.
-  BAD:  source "User", target "Mrs. Johnson", GAVE
-        fact "User gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
+  BAD:  source "{owner}", target "Mrs. Johnson", GAVE
+        fact "{owner} gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
   GOOD: source "spider plant cuttings", target "Mrs. Johnson", GIVEN_TO
-        fact "User gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
-  BAD:  source "User", target "voyage-4-large", SWITCHED_TO
-        fact "User switched the embedder to voyage-4-large, replacing voyage-3"
+        fact "{owner} gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
+  BAD:  source "{owner}", target "voyage-4-large", SWITCHED_TO
+        fact "{owner} switched the embedder to voyage-4-large, replacing voyage-3"
   GOOD: source "synapse", target "voyage-4-large", USES_EMBEDDER
-        fact "User switched synapse's embedder to voyage-4-large, replacing voyage-3"
+        fact "{owner} switched synapse's embedder to voyage-4-large, replacing voyage-3"
 - A DECISION, APPROVAL, REQUEST, PURCHASE, or CLAIM IS A DOING — same rule. Connect
   WHAT WAS CHOSEN to WHAT IT AFFECTS (or what it replaced), and never invent an
   abstraction node ("the X decision", "the plan", "the approach") to receive the edge.
-  BAD:  source "User", target "ship decision", DECIDED
-        fact "User reversed and greenlit shipping episode rerank to production on 2026-06-03"
+  BAD:  source "{owner}", target "ship decision", DECIDED
+        fact "{owner} reversed and greenlit shipping episode rerank to production on 2026-06-03"
   GOOD: source "episode rerank", target "production recall()", SHIPPED_TO
-        fact "User greenlit shipping episode rerank into production recall() on 2026-06-03
+        fact "{owner} greenlit shipping episode rerank into production recall() on 2026-06-03
         (meaning 2026-06-03), reversing an earlier hold-as-findings-only decision"
-  BAD:  source "User", target "MokerLink 2G05110GSM switch", BUYING
-        fact "User is buying the MokerLink 2G05110GSM switch for $40 CAD"
+  BAD:  source "{owner}", target "MokerLink 2G05110GSM switch", BUYING
+        fact "{owner} is buying the MokerLink 2G05110GSM switch for $40 CAD"
   GOOD: source "MokerLink 2G05110GSM switch", target "homelab network", PURCHASED_FOR
-        fact "User is buying the MokerLink 2G05110GSM switch for $40 CAD for the homelab network"
+        fact "{owner} is buying the MokerLink 2G05110GSM switch for $40 CAD for the homelab network"
 - REIFY a participant-less happening as its own event entity. When the happening has no
   real counterparty to connect (a trip, a wedding, an appointment, a milestone), mint a
   short noun-phrase entity for the EVENT itself and hang its participants, roles, dates,
   and attributes off THAT node — one fact per attribute.
-  BAD:  source "User", target "cousin's wedding", ATTENDED
-        fact "User attended their cousin's wedding as a bridesmaid on 2025-06-14"
+  BAD:  source "{owner}", target "cousin's wedding", ATTENDED
+        fact "{owner} attended their cousin's wedding as a bridesmaid on 2025-06-14"
   GOOD: source "cousin's wedding", target "bridesmaid", HAD_ROLE
-        fact "User was a bridesmaid at their cousin's wedding on 2025-06-14"
+        fact "{owner} was a bridesmaid at their cousin's wedding on 2025-06-14"
         plus e.g. source "cousin's wedding", target "Niagara-on-the-Lake", HELD_AT
-        fact "User's cousin's wedding was held in Niagara-on-the-Lake on 2025-06-14"
+        fact "{owner}'s cousin's wedding was held in Niagara-on-the-Lake on 2025-06-14"
 - THE FACT TEXT LOSES NOTHING. Rerouting an edge NEVER removes the user or the date from
   the sentence — the text is what retrieval searches. Every fact about something the user
-  did, owns, received, or attended still SAYS so ("User ...", "User's ..."), and still
+  did, owns, received, or attended still SAYS so ("{owner} ...", "{owner}'s ..."), and still
   carries its date exactly as the date rule requires. A fact that reads "spider plant
   cuttings were given to Mrs. Johnson" with the user erased is a FAILED extraction.
-- The user IS still a legitimate `source`/`target` for a STANDING PROPERTY of the user —
+{owner_rule}- The user IS still a legitimate `source`/`target` for a STANDING PROPERTY of the user —
   something that is true of them between sessions, with no date and no event behind it:
-  a preference, trait, condition, skill, employment, or human relationship ("User has
-  ADHD", "User prefers Postgres over MySQL", "User is Mrs. Johnson's neighbour", "User
+  a preference, trait, condition, skill, employment, or human relationship ("{owner} has
+  ADHD", "{owner} prefers Postgres over MySQL", "{owner} is Mrs. Johnson's neighbour", "{owner}
   works as a Security Playbook Engineer"). Do not contort those into object-first edges.
   This carve-out does NOT cover anything that HAPPENED — a decision, approval, request,
   purchase, report, complaint, assertion, action item, or a status the user is merely
   waiting on. If the fact would carry a date, it is a happening: reroute it.
-  BAD:  source "Coinbase application", target "User", PENDING
+  BAD:  source "Coinbase application", target "{owner}", PENDING
   GOOD: source "Coinbase application", target "Coinbase", AWAITING_REPLY_FROM
-        fact "User's Coinbase application was ~4 days old with no reply as of 2026-05-01
+        fact "{owner}'s Coinbase application was ~4 days old with no reply as of 2026-05-01
         (meaning 2026-05-01)"
   ACQUIRING something is not the same as HAVING it: a purchase, gift, delivery, or any
   one-time acquisition is a DOING, even though it leaves the user owning a thing. Same
   for a complaint or a symptom report — the user reporting it is an event, and the
   standing condition (if there is one) is a separate fact.
-  BAD:  source "User", target "Carex Day-Light Elite", PURCHASED
-        fact "User purchased a Carex Day-Light Elite lamp on 2026-01-08"
+  BAD:  source "{owner}", target "Carex Day-Light Elite", PURCHASED
+        fact "{owner} purchased a Carex Day-Light Elite lamp on 2026-01-08"
   GOOD: source "Carex Day-Light Elite", target "seasonal affective disorder", BOUGHT_FOR
-        fact "User purchased a Carex Day-Light Elite light therapy lamp on 2026-01-08
+        fact "{owner} purchased a Carex Day-Light Elite light therapy lamp on 2026-01-08
         (meaning 2026-01-08) to treat seasonal affective disorder"
-  BAD:  source "User", target "left knee pain", REPORTED
+  BAD:  source "{owner}", target "left knee pain", REPORTED
   GOOD: source "left knee pain", target "half marathon", STARTED_AFTER
-        fact "User reported left knee pain starting after the half marathon on 2026-03-02
+        fact "{owner} reported left knee pain starting after the half marathon on 2026-03-02
         (meaning 2026-03-02)"
   The rule bans the user as a HUB for doings and happenings, not as an entity.
 - PRESERVE EXACT QUANTITIES. A fact carrying a number, price, percentage, count, or
   duration MUST keep the figure VERBATIM in the fact text ("Women hold 20% of
-  leadership positions at User's company", "User spent $120 on a helmet"). Never
+  leadership positions at {owner}'s company", "{owner} spent $120 on a helmet"). Never
   paraphrase a figure and never convert it — "20%" must NOT become "20 people" or
   "20 women". If one statement carries several distinct quantities, emit one fact
   per figure rather than folding them together.
@@ -237,6 +238,31 @@ ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
   of an entity declared in `entities`. If you can't write a meaningful fact about
   an entity, don't list it.
 """
+
+
+# Rendered into _EXTRACTION_PROMPT at {owner_rule} only when the install names its owner
+# (SYNAPSE_OWNER_NAME). The examples above already say that name where they used to say
+# "User"; this tells the extractor the name is the user's even when the text never says
+# it, and keeps a namesake (a manager with the same first name) off the user's entity.
+# The last sentence is there because a named owner draws credit a role does not: without
+# it the extractor wrote the assistant's own work ("I put the file at ...") as the
+# owner's ("Sam created the file") several times more often than it wrote "User created".
+_OWNER_NAME_RULE = """\
+- THE USER IS "{owner}". That is the user's name in this memory. Wherever a fact or an
+  entity name refers to the user, write "{owner}" — never "User" or "the user" — whether
+  or not the text says the name. Someone ELSE called {owner} is a different person: give
+  their surname, or their role when no surname is known ("{owner} <surname>", "the
+  manager"), never the bare first name, so their facts are never read as the user's.
+  The assistant is not the user. What the assistant did in its own turns (code it wrote,
+  files it created, commands and tests it ran, what it found) is never {owner}'s doing:
+  state it without a doer ("the script was written", "the test showed") unless
+  {owner}'s own turn says {owner} did it.
+"""
+
+
+def _owner_rule(owner: str) -> str:
+    """The naming rule for a configured owner; nothing for the default "User"."""
+    return "" if owner == "User" else _OWNER_NAME_RULE.format(owner=owner)
 
 
 _WEB_EXTRACTION_PROMPT = """\
@@ -326,10 +352,13 @@ class LLMExtractor:
             if context_entities
             else "none"
         )
+        owner = owner_name()
         base_prompt = _EXTRACTION_PROMPT.format(
             context_entities=context_str,
             summary=summary,
             session_date=session_date or "unknown",
+            owner=owner,
+            owner_rule=_owner_rule(owner),
         )
         return self._run(base_prompt)
 

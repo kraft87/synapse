@@ -3,6 +3,10 @@ the operator's dev conversations about the legal-transcription domain."""
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+
 from ingestion.contamination import (
     _HARNESS_PREFIXES,
     is_harness_call,
@@ -115,6 +119,29 @@ def test_flags_entity_pipeline_calls():
     assert is_harness_call(
         "[user] You are a fact deduplication assistant. NEVER mark facts with key differences "
         "as duplicates.\n\n[assistant] []"
+    )
+
+
+def test_flags_owner_fact_calls():
+    # The owner-rename classifier and the golden-question generators hand a model stored
+    # facts beside the owner's name: ingested, they answer owner questions before real
+    # history does.
+    spec = importlib.util.spec_from_file_location(
+        "rename_owner_in_facts",
+        Path(__file__).resolve().parent.parent / "scripts" / "rename_owner_in_facts.py",
+    )
+    ro = importlib.util.module_from_spec(spec)
+    sys.modules["rename_owner_in_facts"] = ro
+    spec.loader.exec_module(ro)
+    assert ro.PROMPT.startswith(_HARNESS_PREFIXES)
+    assert is_harness_call("[user] " + ro.PROMPT[:200])
+    assert is_harness_call(
+        "[user] A personal AI memory stores facts about its owner, Sam, extracted from his "
+        "conversations.\n\nFACTS:\n1. Sam owns a car\n\n[assistant] {}"
+    )
+    assert not is_harness_call(
+        "[user] the generator prompt starts 'A personal AI memory stores facts about its "
+        "owner' and its calls got ingested\n\n[assistant] yes"
     )
 
 

@@ -85,13 +85,16 @@ def mark(settings: Settings, session_id: str) -> Path:
 
 def unmark(settings: Settings, session_id: str) -> bool:
     """Remove ``session_id``'s marker. True when none is there afterwards (one that was
-    never there counts). RAISES ValueError for an id ``marker`` refuses."""
+    never there counts); False when it could not be removed, or its folder could not
+    be looked into. RAISES ValueError for an id ``marker`` refuses."""
     path = marker(settings, session_id)
     try:
         path.unlink()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
     except OSError:
-        pass
-    return not path.exists()
+        return False
+    return True
 
 
 def state(
