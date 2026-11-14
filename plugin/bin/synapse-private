@@ -9,6 +9,8 @@
 set -eu
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SCRIPT="$DIR/../scripts/private_mode.py"
+# Windows (Git Bash): `python3` there is often the Microsoft Store stand-in.
+[ "${OS-}" = Windows_NT ] && exec sh "$DIR/synapse-python" "$SCRIPT" "$@"
 if command -v python3 >/dev/null 2>&1; then
   PY=python3
 elif command -v python >/dev/null 2>&1; then

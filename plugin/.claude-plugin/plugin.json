@@ -26,7 +26,7 @@
       "headers": {
         "Authorization": "Bearer ${user_config.SYNAPSE_INGEST_TOKEN}"
       },
-      "headersHelper": "python3 scripts/mcp_headers.py || python scripts/mcp_headers.py || py -3 scripts/mcp_headers.py"
+      "headersHelper": "\"bin/synapse-python\" scripts/mcp_headers.py"
     }
   }
 }

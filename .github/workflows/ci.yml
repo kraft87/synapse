@@ -118,6 +118,7 @@ jobs:
             tests/test_board_block.py tests/test_claude_on_core.py \
             tests/test_client_*.py \
             tests/test_codex_hooks_windows.py tests/test_codex_ingest_retry.py \
+            tests/test_hook_python_launcher.py \
             tests/test_codex_install_portable.py tests/test_codex_on_core.py \
             tests/test_codex_plugin_install.py tests/test_codex_skills_sync.py \
             tests/test_config_review_cli.py tests/test_device_token_precedence.py \
