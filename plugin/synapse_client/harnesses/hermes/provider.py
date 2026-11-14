@@ -41,11 +41,13 @@ daemon, those it was started with.
 
 Uploads
 -------
-Hermes calls ``sync_turn`` on its background worker after each turn that ended with a
-reply, with the whole conversation. messages.py turns it into records and the core
-uploads them (turn_upload.TurnUploader): every complete turn not sent yet goes up, with
-the turn before it as context; a resumed session, and one first met at an upload, looks
-back at most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name
+Hermes calls ``sync_turn`` after each turn that ended with a reply, with the whole
+conversation. It makes no request: it turns the conversation into records (messages.py)
+and hands the upload to a thread of the provider's own (background.py), which runs one
+at a time, in the order the turns ended. The core uploads them
+(turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
+before it as context; a resumed session, and one first met at an upload, looks back at
+most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name
 no session: they upload under the id Hermes named last (live.py) when that is the bound
 one or goes on from it, and nothing otherwise, since nothing says then whose turns they
 hold. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
@@ -63,7 +65,7 @@ the one it came from, so it is off the record when that one is
 server answers when asked at the session's first upload, until when nothing is uploaded
 for it. That is settled once per session (carried.py): at ``on_session_switch``, at
 ``initialize`` (from the session store) and before the first upload under any other id
-(``_follow``). ``/new`` and ``/resume`` open another conversation: nothing is carried to
+(carried.Followed). ``/new`` and ``/resume`` open another conversation: nothing is carried to
 it. Put back on the record (``synapse private off --forget``), a session is back whole.
 A session Hermes said was new that turns out to hold copies (an ACP fork) uploads only
 the turns an agent sees begin in it (``on_turn_start``), as does what goes on from it.
@@ -102,6 +104,7 @@ from agent.memory_provider import MemoryProvider, spawn_context_thread
 
 from ... import __version__, context, project, tools
 from ...api import Client
+from ...messages import Record
 from ...outbox import Outbox, failure_warning
 from ...settings import Settings
 from ...turn_upload import TurnUploader
@@ -109,6 +112,7 @@ from ...upload import Uploader
 from . import carried
 from . import messages as hm
 from . import sessions as hs
+from .background import Background
 from .live import Live
 
 ACTIVE = "active"
@@ -118,11 +122,12 @@ INERT = "inert"
 
 #: How long a session start waits for the board and the preferences, in seconds.
 START_BUDGET = 5.0
-#: Per-request timeouts: a turn upload on Hermes's background worker (which counts a
-#: call past 30 s as stuck and skips the provider's next syncs), and the last uploads
-#: before Hermes compresses or ends a session.
+#: Per-request timeouts: a turn upload, on the provider's own thread (background.py),
+#: and the last uploads before Hermes compresses or ends a session.
 SYNC_TIMEOUT = 20.0
 FLUSH_TIMEOUT = 10.0
+#: How long ``shutdown`` waits for the turn uploads handed over, in seconds.
+LEAVE_WAIT = 5.0
 #: How many complete turns a resumed session sends at most on its first upload.
 LOOKBACK = 10
 
@@ -185,8 +190,9 @@ class SynapseMemoryProvider(MemoryProvider):
         self._turns: TurnUploader | None = None
         self._home: str | None = None
         self._said: set[str] = set()
-        self._followed: set[str] = set()  # ids whose lineage was read here (_follow)
+        self._followed = carried.Followed()  # ids whose lineage was read here
         self._live = Live()  # the session a hook that names none is for
+        self._later = Background(spawn_context_thread, "synapse-sync")  # turn uploads
         self._cut: str | None = None  # the last in-place compression, for self_since
 
     # -- identity and availability -------------------------------------------------
@@ -268,7 +274,7 @@ class SynapseMemoryProvider(MemoryProvider):
             self._block = ""
             self._home = str(home) if home else None
             self._cut = None
-            self._followed = {self._session_id} if verdict.continues else set()
+            self._followed.only(*([self._session_id] if verdict.continues else ()))
         self._live.moved(self._session_id)
         if mode == INERT:
             self._say_once(f"synapse: off for session {self._session_id}: {verdict.reason}")
@@ -413,7 +419,7 @@ class SynapseMemoryProvider(MemoryProvider):
             goes_on = bool(new) and new not in (old, here) and not reset
             # The same conversation under a new id (a compression, a /branch) stays off
             # the record when the id it leaves is. /resume opens another conversation,
-            # which answers for its own row at its first upload (_follow).
+            # which answers for its own row at its first upload (carried.Followed).
             # Outside the lock: telling the server is a request.
             uploader = self._uploader if self._mode == ACTIVE else None
             carries = goes_on and kwargs.get("reason") != "resume" and uploader is not None
@@ -453,10 +459,11 @@ class SynapseMemoryProvider(MemoryProvider):
         messages: list[dict[str, Any]] | None = None,
         turn_author: dict[str, Any] | None = None,
     ) -> None:
-        """Upload every complete turn not sent yet. Without ``messages``, the two strings
-        are the turn. A ``turn_author`` naming someone other than the owner
-        (sessions.foreign; a bot or peer delivery names its sender, tools/bot_relay.py)
-        means nothing is uploaded and the instance turns INERT for good. Never raises."""
+        """Hand over the upload of every complete turn not sent yet (``_sync``), and
+        return: no request is made here. Without ``messages``, the two strings are the
+        turn. A ``turn_author`` naming someone other than the owner (sessions.foreign; a
+        bot or peer delivery names its sender, tools/bot_relay.py) means nothing is
+        uploaded and the instance turns INERT for good. Never raises."""
         try:
             author = turn_author if isinstance(turn_author, Mapping) else {"id": turn_author}
             who = author.get("id"), author.get("name"), author.get("is_bot")
@@ -468,10 +475,25 @@ class SynapseMemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-            if self._upload(messages, session_id, SYNC_TIMEOUT, finished=True):
-                self._drain(SYNC_TIMEOUT)
+            sid = self._whose(session_id) if self._mode == ACTIVE else None
+            if sid is None:
+                return
+            if not self._later.put(self._sync, sid, hm.to_records(messages), self._model):
+                self._say_once("synapse: uploads are behind; a turn goes up with a later one")
         except Exception:
             _log().warning("synapse: sync_turn failed", exc_info=True)
+
+    def _sync(self, sid: str, records: list[Record], model: str) -> None:
+        """One turn's upload, then the outbox: on the provider's thread (background.py),
+        which logs what this raises."""
+        if self._send(records, sid, SYNC_TIMEOUT, model, finished=True):
+            self._drain(SYNC_TIMEOUT)
+
+    def shutdown(self) -> None:
+        """Wait LEAVE_WAIT seconds at most for the turn uploads handed over. One still
+        running then has its batch in the outbox; one not begun leaves its turns to the
+        flush before this (``on_session_end``), or to the session's next look-back."""
+        self._later.wait(LEAVE_WAIT)
 
     def _authored(self) -> None:
         """A turn someone else wrote reached this agent: off for good, said once, and the
@@ -485,71 +507,58 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         try:
-            self._upload(messages, "", FLUSH_TIMEOUT)
+            self._flush(messages)
         except Exception:
             _log().warning("synapse: on_session_end failed", exc_info=True)
 
     def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Upload what is about to be compressed away; adds nothing to the summary."""
         try:
-            self._upload(messages, "", FLUSH_TIMEOUT)
+            self._flush(messages)
         except Exception:
             _log().warning("synapse: on_pre_compress failed", exc_info=True)
         return ""
 
-    def _upload(
-        self, messages: Any, session_id: str, timeout: float, finished: bool = False
-    ) -> bool:
-        """Send the complete turns of ``messages`` not sent yet (turn_upload.TurnUploader).
-        True when at least one batch reached the server. ``finished``: a turn has just
-        ended. The id is the one Hermes names, which need not be one this instance was
-        moved to, so what its row says it continues is read first (``_follow``). With
-        none named (a flush) it is the last one Hermes named (live.py), when that is
-        the bound id or its row says it goes on from it. Otherwise nothing says whose
-        turns the flush holds (after ``/new`` Hermes flushes the session left once the
-        next turn has named the new one), and nothing is sent."""
-        turns = self._turns
-        sid = self._live.named(str(session_id or ""))
-        verdict = self._verdict(sid) if turns is not None else None
-        if turns is None or verdict is None:
+    def _flush(self, messages: Any) -> bool:
+        """Send, before returning, the complete turns of ``messages`` not sent yet: for
+        a hook that names no session and that Hermes waits for."""
+        sid = self._whose("")
+        if sid is None:
             return False
+        return self._send(hm.to_records(messages), sid, FLUSH_TIMEOUT, self._model)
+
+    def _whose(self, session_id: str) -> str | None:
+        """The session a hook's turns are for, settled as the hook runs: a turn upload
+        is sent later, and Hermes may have moved the agent by then. The id is the one
+        Hermes names, which need not be one this instance was moved to. With none named
+        (a flush) it is the last one Hermes named (live.py), when that is the bound id
+        or its row says it goes on from it. Otherwise nothing says whose turns they are
+        (after ``/new`` Hermes flushes the session left once the next turn has named
+        the new one): None, and nothing is sent."""
+        sid = self._live.named(str(session_id or ""))
+        if session_id:
+            return sid
+        verdict = self._verdict(sid) if sid else None
         with self._lock:
             bound = self._session_id
-        if not session_id and sid != bound and bound not in verdict.continues:
-            return False
-        self._follow(sid, verdict.continues)
-        return turns.upload(
-            hm.to_records(messages),
-            sid,
-            timeout=timeout,
-            project=self._project,
-            cwd=self._cwd,
-            model=self._model or None,
-            finished=finished,
-        )
+        if verdict is None or (sid != bound and bound not in verdict.continues):
+            return None
+        return sid
 
-    def _follow(self, session_id: str, continues: tuple[str, ...]) -> None:
-        """Before an upload for ``session_id``: keep it off the record when a session
-        its row says it holds turns of (``continues``) is, once per id and instance.
-        ``initialize`` does this for the id it is given. This is for the others: a
-        session resumed in place, one Hermes moved the agent to without a call, and a
-        row written after ``initialize``. Noted only once done: a carry that raises, and
-        a row that names no session yet, leave the id to be read at the next upload."""
-        uploader, turns = self._uploader, self._turns
-        with self._lock:
-            known = session_id in self._followed
-        if known or uploader is None or turns is None:
-            return
-        if not continues:
-            if carried.copied(self._home, session_id):
-                turns.keep_out(session_id)  # recorded as holding copies: no look-back
-            return
-        earlier = carried.to_ask(self._home, continues)
-        carried.carry(uploader, self._home, earlier, session_id, None)
-        copies = carried.copies(self._home, session_id, continues)  # no look-back
-        turns.start(session_id, 0 if copies else LOOKBACK, continues=continues)
-        with self._lock:
-            self._followed.add(session_id)
+    def _send(
+        self, records: list[Record], sid: str, timeout: float, model: str, finished: bool = False
+    ) -> bool:
+        """Send the complete turns of ``records`` not sent yet, as session ``sid``'s
+        (turn_upload.TurnUploader). True when at least one batch reached the server.
+        ``finished``: a turn has just ended. The session's row is read as this runs: is
+        it still the owner's, and what does it continue (carried.Followed)."""
+        turns, uploader = self._turns, self._uploader
+        verdict = self._verdict(sid) if turns is not None and uploader is not None else None
+        if turns is None or uploader is None or verdict is None:
+            return False
+        self._followed.follow(uploader, turns, self._home, sid, verdict.continues, LOOKBACK)
+        about = {"project": self._project, "cwd": self._cwd, "model": model or None}
+        return turns.upload(records, sid, timeout=timeout, finished=finished, **about)
 
     def _drain(self, timeout: float) -> None:
         uploader = self._uploader

@@ -48,11 +48,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ...turn_upload import TurnUploader
     from ...upload import Uploader
 
 _SETTLED = "settled"
@@ -164,3 +166,47 @@ def carry(
     if not sid or not ids or settled(home, sid):
         return False
     return uploader.carry_private(ids, sid, timeout=timeout, settled=lambda _: settle(home, sid))
+
+
+class Followed:
+    """The sessions one agent uploaded for whose row was read for the ones it goes on
+    from (``follow``), once each. Safe across threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ids: set[str] = set()
+
+    def only(self, *session_ids: str) -> None:
+        """Forget every id but ``session_ids``, which are not read: ``initialize`` has
+        carried to the one it was given."""
+        with self._lock:
+            self._ids = set(session_ids)
+
+    def follow(
+        self,
+        uploader: Uploader,
+        turns: TurnUploader,
+        home: Any,
+        session_id: str,
+        continues: tuple[str, ...],
+        lookback: int,
+    ) -> None:
+        """Before an upload for ``session_id``: keep it off the record when a session
+        its row says it holds turns of (``continues``) is, once per id and agent.
+        ``initialize`` does this for the id it is given. This is for the others: a
+        session resumed in place, one Hermes moved the agent to without a call, and a
+        row written after ``initialize``. Its next upload looks back ``lookback`` turns,
+        and none when it holds copies. Noted only once done: a carry that raises, and a
+        row that names no session yet, leave the id to be read at the next upload."""
+        with self._lock:
+            if session_id in self._ids:
+                return
+        if not continues:
+            if copied(home, session_id):
+                turns.keep_out(session_id)  # recorded as holding copies: no look-back
+            return
+        carry(uploader, home, to_ask(home, continues), session_id, None)
+        holds = copies(home, session_id, continues)  # no look-back
+        turns.start(session_id, 0 if holds else lookback, continues=continues)
+        with self._lock:
+            self._ids.add(session_id)
