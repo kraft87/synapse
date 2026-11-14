@@ -640,12 +640,17 @@ def test_an_upload_asks_only_as_far_up_as_the_first_settled_session(plugin, serv
     assert server.asked() == [_PARENT] and server.puts() == []
 
 
-def test_a_new_session_that_holds_anothers_turns_is_read_once(plugin, server, tmp_path):
-    """``initialize`` read the row of the session it was given: its first upload does
-    not read it again, which would start the session over with a resume's look-back."""
+def test_a_new_session_that_holds_anothers_turns_looks_back_like_any_other(
+    plugin, server, tmp_path
+):
+    """A branch of a session on the record: its first upload looks back ten turns, the
+    one before them as context, whatever Hermes says of how new it is. Its parent is
+    asked about once, and the next turn goes up alone."""
     home = tmp_path / "hermes-a"
     _child(home)
     provider = _open(plugin, home)
     _say(provider, _conversation(12), _CHILD)
-    sent = [text for _, users in _posted(server) for text in users]
-    assert sent == _questions(1, 12) and server.asked() == [_PARENT]
+    assert _posted(server) == [(_CHILD, _questions(2, 12))]
+    _say(provider, _conversation(13), _CHILD)
+    assert _posted(server)[1:] == [(_CHILD, _questions(12, 13))]
+    assert server.asked() == [_PARENT]

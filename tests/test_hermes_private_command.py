@@ -207,7 +207,7 @@ def test_an_upload_that_waits_when_on_runs_is_not_sent(plugin, server, tmp_path)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("platform", ["cli", "tui", "desktop", "acp", "TUI"])
+@pytest.mark.parametrize("platform", ["cli", "tui", "desktop", "TUI"])
 def test_the_owners_own_process_may_run_it(plugin, server, platform):
     reply = _handler(plugin)(
         "status", source=None, session_id=_SID, session_key=_SID, platform=platform
@@ -230,6 +230,7 @@ _REFUSED = {
     "a messaging platform, in process": {"platform": "telegram", "source": None},
     "no surface named": {"platform": "", "source": None},
     "a cron job": {"platform": "cron", "source": None},
+    "an ACP session the gateway does not run": {"platform": "acp", "source": None},
     "a messaging chat": {"source": _source(platform=types.SimpleNamespace(value="telegram"))},
     "a platform with no name": {"source": _source(platform=None)},
     "a group chat": {"source": _source(chat_type="group")},

@@ -475,10 +475,8 @@ def test_the_turn_that_has_just_ended_goes_up_in_a_session_that_holds_copies(tmp
     not go along as its context."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + _turn(3)
-    turns.begin("s-1")
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     assert wire.posts[0]["body"]["records"] == _turn(3)
-    turns.begin("s-1")
     assert turns.upload(said + _turn(4), "s-1", timeout=5, finished=True) is True
     assert wire.posts[1]["body"]["records"] == _turn(3) + _turn(4)  # 3 was sent: context
 
@@ -490,7 +488,9 @@ def test_the_turn_that_has_just_ended_goes_up_in_a_session_that_holds_copies(tmp
 )
 def test_a_turn_from_before_is_not_taken_for_the_one_that_has_just_ended(tmp_path, last, finished):
     """A flush (the session ends, a compression is due) is not a turn ending, and a
-    last turn cut short is not the one before it. Neither had a turn start before it."""
+    last turn cut short is not the one before it. What a session that holds copies
+    shows before its first turn ends here is not its own, and of what the upload that
+    ends that turn shows, only the last turn is."""
     turns, wire = _turns(tmp_path, lookback=0)
     said = _turn(1) + _turn(2) + last
     assert turns.upload(said, "s-1", timeout=5, finished=finished) is False and wire.tries == 0
@@ -498,8 +498,8 @@ def test_a_turn_from_before_is_not_taken_for_the_one_that_has_just_ended(tmp_pat
     assert turns.upload(done, "s-1", timeout=5, finished=True) is True
     sent = [r["id"] for r in wire.posts[0]["body"]["records"] if r["role"] == "user"]
     # What the first upload left out stays out, as a turn and as a context: also the
-    # turn cut short, which was not seen to begin.
-    assert sent == (["u5"] if finished else ["u4", "u5"])
+    # turn cut short. After a flush the look-back is still there: 4 is not the last turn.
+    assert sent == ["u5"]
 
 
 def test_a_turn_that_has_just_ended_adds_nothing_to_a_look_back(tmp_path):

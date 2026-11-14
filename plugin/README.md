@@ -309,10 +309,11 @@ Hermes as far as it got, and goes up with the next one.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its
-own bookkeeping fields. With `gateway.managed_workers` on, Hermes builds an agent for
-every turn and tells it the session is new: each turn goes up without the one before
-as context, and one you steered while it ran (`/steer`), or whose message Hermes folded
-into an earlier one that got no reply, is not uploaded.
+own bookkeeping fields. The first upload an agent makes for a session looks back ten
+finished turns, whatever Hermes says of how new the session is, and sends the ones it
+has not sent itself; the server keeps one copy of a turn it has already. With
+`gateway.managed_workers` on, Hermes builds an agent for every turn, so every upload
+there is such a first one.
 Uploads that fail wait in `$HERMES_HOME/synapse/outbox/` and go with the next
 successful one. A session marked
 private (`/private on` typed in it, or `synapse private on <session-id>` in a terminal;
@@ -328,35 +329,35 @@ session; until it answers, nothing is uploaded for that session, and the turns t
 finish are kept in memory.
 `/new` and `/resume` open another conversation: nothing is carried to it from the one
 you left, and it is on the record unless you mark it or its own row says it continues a
-private session. An ACP fork names no session it came from: it is on the record, and
-uploads the turns begun in it, not the ones copied into it. A file under
-`$HERMES_HOME/synapse/copied/` says it holds copies, so an agent Hermes builds later for
-the fork, or for a session that goes on from it, keeps them out too. Narrow cases are
-left. The copy of a single turn
-whose message had no text (a picture alone) can go up with the fork's first turn. An
-agent built again for the fork before its first turn (you pick another model before
-your first prompt, or the ACP adapter restarts) looks back ten turns. And when the
-copy is one message that got no reply, that agent keeps it out but the agent built
-after it uploads it. A session seeded with another's messages names none either, and
-is taken for a resumed one: up to ten of the copied turns are uploaded, whatever the
-session they came from was. A chat whose first message got no reply looks like a fork
-when you open it again: the agent built then does not upload that first exchange, and
-an agent Hermes builds for the chat later does.
+private session. The client does not guess that a session holds another's turns: it
+goes by the session Hermes names. A fork made in an ACP editor is a branch (`hermes
+acp` runs its sessions in the gateway), and is private when its original is. A session
+seeded with another's messages names no session they came from: it is a session like
+any other, and its first upload sends up to ten of the copied turns, whatever the
+session they came from was. An ACP session Hermes runs outside its gateway (the
+adapter's own session manager, which `hermes acp` does not start) gets nothing from
+Synapse, as a chat-platform session does: its forks name no session, so a private one
+could not be followed. Clients 0.24.10 to 0.24.15 did guess, and recorded the sessions
+they took for such forks under `$HERMES_HOME/synapse/copied/`. Those records are read
+for one more release: a recorded session, and one that goes on from it, uploads only
+the turns that end in it from now on.
 Private mode covers a whole session. `synapse private off <id>` removes the marker and
 keeps the server's row, which goes on dropping that session's turns: to go back on the
 record, start a new session (`/new`). `synapse private off --forget <id>` deletes the
 row too and puts that session back on the record whole: its next turn uploads the
 finished turns not sent yet, the ones spoken while it was private among them (the last
-ten at most when Hermes resumed the session or moved the agent to it; a turn the
-server's row dropped after a plain `off` counts as sent for the agent that sent it).
+ten at most, unless the agent uploaded turns of the session before it went private; a
+turn the server's row dropped after a plain `off` counts as sent for the agent that
+sent it).
 For a session that was private because of the one it continues, those are also the
 turns it took over from that session, which stays private under its own id only: to
 go on without them, start a new session instead. A session is made private because of
 the one it continues once: a file under `$HERMES_HOME/synapse/settled/` says it was
 asked about, so one you put back stays on the record, with the branches and
 compressions made from it afterwards, for every agent Hermes builds under this
-`HERMES_HOME`. An ACP fork you marked private and put back uploads from its next turn
-on: the turns that ended in it while it was private are not told from the copied ones.
+`HERMES_HOME`. A session recorded under `copied/` that you marked private and put back
+uploads from its next turn on: the turns that ended in it while it was private are not
+told from the copied ones.
 
 **`/private`.** In a session you run on this machine, type `/private on` to take that
 session off the record. `/private` alone, or `/private status`, says whether it is. It

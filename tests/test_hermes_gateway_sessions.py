@@ -230,6 +230,8 @@ def test_the_owners_local_shapes_pass_the_keywords(kwargs):
         ({"platform": "api_server", "user_id": "api", "chat_id": "c1"}, "platform"),
         ({"platform": "discord", "chat_id": "1", "chat_type": "group", "user_id": "9"}, "platform"),
         ({"platform": "cli", "chat_id": "123"}, "not a local session"),
+        ({"platform": "acp"}, "ACP session with no gateway identity"),
+        (_in_process(platform="acp"), "ACP session with no gateway identity"),
     ],
 )
 def test_every_other_shape_is_inert_and_says_why(kwargs, why):

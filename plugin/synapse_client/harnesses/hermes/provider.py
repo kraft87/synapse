@@ -46,8 +46,9 @@ conversation. It makes no request: it turns the conversation into records (messa
 and hands the upload to a thread of the provider's own (background.py), which runs one
 at a time, in the order the turns ended. The core uploads them
 (turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
-before it as context; a resumed session, and one first met at an upload, looks back at
-most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name
+before it as context; a session's first upload looks back at most ten turns, whatever
+Hermes says of the session (an agent Hermes builds for each turn is told that the
+session is new). ``on_session_end`` and ``on_pre_compress`` name
 no session: they upload under the id Hermes named last (live.py) when that is the bound
 one or goes on from it, and nothing otherwise, since nothing says then whose turns they
 hold. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
@@ -67,8 +68,11 @@ for it. That is settled once per session (carried.py): at ``on_session_switch``,
 ``initialize`` (from the session store) and before the first upload under any other id
 (carried.Followed). ``/new`` and ``/resume`` open another conversation: nothing is carried to
 it. Put back on the record (``synapse private off --forget``), a session is back whole.
-A session Hermes said was new that turns out to hold copies (an ACP fork) uploads only
-the turns an agent sees begin in it (``on_turn_start``), as does what goes on from it.
+Nothing here guesses that a session holds another's turns: a branch and an ACP fork
+name the session they come from (lineage.py), and an ACP session Hermes runs with no
+gateway, whose forks name none, is INERT (sessions.py). A session an earlier client
+(0.24.10 to 0.24.15) recorded as holding copies still uploads none of them
+(carried.py).
 
 Compression
 -----------
@@ -128,7 +132,7 @@ SYNC_TIMEOUT = 20.0
 FLUSH_TIMEOUT = 10.0
 #: How long ``shutdown`` waits for the turn uploads handed over, in seconds.
 LEAVE_WAIT = 5.0
-#: How many complete turns a resumed session sends at most on its first upload.
+#: How many complete turns a session sends at most on its first upload.
 LOOKBACK = 10
 
 _LOCAL_ONLY = "Synapse is enabled for local sessions only (the Hermes CLI, TUI, Desktop or ACP)."
@@ -244,19 +248,11 @@ class SynapseMemoryProvider(MemoryProvider):
         # Only an active session's verdict names the sessions it goes on from.
         earlier = carried.to_ask(home, verdict.continues)
         private_too = carried.carry(uploader, home, earlier, session_id, None)
-        # A session first met at an upload is looked back at as a resumed one is.
-        turns = TurnUploader(
-            uploader,
-            client="hermes",
-            source="hermes-sync",
-            lookback=LOOKBACK,
-            begins=True,
-            copied=carried.noter(home, kwargs.get("message_count")),
-        )
-        lookback = LOOKBACK if kwargs.get("resumed") else None
-        if carried.copies(home, session_id, verdict.continues):
-            lookback = 0  # copies are not looked back at
-        turns.start(str(session_id or ""), lookback, continues=verdict.continues)
+        turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=LOOKBACK)
+        # The same look-back whatever ``resumed`` says: an agent Hermes builds for each
+        # turn is told the session is new, and would send the whole conversation again.
+        copies = carried.copies(home, session_id, verdict.continues)  # an old record
+        turns.start(str(session_id or ""), 0 if copies else LOOKBACK, continues=verdict.continues)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
@@ -372,8 +368,7 @@ class SynapseMemoryProvider(MemoryProvider):
         return None
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
-        """Note the turn's model, and that a turn starts in the session this instance
-        is bound to (``_begin``). A turn someone else wrote (sessions.foreign, from the
+        """Note the turn's model. A turn someone else wrote (sessions.foreign, from the
         ``author_*`` keywords agent/turn_context.py passes) turns the instance INERT
         before its nudge and tools, as ``sync_turn`` does with ``turn_author``."""
         model = kwargs.get("model")
@@ -382,18 +377,6 @@ class SynapseMemoryProvider(MemoryProvider):
         author = kwargs.get("author_id"), kwargs.get("author_name"), kwargs.get("author_is_bot")
         if hs.foreign(self._owner_id, *author):
             self._authored()
-        self._begin(self._session_id, bool(kwargs.get("previous_message")))
-
-    def _begin(self, session_id: str, earlier: bool) -> None:
-        """A turn starts in ``session_id``, the bound id, where a session said to be new
-        is counted until its first upload (TurnUploader.begin): how a new turn is told
-        from a copy. ``earlier``: a user message came before this one. Never raises."""
-        turns = self._turns
-        try:
-            if turns is not None and self._mode == ACTIVE:
-                turns.begin(session_id, earlier=earlier)
-        except Exception:
-            _log().warning("synapse: a turn start could not be noted", exc_info=True)
 
     def on_session_switch(
         self,

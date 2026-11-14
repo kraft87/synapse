@@ -21,6 +21,12 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
 - ``agent_context`` other than "primary" (a subagent, a memory flush or other fork):
   INERT. A ``platform`` other than "cli", "tui", "desktop", "acp" (every messaging
   platform, "api_server", "bot_room", "a2a", "kanban", "webhook", ...): INERT.
+- ``platform`` "acp" with no gateway identity: INERT. ``hermes acp`` runs its sessions
+  in the gateway, which names the chat, and its fork is a branch that records its
+  parent (acp_adapter/gateway_server.py). The ACP session manager in the adapter's own
+  process (acp_adapter/session.py, which ``hermes acp`` does not start) copies a fork's
+  turns into a row that names no session: nothing would say that such a fork holds the
+  turns of a private session.
 - ``session_title`` "Bot Chat" (also "Bot Chat #2", "Bot Chat (...)"): INERT. The Bot
   Chat is a local session other agents and API-key peers write into
   (gateway/session_bot.py, gateway/platforms/api_server_bot_chat.py). A title that
@@ -182,6 +188,7 @@ _IS_BOT_CHAT = "the Bot Chat, which other agents and API peers write into"
 _IS_GROUP = "a Group Chat member, which other agents write into"
 _FOLLOWS_PROFILE = "a chat that follows its profile (the Bot Chat or a Group Chat member)"
 _MARKED = "a chat other agents or people have written into (marked when that was seen)"
+_ACP_ALONE = "an ACP session with no gateway identity (its forks name no session they copy)"
 
 
 class Verdict(NamedTuple):
@@ -297,6 +304,8 @@ def from_keywords(kwargs: Mapping[str, Any]) -> Verdict:
     if titled is not None:
         return titled
     if not gateway:
+        if platform == "acp":
+            return Verdict(INERT, _ACP_ALONE)
         source = _word(os.environ.get(SOURCE_ENV))
         if source and source not in ROW_SOURCES:
             return Verdict(INERT, f"started as {source!r}, not one of the owner's own chats")
