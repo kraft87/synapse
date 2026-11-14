@@ -6,6 +6,7 @@ real one sets a new home up on first launch, a large download.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -61,7 +62,7 @@ def _harness(home: Path, runner: Any = None, program: str | None = None) -> hi.H
 
 
 def _files(root: Path) -> set[str]:
-    return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +286,20 @@ def test_without_the_program_an_existing_config_is_left(tmp_path):
     report = elsewhere.install("http://unused", hermes_home=home)
     assert config.read_text(encoding="utf-8") == "model: x\nmemory:\n  provider: honcho\n"
     assert report.endswith(
-        f"select it with `HERMES_HOME={home} hermes config set memory.provider synapse`"
+        f"select it with `{hi.home_prefix(home)}hermes config set memory.provider synapse`"
     )
     # In the default home the command needs no prefix.
     report = _harness(home).install("http://unused", hermes_home=home)
     assert report.endswith("select it with `hermes config set memory.provider synapse`")
+
+
+def test_the_home_is_set_the_way_the_users_shell_reads_it():
+    home = Path("/srv/hermes homes/it's")
+    assert hi.home_prefix(home, windows=False) == f"HERMES_HOME={shlex.quote(str(home))} "
+    windows = Path("C:/Users/O'Neil/AppData/Local/hermes-work")
+    assert hi.home_prefix(windows, windows=True) == (
+        f"$env:HERMES_HOME = '{str(windows).replace(chr(39), chr(39) * 2)}'; "
+    )
 
 
 def test_dry_run_changes_nothing(tmp_path):

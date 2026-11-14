@@ -593,3 +593,33 @@ def test_a_raising_log_does_not_escape(tmp_path):
 
     s = Settings.load(env={"SYNAPSE_PRIVATE_DIR": str(private_dir)}, home=tmp_path / "h")
     assert is_private(s, "s", bad_log) is False
+
+
+@pytest.mark.parametrize("folder", ["file", "missing", "dir"])
+def test_a_marker_not_found_is_private_only_when_a_file_holds_the_folders_place(
+    scratch, tmp_path, monkeypatch, folder
+):
+    """Windows answers FileNotFoundError, not NotADirectoryError, for a marker under a
+    file where the private dir goes: that stays unreadable (nothing shipped). A missing
+    marker in a folder, or no folder at all, is not private."""
+    private_dir = tmp_path / "private"
+    if folder == "file":
+        private_dir.write_text("not a directory")
+    elif folder == "dir":
+        private_dir.mkdir()
+    real_stat = os.stat
+
+    def stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path).endswith("sess-1"):
+            raise FileNotFoundError(2, "The system cannot find the path specified", path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat)
+    lines: list[str] = []
+    s = Settings.load()
+    assert s.private_dir == private_dir
+    assert is_private(s, "sess-1", lines.append) is (folder == "file")
+    if folder == "file":
+        assert lines == ["PRIVATE unreadable sess-1: NotADirectoryError — skipping ingestion"]
+    else:
+        assert lines == []

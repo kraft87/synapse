@@ -143,6 +143,8 @@ def _env(home: Path | None, **extra: str) -> dict[str, str]:
     # The installer defers to an older Claude plugin's saved URL: never the real one's.
     env["CLAUDE_CONFIG_DIR"] = str((home or Path(env.get("HOME", "/nonexistent"))) / "no-claude")
     env.update(extra)
+    if "HOME" in extra:
+        env["USERPROFILE"] = extra["HOME"]  # ~ on Windows
     return env
 
 
@@ -710,6 +712,10 @@ def test_a_failed_swap_keeps_the_working_client(tmp_path, monkeypatch):
     assert [p.name for p in lib.iterdir()] == ["1.0.0"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX shell setup: on Windows the installer edits the user PATH instead",
+)
 def test_the_path_hint_names_the_file_a_macos_login_bash_reads(tmp_path, monkeypatch, capsys):
     mod = _installer_module()
     home = tmp_path / "home"
@@ -824,6 +830,10 @@ def _with(local: Path) -> str:
     return os.pathsep.join([str(local), os.environ.get("PATH", "")])
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX shell setup: on Windows the installer edits the user PATH instead",
+)
 def test_the_default_home_is_linked_into_local_bin_when_that_is_on_path(tmp_path):
     cli = {"plugin/scripts/synapse_cli.py": "import sys\nprint('cli', *sys.argv[1:])\n"}
     script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client", extra=cli))
@@ -852,6 +862,10 @@ def test_the_default_home_is_linked_into_local_bin_when_that_is_on_path(tmp_path
     assert "Linked" not in again.stdout and "not on your PATH" not in again.stdout
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX shell setup: on Windows the installer edits the user PATH instead",
+)
 @pytest.mark.parametrize("case", ["off PATH", "no directory"])
 def test_without_a_local_bin_on_path_the_line_to_add_is_printed(tmp_path, case):
     script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))
@@ -864,6 +878,10 @@ def test_without_a_local_bin_on_path_the_line_to_add_is_printed(tmp_path, case):
     assert f"{user / '.synapse' / 'bin'} is not on your PATH" in r.stdout
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX shell setup: on Windows the installer edits the user PATH instead",
+)
 @pytest.mark.parametrize("case", ["a file", "a link elsewhere", "a dangling link"])
 def test_something_else_named_synapse_in_local_bin_is_left_as_it_is(tmp_path, case):
     script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))

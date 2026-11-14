@@ -17,7 +17,6 @@ builds.
 from __future__ import annotations
 
 import inspect
-import os
 import sys
 import threading
 import types
@@ -26,6 +25,10 @@ from typing import Any
 import pytest
 
 from tests import test_hermes_provider as base
+from tests.helpers.client_core import use_core
+
+use_core()
+from synapse_client.harnesses.hermes import sessions as hs  # noqa: E402
 
 hermes_stub = base.hermes_stub
 user = base.user
@@ -61,7 +64,7 @@ def _source(**changes: Any) -> types.SimpleNamespace:
         "platform": types.SimpleNamespace(value="local"),
         "chat_id": _CHAT,
         "chat_type": "dm",
-        "user_id": f"uid:{os.getuid()}",
+        "user_id": hs.owner_subject(),
         "user_name": None,
         "chat_name": None,
         "thread_id": None,

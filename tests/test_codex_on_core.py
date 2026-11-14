@@ -368,7 +368,8 @@ def test_install_writes_the_branch_point_blocks_byte_for_byte(layout, tmp_path, 
     }[layout]
     installer.install("https://synapse.example.net", launcher=launcher)
     expected = {"checkout": _INSTALLED_CHECKOUT, "managed": _INSTALLED_MANAGED}[layout]
-    assert installer.CONFIG_PATH.read_bytes() == expected.encode("utf-8")
+    # Written in text mode: CRLF on Windows, which TOML reads the same.
+    assert installer.CONFIG_PATH.read_bytes() == expected.replace("\n", os.linesep).encode()
     capsys.readouterr()
 
 
@@ -743,7 +744,8 @@ def _feedback_hook(path: Path, setting: str | None, tool: str = "mcp__synapse__r
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout
+    # A text stdout ends lines with CRLF on Windows; the hook's bytes are otherwise these.
+    return proc.stdout.replace(os.linesep.encode(), b"\n")
 
 
 @pytest.mark.parametrize(

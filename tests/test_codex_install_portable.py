@@ -614,7 +614,7 @@ def test_default_launcher_uses_the_runner_only_from_a_managed_client(
     command = launcher.command("plugin-codex/hooks/session_start.py")
     if managed:
         assert launcher.runner == runner
-        assert command == f'python3 "{runner}" plugin-codex/hooks/session_start.py'
+        assert command == f'python3 "{runner.as_posix()}" plugin-codex/hooks/session_start.py'
     else:
         assert launcher.runner is None
         assert "synapse_run.py" not in command

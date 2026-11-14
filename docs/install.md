@@ -161,8 +161,8 @@ Then it wires every harness it finds, and each needs one step from you:
   `synapse ← active`. Hermes runs one external memory provider at a time: if another one
   (Honcho, Hindsight, mem0) is selected, the output says `left memory.provider at '<name>'`
   and Synapse is not active. `synapse install hermes --replace` switches to Synapse, and
-  `hermes config set memory.provider <name>` switches back. Local sessions only, and not on
-  Windows yet: see [plugin/README.md](../plugin/README.md#hermes).
+  `hermes config set memory.provider <name>` switches back. Local sessions only: see
+  [plugin/README.md](../plugin/README.md#hermes).
 
 `synapse status` shows which harnesses are wired. Re-running `synapse login` wires a harness
 you install later and never asks for a new sign-in on an enrolled machine (`--reenroll` does

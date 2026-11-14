@@ -82,7 +82,7 @@ def _row(
                 sid,
                 source,
                 source,
-                f"uid:{os.getuid()}",
+                gs._owner(),
                 chat,
                 "dm" if chat else None,
                 f"agent:main:local:dm:{chat}" if chat else None,
@@ -707,6 +707,7 @@ def test_a_chat_never_seen_as_a_bot_chat_has_no_mark(tmp_path):
     assert not (tmp_path / "synapse").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
 def test_a_mark_is_an_owner_only_file_that_names_its_chat(tmp_path):
     session = "20261112_135415_30e776"
     hs.mark(tmp_path, [_LOCAL, "", None, session, _LOCAL], "why")

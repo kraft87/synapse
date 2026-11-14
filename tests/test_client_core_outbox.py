@@ -19,6 +19,7 @@ import textwrap
 import time
 import urllib.error
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -292,16 +293,15 @@ _WORKER = textwrap.dedent(
     sys.path.append(sys.argv[1])
     from synapse_client.outbox import Outbox
 
-    box = Outbox(sys.argv[2])
+    box = Outbox(sys.argv[2], log=lambda line: print(line, file=sys.stderr, flush=True))
     log = sys.argv[3]
 
     def send(payload):
+        # One new file per delivery: an O_APPEND log is not atomic across processes on
+        # Windows, where concurrent appends overwrite each other.
         time.sleep(0.002)
-        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, (str(payload["n"]) + "\\n").encode())
-        finally:
-            os.close(fd)
+        name = "%s-%d-%d" % (payload["n"], os.getpid(), time.perf_counter_ns())
+        os.close(os.open(os.path.join(log, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL))
 
     while sys.argv[4] == "go" and box.pending():
         box.drain(send, max_items=7)
@@ -314,18 +314,52 @@ def test_concurrent_drains_deliver_each_payload_exactly_once(tmp_path):
     total = 120
     for n in range(total):
         box.put({"n": n})
-    log = tmp_path / "sent.log"
+    log = tmp_path / "sent"
+    log.mkdir()
     procs = [
         subprocess.Popen(
-            [sys.executable, "-c", _WORKER, str(PLUGIN), str(box.directory), str(log), "go"]
+            [sys.executable, "-c", _WORKER, str(PLUGIN), str(box.directory), str(log), "go"],
+            stderr=subprocess.PIPE,
+            text=True,
         )
         for _ in range(4)
     ]
-    for proc in procs:
-        assert proc.wait(timeout=60) == 0
-    sent = [int(line) for line in log.read_text().split()]
-    assert sorted(sent) == list(range(total))
+    said = [proc.communicate(timeout=60)[1] for proc in procs]
+    assert [proc.returncode for proc in procs] == [0] * 4, said
+    sent = [int(entry.name.split("-")[0]) for entry in log.iterdir()]
+    left = sorted(os.listdir(box.directory))
+    assert not any("dropped" in text for text in said), said
+    if os.name == "nt":  # a rename is no exclusive claim there: at least once (outbox.py)
+        assert set(sent) == set(range(total)), (said, left)
+    else:
+        assert sorted(sent) == list(range(total)), (said, left)
     assert box.pending() == 0
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_on_windows_a_claim_taken_on_by_another_drain_is_never_dropped(
+    tmp_path, monkeypatch, error
+):
+    """Two drains can both rename one payload on Windows. The one whose claim is gone
+    (FileNotFoundError) or still being moved (PermissionError) when it reads it leaves
+    the payload to the other: nothing dropped, nothing counted."""
+    box = Outbox(tmp_path / "q")
+    box.put({"n": 1})
+    monkeypatch.setattr(outbox_mod, "_WINDOWS", True)
+    real = Path.read_text
+
+    def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name.endswith(".claim"):
+            raise error(13, "taken on", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    sent: list[Any] = []
+    assert box.drain(sent.append) == (0, 1)
+    assert sent == [] and box.pending() == 1 and box.dropped() == 0
+    monkeypatch.setattr(Path, "read_text", real)
+    assert box.drain(sent.append) == (1, 0)
+    assert sent == [{"n": 1}]
 
 
 # ---------------------------------------------------------------------------

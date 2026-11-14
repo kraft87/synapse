@@ -958,6 +958,8 @@ def test_config_json_alone_works_in_codexs_cleared_environment(tmp_path, where):
     token, no URL, no Claude settings anywhere."""
     home = tmp_path / "home"
     env = {"HOME": str(home), "PATH": os.environ.get("PATH", "")}
+    if os.name == "nt":  # ~ is USERPROFILE there; Python needs SYSTEMROOT
+        env.update(USERPROFILE=str(home), SYSTEMROOT=os.environ.get("SYSTEMROOT", ""))
     if where == "SYNAPSE_HOME":
         env["SYNAPSE_HOME"] = str(tmp_path / "synapse-home")
         _home_config(tmp_path, url=_URL, token=_TOKEN)

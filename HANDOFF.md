@@ -6,6 +6,34 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — hermes: Synapse works in Hermes on Windows, and Windows client fixes (plugin 0.24.18)
+
+**What changed**
+
+- **Hermes on Windows.** Hermes names the machine's owner `sid:<sid>` there. The provider
+  now reads the same SID, so a local Hermes session on Windows gets the board, the tools
+  and its turns uploaded. Before, every session on Windows got nothing. When the SID cannot
+  be read, no session matches and Synapse stays off.
+- **Outbox on Windows.** Two processes draining the outbox at once could drop a payload as
+  unreadable. It is now left to the other process; a payload can be sent twice, and the
+  server keeps one copy.
+- **Private mode on Windows.** With a file where the private folder goes, a session read
+  as not private. It now reads as unknown and nothing is sent.
+- **Installer on Windows.** Only the default Synapse home is added to the user `PATH`.
+- CI has a `Windows client` job: the SID against the OS and against Hermes's own identity
+  code, and the client's install, wiring, hook and Hermes tests.
+
+**What to do on each machine**
+
+- `synapse update`. On Windows with Hermes, then `hermes gateway stop` so the next
+  `hermes` loads the new provider. Nothing changes on Linux or macOS.
+
+**What was proven**
+
+- On a Windows runner: the SID equals `whoami /user` and the subject Hermes v0.23.1 mints
+  for a same-user client. On a Windows 11 machine: a Hermes chat stored the owner's `sid:`
+  subject and its turns reached the server.
+
 ## 2026-11-14 — docs: a new user's install works as written for Claude Code, Codex and Hermes (plugin 0.24.17)
 
 **What changed**

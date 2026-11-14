@@ -123,11 +123,17 @@ def state(
     if not plain_name(session_id):
         _say(log, f"PRIVATE ignored a session id that is not a file name: {session_id[:80]!r}")
         return OPEN
-    marker = os.path.join(str(settings.private_dir), session_id)
+    folder = str(settings.private_dir)
+    marker = os.path.join(folder, session_id)
     try:
         age = (time.time() if now is None else now) - os.stat(marker).st_mtime
     except FileNotFoundError:
-        return OPEN
+        # Windows answers "not found" where POSIX says NotADirectoryError: something
+        # other than a folder stands where the private dir goes.
+        if os.path.isdir(folder) or not os.path.lexists(folder):
+            return OPEN
+        _say(log, f"PRIVATE unreadable {session_id}: NotADirectoryError — skipping ingestion")
+        return UNKNOWN
     except OSError as err:
         _say(log, f"PRIVATE unreadable {session_id}: {type(err).__name__} — skipping ingestion")
         return UNKNOWN

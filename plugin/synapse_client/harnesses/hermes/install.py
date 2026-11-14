@@ -79,6 +79,15 @@ def default_home(env: Mapping[str, str] | None = None) -> Path:
     return Path.home() / (".hermes" + suffix)
 
 
+def home_prefix(home: Path, windows: bool | None = None) -> str:
+    """What sets ``HERMES_HOME`` for the one command after it: a POSIX shell's
+    ``VAR=value``, or PowerShell's ``$env:`` on Windows."""
+    if sys.platform == "win32" if windows is None else windows:
+        quoted = str(home).replace("'", "''")
+        return f"$env:HERMES_HOME = '{quoted}'; "
+    return f"HERMES_HOME={shlex.quote(str(home))} "
+
+
 def _render(template: str) -> str:
     text = (_here() / template).read_text(encoding="utf-8")
     return string.Template(text).safe_substitute(version=__version__)
@@ -254,7 +263,7 @@ class HermesHarness:
     # -- selecting the provider -------------------------------------------------------
 
     def _command(self, home: Path) -> str:
-        prefix = "" if home == default_home(self._env) else f"HERMES_HOME={shlex.quote(str(home))} "
+        prefix = "" if home == default_home(self._env) else home_prefix(home)
         return f"{prefix}hermes config set memory.provider {PLUGIN}"
 
     def _select(self, home: Path, *, dry_run: bool, replace: bool) -> str:

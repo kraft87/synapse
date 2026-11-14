@@ -84,6 +84,7 @@ def _isolated(monkeypatch, tmp_path):
     project .claude. No setting arrives through the real environment."""
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # ~ on Windows
     monkeypatch.setenv("SYNAPSE_HOME", str(home / ".synapse"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
@@ -566,7 +567,10 @@ def test_a_config_json_token_the_record_does_not_describe_is_overridden_and_name
     assert cfg.INGEST_TOKEN == _DEVICE
     assert cfg.TOKEN_OVERRIDE == {"surface_id": _SURFACE_ID, "sources": ["config_file"]}
     notice = cfg.token_override_notice()
-    assert notice.startswith("[Synapse] The token in ~/.synapse/config.json is ignored")
+    # The path is shown with the platform's separator (config.py _display_path).
+    assert notice.replace(os.sep, "/").startswith(
+        "[Synapse] The token in ~/.synapse/config.json is ignored"
+    )
     assert _SURFACE_ID in notice
     assert "synapse login --reenroll" in notice and "synapse config token --unset" in notice
     _no_token_material(notice)

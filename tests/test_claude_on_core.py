@@ -462,7 +462,8 @@ def test_token_rules_and_notices(scratch, monkeypatch, case):
     config = load_script("config")
     assert config.INGEST_TOKEN == token
     assert config.TOKEN_OVERRIDE == note
-    assert config.token_override_notice() == notice
+    # Paths are shown with the platform's separator (config.py _display_path).
+    assert config.token_override_notice().replace(os.sep, "/") == notice
     for secret in (_TOKEN, _DEVICE, _STALE):
         assert secret not in notice
 

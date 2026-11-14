@@ -169,7 +169,7 @@ passes and, for a session they allow, Hermes's own record of who created it
   `hermes chat` and the TUI run their turns in the gateway daemon, which passes a chat
   identity even for them: such a session is active only with the shape of a local
   session (`chat_id` `local-<hex>`, `chat_type` "dm", its `agent:<profile>:local:dm:`
-  route, `user_id` `uid:<this OS user>`), its row in `<hermes_home>/state.db`, and a
+  route, `user_id` `uid:<this OS user>`, or `sid:<its SID>` on Windows), its row in `<hermes_home>/state.db`, and a
   creation receipt there, read read-only, naming the owner as its creator, an owner's
   chat as its source (not `--source tool`; `-q`/`-z` one-shot runs count as the owner's),
   no Bot Chat, and no `follow_profile_config` in its request. The board, the nudge,
@@ -212,7 +212,7 @@ provider; one that no longer passes turns the instance inert for good, and so do
 gateway session whose row is gone. A turn another agent or person wrote is not uploaded
 and turns the instance inert for good. Hermes names a turn's author on `on_turn_start`
 and in `sync_turn`'s `turn_author`: the daemon names one on every turn, the owner's own
-as the session's `user_id` (`uid:<this OS user>`, not a bot); in-process, a human turn
+as the session's `user_id` (the owner's subject, not a bot); in-process, a human turn
 has none. An author that is a bot, or not the session's user, is someone else. The
 owner's id means only that nobody stamped the turn. A gateway session's project comes
 from the `cwd` its client sent, never the daemon's.
@@ -250,7 +250,7 @@ What this does not cover:
   one turn; no Hermes path starts such a run today. A process whose own environment
   carries `HERMES_TURN_AUTHOR` is inert from `initialize`, a backstop nothing reaches.
 - Hermes treats whoever can sign in to its dashboard or Webapp as the machine's owner
-  (`gateway/owner_identity.py`): their sessions carry the owner's `uid:` subject, so they
+  (`gateway/owner_identity.py`): their sessions carry the owner's subject, so they
   are the owner's here too. That covers a remote Desktop, a phone and a standalone
   dashboard.
 - The welcome-trial mark (`follow_adopted`) is not read: Hermes puts it on an ordinary
@@ -276,8 +276,8 @@ What this does not cover:
 - Automation turns in an owner's chat (wake, goals, notifications) run with the nudge
   and the tools: Hermes gives them the owner as author.
 - Wrongly inert: a session from before Hermes's creation receipts resumed through the
-  daemon, the owner's own `/background` and `/btw` there, every daemon session on
-  Windows, and an agent built while `state.db` could not be read. For good: a chat the
+  daemon, the owner's own `/background` and `/btw` there, every daemon session when
+  the owner's SID cannot be read on Windows, and an agent built while `state.db` could not be read. For good: a chat the
   owner titled exactly "Bot Chat", "Bot Chat #N", "Bot Chat (...)" or "Group: ...", even
   briefly, once it is judged under that title, with every branch of it and every later
   segment (`/new`) of such a branch; and a branch cut before its parent was handed a
@@ -293,8 +293,9 @@ agent's `memory_agent_context`, else "cron" or "subagent" by platform, else "pri
 the chat identity is `_GATEWAY_IDENTITY_PARAMS` in `agent/agent_init_params.py`),
 `gateway/session_execution.py` (a gateway passes its platform and the chat identity),
 `hermes_state_keys.py` and `hermes_state_local.py` (the local chat id and its creation
-receipt), `gateway/control_socket.py` and `gateway/owner_identity.py` (the `uid:` subject,
-minted for a peer of the same OS user and for every dashboard login),
+receipt), `gateway/control_socket.py`, `gateway/runtime_bootstrap_windows.py` and
+`gateway/owner_identity.py` (the `uid:` or Windows `sid:` subject, minted for a peer
+of the same OS user and for every dashboard login),
 `gateway/session_policy.py` (`follow_profile_config`), `gateway/session_bot.py` and
 `hermes_state_local_lineage.py` (the Bot Chat and its reset),
 `hermes_state_mutation_branch.py`, `hermes_state_mutation_reset.py` and

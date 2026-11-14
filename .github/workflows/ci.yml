@@ -75,6 +75,66 @@ jobs:
           npm ci
           npm run build
 
+  # The client on native Windows: the Hermes owner subject (a SID there) checked against
+  # the OS and against Hermes's own identity code, and the client's install, wiring and
+  # hook tests. No database: only tests that run without one.
+  windows:
+    name: Windows client
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      HERMES_REF: v0.23.1
+    steps:
+      # The files as the repository holds them: the client ships LF files, and tests pin
+      # their bytes.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          activate-environment: "true"
+      - name: Install dependencies
+        run: uv sync --frozen
+      # Only what the owner check imports (stdlib only): gateway/, agent/ and the root
+      # modules. Hermes is read, never installed or run.
+      - name: Fetch Hermes source
+        run: |
+          git clone --quiet --depth 1 --branch "$HERMES_REF" --filter=blob:none --sparse \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes"
+          git -C "$RUNNER_TEMP/hermes" sparse-checkout set gateway agent
+      - name: Owner subject against Windows and Hermes
+        env:
+          SYNAPSE_HERMES_SOURCE: ${{ runner.temp }}/hermes
+        run: uv run pytest tests/test_hermes_windows_owner.py -v -rs -p no:cacheprovider
+      - name: Client tests
+        run: |
+          uv run pytest -n auto --dist loadfile -p no:cacheprovider -rfEs --tb=short \
+            -m "not db and not integration and not slow" \
+            tests/test_hermes_*.py \
+            tests/test_board_block.py tests/test_claude_on_core.py \
+            tests/test_client_*.py \
+            tests/test_codex_hooks_windows.py tests/test_codex_ingest_retry.py \
+            tests/test_codex_install_portable.py tests/test_codex_on_core.py \
+            tests/test_codex_plugin_install.py tests/test_codex_skills_sync.py \
+            tests/test_config_review_cli.py tests/test_device_token_precedence.py \
+            tests/test_enroll_client.py tests/test_hook_env_numbers.py \
+            tests/test_hook_imports.py tests/test_import_history.py \
+            tests/test_ingest_hook_cursor.py tests/test_ingest_hook_retry.py \
+            tests/test_ingest_hook_tail.py tests/test_install_route.py \
+            tests/test_plugin_config.py tests/test_plugin_skills_sync.py \
+            tests/test_private_mode.py tests/test_project_label.py \
+            tests/test_recall_feedback_nudge.py tests/test_recall_nudge.py \
+            tests/test_remember_spool.py tests/test_session_id_paths.py \
+            tests/test_skill_accept_applies.py tests/test_skill_review_cli.py \
+            tests/test_skill_trust_scoping.py tests/test_skill_whole_hash.py \
+            tests/test_skills_retire_client.py tests/test_skills_unserved_client.py \
+            tests/test_surface_inject.py tests/test_synapse_cli.py \
+            tests/test_synapse_login.py tests/test_update_handover.py
+
   # Machines update by version number, so a PR that changes the client (what /install
   # bundles from plugin/ and plugin-codex/, Markdown included) must raise the version to
   # one with no v<version> tag. Rules in scripts/release_notes.py, shared with

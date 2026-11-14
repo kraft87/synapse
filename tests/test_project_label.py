@@ -500,7 +500,11 @@ class TestNoRepo:
             ("C:\\Users\\pat\\Acme\\", "Acme"),
             ("c:\\users\\pat\\Acme", "Acme"),
             ("C:\\Users/pat\\Acme/", "Acme"),
-            ("C:\\", None),
+            pytest.param(
+                "C:\\",
+                None,
+                marks=pytest.mark.skipif(os.name == "nt", reason="C:\\ exists on Windows"),
+            ),
         ],
         ids=repr,
     )
@@ -647,6 +651,7 @@ class TestNeverRaises:
         for raw in (None, "", 0):
             assert client.project_label(raw) == "alpha"
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows cannot delete a process's working folder")
     def test_deleted_process_cwd(self, ws, monkeypatch):
         gone = ws / "gone"
         gone.mkdir()
@@ -856,6 +861,7 @@ def test_a_home_directory_repository_is_not_the_project_of_folders_under_it(ws, 
     one '<username>' project (and turn project skills sync off: its root is ~)."""
     home = _init_repo(ws / "pat")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # ~ on Windows
     (home / "notes" / "deep").mkdir(parents=True)
     assert client.resolve(home / "notes" / "deep") == ("deep", home / "notes" / "deep")
     assert client.project_label(home) == "pat"  # a session in ~ itself is still ~'s
@@ -879,6 +885,7 @@ def test_the_bare_plus_worktrees_layout_is_named_for_its_folder(ws):
         assert client.project_label(ws / name / "feature") == name
 
 
+@pytest.mark.skipif(os.name == "nt", reason="no FIFOs on Windows")
 def test_a_fifo_named_git_never_blocks_the_resolver(ws):
     import os
     import threading
