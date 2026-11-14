@@ -6,13 +6,13 @@ a private session's turns. These are the ways such turns could still leave after
   * a flush hook (``on_session_end``, ``on_pre_compress``) names no session, and the
     agent may be in another than the one the provider was built for or switched to
     (harnesses/hermes/live.py);
-  * after ``synapse private off --forget`` on a carried session, the turns from before
-    are still in the conversation: a turn Hermes begins itself lands on the last of
-    them, and a compression that starts a new session copies them under a new id;
   * a late upload for the session the agent left, while turns are kept for it;
-  * an agent Hermes builds later for such a session, for a branch made from it, or for
-    the id a compression moved it to: it goes by the record of the session
-    (harnesses/hermes/carried.py ``held``).
+  * an agent Hermes builds later for such a session: it finds the session settled
+    (harnesses/hermes/carried.py) and goes by its marker and the server's row.
+
+Private mode covers whole sessions. ``synapse private off --forget`` on a carried
+session puts all of it back on the record, with the turns it holds from the session it
+came from, and what goes on from it afterwards is on the record too.
 
 The fixtures and helpers are those of the lineage tests.
 """
@@ -69,19 +69,6 @@ def _other_conversation(count: int) -> list[dict[str, Any]]:
             {"role": "assistant", "content": f"other answer {n}", "message_uid": f"oa{n}"},
         ]
     return rows
-
-
-def _notice(n: int) -> list[dict[str, Any]]:
-    """A turn Hermes begins itself: a background-process notice in the user's place
-    (tools/process_registry_notifications.py), and the model's reply."""
-    return [
-        {
-            "role": "user",
-            "content": f"[IMPORTANT: Background process proc_{n} completed (exit code 0).]",
-            "message_uid": f"n{n}",
-        },
-        {"role": "assistant", "content": f"noted {n}", "message_uid": f"an{n}"},
-    ]
 
 
 def _forget(server: Any, tmp_path: Path, session_id: str) -> None:
@@ -222,33 +209,33 @@ def test_the_flush_of_the_session_left_at_new_does_not_go_under_the_new_id(
 
 
 # ---------------------------------------------------------------------------
-# After `synapse private off --forget` on a carried session
+# Private mode covers whole sessions
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spoken_private", [0, 1], ids=["a copied turn", "a turn of its own"])
-def test_a_turn_hermes_begins_after_forget_takes_no_turn_from_before_along(
-    plugin, server, tmp_path, spoken_private
-):
-    """A branch of a private session, put back on the record. The first turn that ends
-    is one Hermes began with a row in the user's place. That row opens no turn, so the
-    reply lands on the turn before it, spoken off the record: neither goes. The next
-    turn the user begins goes up, alone."""
+def test_a_turn_goes_by_what_its_session_is_when_its_upload_runs(plugin, server, tmp_path):
+    """An upload goes by the session as it is then, not by when the turn began.
+    `synapse private on` while the model works on a turn keeps that turn in. `off
+    --forget` while it works on the next puts the session back whole, with both."""
     home = tmp_path / "hermes-a"
-    _child(home)
-    _marker(tmp_path, _PARENT)
-    provider = _open(plugin, home, resumed=True)
-    said = _conversation(3)  # the parent's turns, copied
-    if spoken_private:
-        said = _conversation(4)
-        _say(provider, said, _CHILD)
-    _forget(server, tmp_path, _CHILD)
-    said = said + _notice(1)
-    provider.sync_turn("n", "noted 1", session_id=_CHILD, messages=said)
-    assert server.posts() == []
-    said = said + _conversation(5)[-2:]
-    _say(provider, said, _CHILD)
-    assert _posted(server) == [(_CHILD, ["question 5"])]
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    provider = _open(plugin, home, _PARENT)
+    _say(provider, _conversation(1), _PARENT)
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
+    _marker(tmp_path, _PARENT)  # `synapse private on`
+    server.private_rows.add(_PARENT)
+    provider.sync_turn("question 2", "a", session_id=_PARENT, messages=_conversation(2))
+    provider.on_session_end(_conversation(2))
+    assert _posted(server) == [(_PARENT, ["question 1"])]
+    provider.on_turn_start(3, "question 3", previous_message="question 2")
+    _forget(server, tmp_path, _PARENT)
+    provider.sync_turn("question 3", "a", session_id=_PARENT, messages=_conversation(3))
+    assert _posted(server)[1:] == [(_PARENT, _questions(1, 3))]  # 1 as the context of 2
+
+
+# ---------------------------------------------------------------------------
+# After `synapse private off --forget` on a carried session
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -256,14 +243,15 @@ def test_a_turn_hermes_begins_after_forget_takes_no_turn_from_before_along(
     [(True, True), (True, False), (False, True)],
     ids=["a switch and a row", "a switch, no link in the row", "a row, no switch"],
 )
-def test_a_new_session_id_after_forget_is_not_looked_back_at_either(
+def test_a_new_session_id_after_forget_is_on_the_record_too(
     plugin, server, tmp_path, switch, linked
 ):
     """A compression that starts a new session copies the tail of the conversation
-    under a new id. The id it leaves is on the record by now, so the new one is too,
-    but the tail still holds turns the private parent spoke. However the provider
-    learns which session the new id goes on from: the switch, or the row alone (the
-    compression was another holder's, and Hermes moved this agent without a call)."""
+    under a new id. The id it leaves is back on the record, whole, so the new one is on
+    it too and is looked back at as after any compression, though the parent is still
+    private. However the provider learns which session the new id goes on from: the
+    switch, or the row alone (the compression was another holder's, and Hermes moved
+    this agent without a call)."""
     home = tmp_path / "hermes-a"
     _child(home)
     _marker(tmp_path, _PARENT)
@@ -271,7 +259,7 @@ def test_a_new_session_id_after_forget_is_not_looked_back_at_either(
     provider = _open(plugin, home, resumed=True)
     _forget(server, tmp_path, _CHILD)
     _say(provider, _conversation(4), _CHILD)
-    assert _posted(server) == [(_CHILD, ["question 4"])]
+    assert _posted(server) == [(_CHILD, _questions(1, 4))]
     _store(home, _THIRD, source="tui", receipt=False, chat_id="")
     if linked:
         _link(home, _THIRD, _CHILD, None)
@@ -279,8 +267,9 @@ def test_a_new_session_id_after_forget_is_not_looked_back_at_either(
         provider.on_session_switch(_THIRD, parent_session_id=_CHILD, reason="compression")
     tail = [_conversation(4)[0], *_conversation(4)[3:], *_conversation(5)[-2:]]  # turns 2 to 5
     _say(provider, tail, _THIRD)
-    assert _posted(server)[1:] == [(_THIRD, ["question 5"])]
+    assert _posted(server)[1:] == [(_THIRD, _questions(2, 5))]
     assert not (tmp_path / "private" / _THIRD).exists() and _THIRD not in server.private_rows
+    assert (tmp_path / "private" / _PARENT).is_file()
 
 
 def test_forget_after_a_switch_stands_when_the_note_of_the_carry_could_not_be_kept(
@@ -294,55 +283,26 @@ def test_forget_after_a_switch_stands_when_the_note_of_the_carry_could_not_be_ke
     _marker(tmp_path, _PARENT)
     provider = _open(plugin, home, _PARENT, resumed=True)
     module = sys.modules[type(provider).__module__]  # the provider's own copy of the core
-    monkeypatch.setattr(module.carried, "settle", lambda home, session_id, made=False: None)
+    monkeypatch.setattr(module.carried, "settle", lambda home, session_id: None)
     provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
     assert server.puts() == [f"/private-sessions/{_CHILD}"]
     _forget(server, tmp_path, _CHILD)
     _say(provider, _conversation(4), _CHILD)
-    assert _posted(server) == [(_CHILD, ["question 4"])]
+    assert _posted(server) == [(_CHILD, _questions(1, 4))]
     assert not (tmp_path / "private" / _CHILD).exists() and len(server.puts()) == 1
     assert not carried.settled(home, _CHILD)
 
 
-def test_a_new_id_found_at_an_upload_is_not_looked_back_at_when_no_record_says_so(
-    plugin, server, tmp_path, monkeypatch
-):
-    """The record could not be written, and the session and its parent are both put
-    back on the record. An upload then names a new id that only its row says goes on
-    from the session. Nothing on disk says the session held turns from off the record
-    and nobody is private, but the agent that carried it remembers: the new id is
-    started with the sessions it goes on from, and is not looked back at."""
-    home = tmp_path / "hermes-a"
-    _child(home, None)
-    _marker(tmp_path, _PARENT)
-    provider = _open(plugin, home, _PARENT, resumed=True)
-    module = sys.modules[type(provider).__module__]  # the provider's own copy of the core
-    monkeypatch.setattr(module.carried, "settle", lambda home, session_id, made=False: None)
-    provider.on_session_switch(_CHILD, parent_session_id=_PARENT, reason="compression")
-    _forget(server, tmp_path, _CHILD)
-    (tmp_path / "private" / _PARENT).unlink()  # `off --forget` for the parent as well
-    _say(provider, _conversation(4), _CHILD)
-    assert _posted(server) == [(_CHILD, ["question 4"])]
-    _store(home, _THIRD, source="tui", receipt=False, chat_id="")
-    _link(home, _THIRD, _CHILD, None)
-    tail = [_conversation(4)[0], *_conversation(4)[3:], *_conversation(5)[-2:]]  # turns 2 to 5
-    _say(provider, tail, _THIRD)
-    assert _posted(server)[1:] == [(_THIRD, ["question 5"])]
-    assert not (tmp_path / "private" / _THIRD).exists()
-
-
-def test_a_turn_begun_under_an_id_gone_back_to_stays_out_after_the_next_compression(
+def test_a_conversation_stays_private_through_a_rewind_and_the_next_compression(
     plugin, server, tmp_path
 ):
     """A compression moves a private session to a second id, and the turn raises: the
     TUI keeps the first id as its key (tui_gateway/prompt_turn.py re-anchors it only
     with a result). `/undo` then names the first id (tui_gateway/methods_tools.py; that
     Hermes takes the old key there was read off its code, not run): the provider goes
-    back to it, and each of the two ids has gone on from the other. Question 4 begins
-    off the record under the first, and a compression in the middle of it moves the
-    agent to a third id, which goes on from both. After `off --forget`, question 4's
-    upload runs late, after question 5 has begun: the turn begun off the record is
-    still counted, so that upload is not taken for the end of question 5."""
+    back to it, and each of the two ids has gone on from the other. A compression in
+    the middle of question 4 moves the agent to a third id, which goes on from both and
+    is private as they are. `off --forget` on the third puts that session back, whole."""
     home = tmp_path / "hermes-a"
     _store(home, _PARENT, source="tui", receipt=False, chat_id="")
     _marker(tmp_path, _PARENT)
@@ -362,18 +322,16 @@ def test_a_turn_begun_under_an_id_gone_back_to_stays_out_after_the_next_compress
     agent.on_pre_compress(asked)
     agent.on_session_switch(_NEW, parent_session_id=_THIRD, reason="compression")
     assert (tmp_path / "private" / _NEW).is_file()
-    _forget(server, tmp_path, _NEW)
-    agent.on_turn_start(5, "question 5", previous_message="question 4")
-    agent.prefetch("question 5", session_id=_NEW)
     agent.sync_turn("question 4", "a", session_id=_NEW, messages=_conversation(4))
     assert server.posts() == []
-    agent.sync_turn("question 5", "a", session_id=_NEW, messages=_conversation(5))
-    _say(agent, _conversation(6), _NEW)
-    assert _posted(server) == [(_NEW, ["question 5"]), (_NEW, _questions(5, 6))]
+    _forget(server, tmp_path, _NEW)
+    _say(agent, _conversation(5), _NEW)
+    assert _posted(server) == [(_NEW, _questions(1, 5))]
+    assert (tmp_path / "private" / _PARENT).is_file() and (tmp_path / "private" / _THIRD).is_file()
 
 
 # ---------------------------------------------------------------------------
-# An agent built later for a session that holds turns from off the record
+# An agent built later for a session that was carried
 # ---------------------------------------------------------------------------
 
 
@@ -385,19 +343,20 @@ def _carried(plugin: Any, server: Any, home: Path, tmp_path: Path) -> Any:
     server.private_rows.add(_PARENT)
     provider = _open(plugin, home, resumed=True, message_count=6)
     _say(provider, _conversation(4), _CHILD)
-    assert server.posts() == [] and carried.held(home, _CHILD)
+    assert server.posts() == [] and carried.settled(home, _CHILD)
     return provider
 
 
 @pytest.mark.parametrize("built", ["while it is private", "after forget"])
-def test_an_agent_built_later_for_a_carried_session_keeps_its_turns_out(
+def test_an_agent_built_later_for_a_carried_session_does_not_carry_it_again(
     plugin, server, tmp_path, built
 ):
     """Hermes builds a session a new agent when it likes: the gateway after an idle
     hour, ``/model``, ``/undo``, ``/retry`` and a restart. The new agent finds the
-    session settled and does not carry it again. Its record says it was made private,
-    so its turns from before are not looked back at, whether the agent was built
-    before ``off --forget`` or after: a resume's look-back would send them."""
+    session settled and does not carry it again, though the parent is still private.
+    While the session is private nothing leaves. After ``off --forget`` it is back
+    whole, looked back at as any resumed session, whether the agent was built before
+    or after."""
     home = tmp_path / "hermes-a"
     first = _carried(plugin, server, home, tmp_path)
     first.on_session_end(_conversation(4))
@@ -411,19 +370,18 @@ def test_an_agent_built_later_for_a_carried_session_keeps_its_turns_out(
         count = 6
     assert server.posts() == []
     _say(later, _conversation(count), _CHILD)
-    assert _posted(server) == [(_CHILD, [f"question {count}"])]
+    assert _posted(server) == [(_CHILD, _questions(1, count))]
+    assert not (tmp_path / "private" / _CHILD).exists()
     assert server.puts() == [f"/private-sessions/{_CHILD}"] and server.asked() == []
 
 
 @pytest.mark.parametrize("how", ["a branch", "a compression"])
-def test_a_session_that_takes_over_such_turns_keeps_them_out_under_its_own_id(
-    plugin, server, tmp_path, how
-):
+def test_what_goes_on_from_a_session_put_back_is_on_the_record(plugin, server, tmp_path, how):
     """The carried session is back on the record. A branch of it made now, with an
     agent of its own, and the session a compression moves it to both hold its turns
-    under a new id. That id is on the record, as the session it comes from is by now,
-    and its record says what that one's does: an agent built for it, now or later,
-    does not look back at them."""
+    under a new id. That id is on the record, as the session it comes from is by now:
+    it is asked about that one, once, and looked back at as any session that goes on
+    from another, by this agent and by one built for it later."""
     home = tmp_path / "hermes-a"
     first = _carried(plugin, server, home, tmp_path)
     _forget(server, tmp_path, _CHILD)
@@ -438,11 +396,14 @@ def test_a_session_that_takes_over_such_turns_keeps_them_out_under_its_own_id(
         first.on_session_switch(_THIRD, parent_session_id=_CHILD, reason="compression")
         said = [said[0], *said[5:]]  # turns 3 to 5
         _say(first, said, _THIRD)
-    assert _posted(server) == [(_THIRD, ["question 5"])]
-    assert carried.held(home, _THIRD) and not (tmp_path / "private" / _THIRD).exists()
+    held = _questions(1 if how == "a branch" else 3, 5)
+    assert _posted(server) == [(_THIRD, held)]
+    assert carried.settled(home, _THIRD) and not carried.copied(home, _THIRD)
+    assert not (tmp_path / "private" / _THIRD).exists()
     later = _open(plugin, home, _THIRD, resumed=True, message_count=10)
     _say(later, [*said, *_conversation(6)[-2:]], _THIRD)
-    assert _posted(server)[1:] == [(_THIRD, ["question 6"])]
+    # A new agent sends what its look-back reaches again; the server keeps one of each.
+    assert _posted(server)[1:] == [(_THIRD, [*held, "question 6"])]
     assert server.puts() == [f"/private-sessions/{_CHILD}"] and server.asked() == [_CHILD]
 
 
@@ -456,7 +417,7 @@ def test_a_branch_settled_as_on_the_record_is_looked_back_at_as_any_resumed_sess
     _child(home)
     first = _open(plugin, home, resumed=True, message_count=6)
     first.on_session_end([])  # the server is asked, and says no
-    assert carried.settled(home, _CHILD) and not carried.held(home, _CHILD)
+    assert carried.settled(home, _CHILD)
     _marker(tmp_path, _PARENT)
     later = _open(plugin, home, resumed=True, message_count=6)
     _say(later, _conversation(4), _CHILD)
@@ -632,6 +593,37 @@ def test_a_switch_goes_by_the_session_the_provider_was_bound_to_as_well(plugin, 
     provider.on_session_switch(_THIRD, parent_session_id=_OTHER, reason="compression")
     assert (tmp_path / "private" / _THIRD).is_file()
     assert server.puts() == [f"/private-sessions/{_THIRD}"]
+
+
+@pytest.mark.parametrize("undo", [False, True], ids=["as it is", "after /undo"])
+def test_a_marker_on_the_id_the_tui_still_shows_covers_the_id_the_agent_is_in(
+    plugin, server, tmp_path, undo
+):
+    """A turn compresses the session to a new id and then raises: the TUI keeps the id
+    left as its key until a turn ends with a result (tui_gateway/prompt_turn.py,
+    session_compression.py), and `/undo` names that key (tui_gateway/methods_tools.py;
+    read off Hermes's code, not run). The agent's turns are stored, and uploaded, under
+    the new id. `synapse private on` for the id the TUI shows then marks the session
+    the new id goes on from, before any upload has settled the new id: it is private
+    with it."""
+    home = tmp_path / "hermes-a"
+    _store(home, _CHILD, source="tui", receipt=False, chat_id="")
+    provider = _open(plugin, home, _CHILD, resumed=True, message_count=6)
+    provider.on_turn_start(4, "question 4", previous_message="question 3")
+    provider.prefetch("question 4", session_id=_CHILD)
+    _store(home, _THIRD, source="tui", receipt=False, chat_id="")
+    _link(home, _THIRD, _CHILD, None)
+    provider.on_session_switch(_THIRD, parent_session_id=_CHILD, reason="compression")
+    if undo:  # the turn raised, so no sync_turn came for it
+        provider.on_session_switch(_CHILD, parent_session_id="", reset=False, rewound=True)
+    _marker(tmp_path, _CHILD)  # `synapse private on`, for the id the TUI shows
+    server.private_rows.add(_CHILD)
+    for n in (4, 5):
+        provider.on_turn_start(n, f"question {n}", previous_message=f"question {n - 1}")
+        provider.prefetch(f"question {n}", session_id=_THIRD)
+        provider.sync_turn(f"question {n}", "a", session_id=_THIRD, messages=_conversation(n))
+    assert server.posts() == []
+    assert (tmp_path / "private" / _THIRD).is_file()
 
 
 def test_an_upload_asks_only_as_far_up_as_the_first_settled_session(plugin, server, tmp_path):

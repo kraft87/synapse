@@ -82,13 +82,15 @@ server-only change leaves the version alone. The rules live in `scripts/release_
    ingest route itself, so no adapter can forget the check. The two older shippers that
    still post on their own (Claude Code's and Codex's Stop hooks) run the same check
    inside their senders.
-7. **One private-mode toggle.** `private_toggle.Toggle` is the toggle of every harness:
-   the marker (`private.mark`), the server row (`Client.private_put`), the read-back,
-   and what `off` and `--forget` leave behind. `synapse private`, and the
-   `private_mode.py` of the Claude Code and Codex plugins, only build the client and
-   hand it the arguments. A harness that gives a continuing conversation a new session
-   id calls `Uploader.carry_private`, or the turns spoken off the record go up under
-   the new id.
+7. **One private-mode toggle, for whole sessions.** `private_toggle.Toggle` is the
+   toggle of every harness: the marker (`private.mark`), the server row
+   (`Client.private_put`), the read-back, and what `off` and `--forget` leave behind.
+   `synapse private`, and the `private_mode.py` of the Claude Code and Codex plugins,
+   only build the client and hand it the arguments. Private mode covers a session as a
+   whole: the core keeps no list of the turns spoken while it was on, and a session
+   put back on the record (`off --forget`) is back with all of them. A harness that
+   gives a continuing conversation a new session id calls `Uploader.carry_private`, or
+   the turns spoken off the record go up under the new id.
 
 ## What an adapter provides
 
@@ -323,13 +325,13 @@ like every other harness, so there is no Hermes setup wizard step.
 | Method | Behaviour |
 |---|---|
 | `is_available()` | A URL and a token resolve. No network. |
-| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences (one request) within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. With a marker to go by, the server is told here, beside that request and inside the same 5 seconds; with none, it is asked at the first upload. Once per session, and `carried.py` records how it ended: an agent built later for a session that was made private this way, or for one that took over such a session's turns (a branch of it, the id a compression moved it to), looks back at no turn, also after `off --forget`. Nor does an agent built for a session that was found to hold copies (an ACP fork: the record under `copied/`), or for one that goes on from it. Any other resumed session looks back ten. |
+| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences (one request) within 5 seconds, fail-open, then drains the outbox on a thread of its own. A session whose row in the store says it holds another's turns (a branch, a compressed continuation: `lineage.chain`) is made private when one of those sessions is, as at a switch: Hermes's TUI, desktop app and gateway build a new agent for a branch and announce no switch. With a marker to go by, the server is told here, beside that request and inside the same 5 seconds; with none, it is asked at the first upload. Once per session: `carried.py` records that the session was asked about, so one put back on the record since (`off --forget`) is not made private again by an agent built later. An agent built for a session that was found to hold copies (an ACP fork: the record under `copied/`), or for one that goes on from it, looks back at no turn. Any other resumed session looks back ten. |
 | `system_prompt_block()` | The text fetched in `initialize()`, in an active session that the store still says is the owner's. Hermes caches it for the session, stores it with the session and restores it for a continuing one, and asks again after a compression. |
 | `prefetch(query, session_id=...)` | The timestamp line and the recall nudge, in an active session. No request is made. Hermes runs it as a turn starts, after `on_turn_start`, on a thread it waits for, with the agent's session id: the provider notes it as the session the agent is in (`live.py`), for the hooks that name none. Hermes runs none for a trivial prompt, a bare skill invocation, an owner scope that refuses it, a fork with its hooks off, or while its gate holds a stuck call. |
-| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. Tells the uploader that a turn starts in the session Hermes named last (`TurnUploader.begin`), and whether Hermes names a user message before this one (`previous_message`): a session that holds turns from before goes by that to tell a new turn from an old one. Every turn gets the hook but a prompt a `pre_llm_call` hook vetoed; it comes after the turn-start compaction and before `prefetch`. |
-| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn's `turn_author` is a bot or not the session's user. The session id is the one Hermes passes, which need not be one the instance was moved to (a session resumed in place, an agent Hermes pointed at a compression's new id, a row written after `initialize`): before the first upload under an id, its row in the store is read, and it is made private when a session it holds turns of is (`_follow`, once per id). After `synapse private off --forget` on a session that was private because of the one it continues, the turns it holds stay out, as turns and as context: in the agent that carried it, and in one built for it later, which goes by the record `initialize` reads. The next turn seen to begin on the record goes up when it ends, alone, unless it holds more than one exchange by then (a row Hermes wrote in the user's place, a reply to a background-process notice, a message with no text, a message Hermes folded into an earlier one that got no reply): such a turn may be one spoken off the record that something later landed on. Turn starts are counted for the agent, whichever session ids a start and its `sync_turn` name: a turn begun off the record is counted until the `sync_turn` that ends it, and the one turn before with it when its `sync_turn` had not run, so one that runs late is not taken for the end of another turn. Two that run late past a turn begun off the record are, and that turn can then go up. Once a turn begun off the record has ended, a session that was off the record notes again what it holds at its next `sync_turn`. A session Hermes said was new is treated the same once its first turn start or its first upload shows that it holds turns from before (an ACP fork). That is recorded when Hermes's store held no message of the session as the agent was built (`carried.noter`, by the `message_count` of `initialize`; a file under `<hermes_home>/synapse/copied/`), so an agent built for the session later treats it so too: at `initialize`, or here for an id whose row names no session (`TurnUploader.keep_out`). A session with messages at the build that is said to be new all the same (a chat whose first message got no reply, opened again) gets no record: the messages are its own, and the agent built next looks back at them. A session marked by hand sends every turn once it is back on the record. Hermes runs `sync_turn` on its background worker, after a turn that ended with a reply and not after one cut short (a reply stopped while it streamed is stored all the same, and goes up with the next upload; a stopped turn's start stays counted, which costs a session that was off the record the first turn back on the record after each stretch off it from then on); the worker's stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
-| `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Neither hook carries a session id, and the one the instance was built for or switched to need not be the agent's, so they go under the id Hermes named last (`live.py`: `initialize`, `on_session_switch`, `prefetch` and `sync_turn` name one; a `sync_turn` that runs late does not take the agent back to an id a hook named before the move, or to the parent a switch names), when that is the bound id or a session whose row says it goes on from it. Otherwise nothing is sent, since nothing says whose turns the flush holds: after `/new`, Hermes flushes the session left once the next turn has named the new one. The rules are those of `sync_turn`, except that a flush never takes a turn for one that has just ended: in a session that holds turns from before, the last turn is left for the `sync_turn` that ends it, and a session Hermes said was new sends nothing before its first turn start. Nor does a flush settle which turns such a session held: it may be handed part of the conversation (`/compress here N` hands over the head it is about to summarise), so it notes the turns it is shown as off the record, and the rest are noted at the next `sync_turn`, which holds them all. And while a turn begun off the record is still to end, or has ended with no `sync_turn` for the session since, the flush of a session that was off the record sends no new turn: Hermes makes no `sync_turn` for a turn the user stopped and stores its reply as far as it came, so that turn can stand whole in the rows with nothing having noted it. For a session held until the server answers, nothing is sent or queued: its turns are kept in memory (200 at most, per session id) and go up at the first upload for that id after the answer, also those a compression in place has taken out of the conversation. A compression that starts a new session leaves them with the id left: they are not uploaded. Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
-| `on_session_switch(new_id, ...)` | Rebinds the session id. At Hermes bca51750 a compression and the TUI's rewind reach it; the classic CLI's `/new`, `/resume` and `/branch` make the call, but its agent holds no memory manager. A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. A conversation that goes on under a new id (a compression, `/branch`: any new id that is neither a reset nor `reason="resume"`) stays private when the id it leaves (the one the instance is bound to, and the one Hermes named last), or the parent the switch names, is: the new id gets the marker and the server row (`Uploader.carry_private`), and no turn before the switch is looked back at. Nor is any when the id it leaves was off the record earlier in this agent and is back on it (`off --forget`): the new id is on the record, and holds those turns. With no marker to say so the server is asked at the session's next upload, and nothing is uploaded for it until the server answers. `/new` and `/resume` open another conversation: nothing is carried to it from the one left, and a resumed session answers for its own row at its first upload. If the check raises, the instance turns inert. A compression of an id the agent is in already (`reason="compression"`; the bound id, or one Hermes named since without a switch) is one in place. It records the time, on the clock Hermes stamps its messages with; recall and recall_full_turns then carry it as `self_since`, so the turns before it serve again. A new id, a reset or a restart forgets it. |
+| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. Tells the uploader that a turn starts in the session the instance is bound to (`TurnUploader.begin`), and whether Hermes names a user message before this one (`previous_message`): the first turn start of a session Hermes said was new shows by that whether turns were copied into it, and a session that holds copies uploads only turns seen to begin. Every turn gets the hook but a prompt a `pre_llm_call` hook vetoed; it comes after the turn-start compaction and before `prefetch`. |
+| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn's `turn_author` is a bot or not the session's user. The session id is the one Hermes passes, which need not be one the instance was moved to (a session resumed in place, an agent Hermes pointed at a compression's new id, a row written after `initialize`): before the first upload under an id, its row in the store is read, and it is made private when a session it holds turns of is (`_follow`, once per id). Private mode covers the session as a whole. A turn goes by what its session is when its `sync_turn` runs, and nothing is noted of the turns that end while it is private. After `synapse private off --forget` the session is back whole: the next `sync_turn` sends every finished turn not sent yet, as far as the look-back reaches (ten turns for a resumed session and for one started at a switch or first met here), the turns it took over from a private session it goes on from among them. That session stays private under its own id; to go on without its turns, the user starts a new session. A session Hermes said was new holds copies when its first turn start names a message before it, or its first upload shows more turns than were seen to begin (an ACP fork): it uploads the turns begun in it, and the copied ones stay out, as turns and as context. Of what such a session holds at its first upload only the last turn can go up, when a turn start is still counted and the turn holds one exchange. One that holds more (a row Hermes wrote in the user's place, a reply to a background-process notice, a message with no text, a message Hermes folded into an earlier one that got no reply) may be a copy that something later landed on, and stays out. Turn starts are counted for the agent, whichever session ids a start and its `sync_turn` name. That a session holds copies is recorded when Hermes's store held no message of the session as the agent was built (`carried.noter`, by the `message_count` of `initialize`; a file under `<hermes_home>/synapse/copied/`), so an agent built for the session later treats it so too: at `initialize`, or here for an id whose row names no session (`TurnUploader.keep_out`). A session that goes on from one recorded there is recorded too. A session with messages at the build that is said to be new all the same (a chat whose first message got no reply, opened again) gets no record: the messages are its own, and the agent built next looks back at them. Hermes runs `sync_turn` on its background worker, after a turn that ended with a reply and not after one cut short (a reply stopped while it streamed is stored all the same, and goes up with the next upload); the worker's stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
+| `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Neither hook carries a session id, and the one the instance was built for or switched to need not be the agent's, so they go under the id Hermes named last (`live.py`: `initialize`, `on_session_switch`, `prefetch` and `sync_turn` name one; a `sync_turn` that runs late does not take the agent back to an id a hook named before the move, or to the parent a switch names), when that is the bound id or a session whose row says it goes on from it. Otherwise nothing is sent, since nothing says whose turns the flush holds: after `/new`, Hermes flushes the session left once the next turn has named the new one. The rules are those of `sync_turn`, except that a flush never takes a turn for one that has just ended: a session that holds copies sends nothing at a flush that comes before its first `sync_turn`, and a session Hermes said was new sends nothing before its first turn start. Nor does a flush settle which turns such a session holds as copies: it may be handed part of the conversation (`/compress here N` hands over the head it is about to summarise), so it notes the turns it is shown, and the rest are noted at the next `sync_turn`, which holds them all. For a session held until the server answers, nothing is sent or queued: its turns are kept in memory (200 at most, per session id) and go up at the first upload for that id once it is on the record, also those a compression in place has taken out of the conversation: after an answer that no session it goes on from is private, or, when the answer made it private, after `off --forget`. A compression that starts a new session leaves them with the id left: they are not uploaded. Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
+| `on_session_switch(new_id, ...)` | Rebinds the session id. At Hermes bca51750 a compression and the TUI's rewind reach it; the classic CLI's `/new`, `/resume` and `/branch` make the call, but its agent holds no memory manager. A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. A conversation that goes on under a new id (a compression, `/branch`: any new id that is neither a reset nor `reason="resume"`) stays private when the id it leaves (the one the instance is bound to, and the one Hermes named last), or the parent the switch names, is: the new id gets the marker and the server row (`Uploader.carry_private`). With no marker to say so the server is asked at the session's next upload, and nothing is uploaded for it until the server answers. Once per session: a new id put back on the record (`off --forget`) stays there, whole, and so does what goes on from it afterwards. A new id that goes on from a session known to hold copies holds them too: it is recorded under `copied/` and looks back at no turn. `/new` and `/resume` open another conversation: nothing is carried to it from the one left, and a resumed session answers for its own row at its first upload. If the check raises, the instance turns inert. A compression of an id the agent is in already (`reason="compression"`; the bound id, or one Hermes named since without a switch) is one in place. It records the time, on the clock Hermes stamps its messages with; recall and recall_full_turns then carry it as `self_since`, so the turns before it serve again. A new id, a reset or a restart forgets it. |
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `self_since` on `recall` and `recall_full_turns`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
 | `handle_tool_call(name, args)` | `tools.call()`: adds the session id, and the compression time where there is one, the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, a call in an inert session, or a call before `initialize()` comes back as a JSON object with an `error` field. |
 
@@ -370,9 +372,9 @@ and, against a server, `tests/test_private_mode.py`. `tests/test_hermes_messages
 `test_hermes_gateway_sessions.py` (the rule, over a `state.db` built like Hermes's),
 `test_hermes_private_lineage.py` (which sessions a row holds turns of, and private mode
 for a new agent bound to such a session), `test_hermes_private_moves.py` (a flush after a
-move Hermes did not announce, and what `off --forget` leaves behind),
-`test_hermes_turn_starts.py` (which turns a session that holds turns from before
-uploads, in Hermes's own order of hooks),
+move Hermes did not announce, and a session put back on the record with `off --forget`),
+`test_hermes_turn_starts.py` (which turns a session that holds copies uploads, in
+Hermes's own order of hooks),
 `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` and
 `test_hermes_install_selection.py`. `tests/test_hermes_integration.py` runs only with
 `SYNAPSE_HERMES_CHECKOUT` set to a Hermes checkout with its `.venv`: it installs into a
@@ -469,8 +471,9 @@ The core ports the hooks' behaviour and wording, with these differences:
   uploader Hermes started with: finished turns once each, the turn before as context, a
   resumed conversation looking back only so far. A harness names the session at every
   upload and may name several to one uploader, so what it remembers (turns sent, turns
-  kept, turns spoken off the record, the look-back) is kept per session id.
-- **A conversation that changes its session id.** Private mode is kept per session id.
+  kept, copies, the look-back) is kept per session id.
+- **A conversation that changes its session id.** Private mode covers whole sessions
+  and is kept per session id.
   `Uploader.carry_private(earlier, new)` gives `new` the marker and the server row when
   one of `earlier` is private here (a marker, or one that cannot be read), and answers
   whether it did. A marker lasts twelve hours and `off` removes it, while the server's
@@ -481,72 +484,63 @@ The core ports the hooks' behaviour and wording, with these differences:
   private this way once: carried again it is left as it is, so `off --forget` stands.
   Nothing is sent or queued for a held session; `TurnUploader` keeps the turns finished
   meanwhile in memory (`turn_upload.KEPT_TURNS`, per session id) and sends them at that
-  session's next upload after the server says the earlier sessions are on the record,
-  also those the conversation no longer holds. They are dropped when it says private. `Uploader.settle` says where a session stands for an upload: open,
-  waiting for the answer, private, or made private by the server's answer just now. Where a write
-  fails the uploader refuses the session itself: for as long as it lives when the marker
-  could not be written, and until the server has the row when the request failed. The
-  server is told again each time that session has a turn, and after any delivered
-  upload for every session still owed (`settle_owed`, which stops at the first request
-  that fails); each failed try is said to `warn`. With `timeout=None` the carry makes no request, and the caller settles.
+  session's next upload once it is on the record, also those the conversation no
+  longer holds: when the server says the earlier sessions are on the record, or, when
+  its answer made the session private, after `off --forget`. `Uploader.settle` says
+  where a session stands for an upload: open, waiting for the answer, or private.
+  Nothing is noted of the turns a private session shows: put back on the record it is
+  back whole, and its next upload sends every finished turn not sent yet, as far as
+  its look-back reaches. Where a write fails the uploader refuses the session itself:
+  for as long as it lives when the marker could not be written, and until the server
+  has the row when the request failed. The server is told again each time that session
+  has a turn, and after any delivered upload for every session still owed
+  (`settle_owed`, which stops at the first request that fails); each failed try is said
+  to `warn`. With `timeout=None` the carry makes no request, and the caller settles.
   `settled(made)` is the caller's hook for a question that was closed: the server said
   no earlier session is private (`made` is False), or it has the session's own row
-  (True). Hermes records which, so that a session is asked about once and an agent
-  built for it later knows whether it holds turns from off the record. It is not
-  called when there was nothing to ask. A session carried again while its question is
-  open (the server has not answered, or is still to be told) has the hook of every
-  carry called; for a session made private here whose question closed before the
-  call, none is.
-- **A session that holds turns from before.** A session with a look-back of 0 holds
-  turns that are not its own to upload: it was off the record, or they are copies.
-  Nothing in a turn's rows tells them from a new one, so the harness says when each
-  turn starts (`TurnUploader.begin(session_id)`, where the uploader reads whether the
-  session is private at that moment), and `upload(..., finished=True)` says a turn has
-  just ended. When such a session is first found on the record, every turn of the
-  records that upload is handed is noted as off the record, by the row that opens it
-  (`messages.opening_key`), and stays out as a turn and as context. The exception is a
-  last turn seen to begin on the record, with no turn begun off it still to end, that
-  holds one exchange (`messages.joined`: no user row besides the one that opens it,
-  nothing after its reply): it is sent when it ends, alone. An upload that ends no turn
-  may be handed part of the conversation (a flush before a compression), so with
-  `begins=True` it notes what it is shown and the look-back stays 0 until an upload
-  with `finished=True`, which holds all of it. A turn begun while the session is
-  private on this machine (`Uploader.private_here`: its marker, or held as private by
-  the uploader; a question the server has not answered is not waited for) is counted
-  until the upload that ends it, and the one turn before with it when its upload had
-  not run: which of the two an upload that runs late ends is not known, so neither
-  goes up. Turn starts are counted for the uploader and not per session id: it serves
-  one agent, whose turns run one at a time, and a turn can begin under one id and end
-  under another, so `start` moves no count. An upload with `finished=True` takes the
-  oldest start still counted: a harness makes those uploads in the order the turns
-  began, and each shows the turn it ends last. On the record two starts are kept at
-  most, and one turn before is counted, not two: with two uploads still to come, the
-  second takes the count of the turn begun off the record, and that turn's own
-  upload, or a flush, can then send it. A turn whose upload never comes (it was
-  stopped) stays counted, which costs a session that was off the record the first
-  turn back after each later stretch off it. Once a turn begun off the record has
-  ended, a session that was off the record notes again what it holds at its next
-  upload with `finished=True`, whichever id that turn's own upload named. Until then,
-  and while one is counted, an upload without
-  `finished` picks no turn to send in a session that was off the record: that turn may
-  stand whole in the records (its reply cut short, its upload late), and only the
-  upload that ends a turn notes it. The turns kept for the server's answer still go.
-  For `joined` to say what a turn holds an adapter leaves no user
-  row out: one that opens no turn (written in the user's place, or with no text) is
-  sent as `synthetic`, and a row the harness folded two user messages into is followed
-  by a `synthetic` row with no text. With `begins=True`, a session started with no
-  look-back and nothing it goes on from is checked as well: it sends nothing at a
-  flush before its first turn start, and counts as one that holds turns from before
-  when that turn start says so (`begin(..., earlier=True)`) or its first upload shows
-  more turns than were begun. The uploader then calls `copied(session_id)`, a
-  constructor argument, for that session and for every one the doubt came through:
-  what it found is in memory, and a process started for the session later would look
-  back. A harness need not keep it: the Hermes adapter passes no `copied` when
-  Hermes's store held messages of the session as the agent was built, since those can
-  be the session's own. One that kept it says so there with `keep_out(session_id)`,
-  or starts the session with 0. A look-back of 0 stays with the session, and with every
-  id started as going on from it (`start(..., continues=...)`): a later start asks for
-  a look-back in vain.
+  (True). Hermes records that it was closed, so that a session is asked about once,
+  also by an agent built for it later, and one put back on the record stays there. It
+  is not called when there was nothing to ask. A session carried again while its
+  question is open (the server has not answered, or is still to be told) has the hook
+  of every carry called; for a session made private here whose question closed before
+  the call, none is. Nor is any called for a session whose marker could not be
+  written: only that uploader keeps it private on the machine, so the next one must
+  ask again and not find it closed.
+- **A session that holds copies.** A harness can copy another session's turns into a
+  new one and name no session they came from. A session with a look-back of 0 holds
+  such turns: they are not its own to upload. Nothing in a turn's rows tells a copy
+  from a new turn, so the harness says when each turn starts
+  (`TurnUploader.begin(session_id)`), and `upload(..., finished=True)` says a turn has
+  just ended. At such a session's first upload every turn of the records it is handed
+  is noted as a copy, by the row that opens it (`messages.opening_key`), and stays out
+  as a turn and as context. The exception is a last turn, when a turn start is still
+  counted and it holds one exchange (`messages.joined`: no user row besides the one
+  that opens it, nothing after its reply): it is sent when it ends, alone. An upload
+  that ends no turn may be handed part of the conversation (a flush before a
+  compression), so with `begins=True` it notes what it is shown and the look-back stays
+  0 until an upload with `finished=True`, which holds all of it. Turn starts are
+  counted for the uploader and not per session id: it serves one agent, whose turns
+  run one at a time, and a turn can begin under one id and end under another, so
+  `start` moves no count. An upload with `finished=True` takes the oldest start still
+  counted, also when it is refused for a private session: a harness makes those
+  uploads in the order the turns began, and each shows the turn it ends last. A turn
+  whose upload never comes (it was stopped) stays counted. For `joined` to say what a
+  turn holds an adapter leaves no user row out: one that opens no turn (written in the
+  user's place, or with no text) is sent as `synthetic`, and a row the harness folded
+  two user messages into is followed by a `synthetic` row with no text. With
+  `begins=True`, a session started with no look-back and nothing it goes on from is
+  checked as well: it sends nothing at a flush before its first turn start, and counts
+  as one that holds copies when that turn start says so (`begin(..., earlier=True)`)
+  or its first upload shows more turns than were begun. The uploader then calls
+  `copied(session_id)`, a constructor argument, for that session and for every one the
+  doubt came through: what it found is in memory, and a process started for the
+  session later would look back. A harness need not keep it: the Hermes adapter passes
+  no `copied` when Hermes's store held messages of the session as the agent was built,
+  since those can be the session's own. One that kept it says so there with
+  `keep_out(session_id)`, or starts the session with 0. A look-back of 0 stays with the
+  session, and with every id started as going on from it (`start(..., continues=...)`):
+  a later start asks for a look-back in vain. Private mode is not this: a session that
+  was private holds its own turns, and is looked back at like any other.
 
 ## Adding a harness
 
@@ -561,16 +555,16 @@ The core ports the hooks' behaviour and wording, with these differences:
    adapter only converts its harness's shapes), tool calls -> `tools.call`. Do not post
    to the ingest route from the adapter: the uploader is where a private session's turns
    are stopped and a failed upload is queued. If the harness can give a conversation a
-   new session id while it goes on, call `Uploader.carry_private` when it does, and
-   start the new id with a look-back of 0 when it is carried
-   (`TurnUploader.start(id, 0)`), also in a process started for it later: keep what
-   `settled(made)` says. If the harness can call a session new and copy turns into it,
-   pass `copied=` and keep that as well. Build the `TurnUploader` with `begins=True`, call `begin` as
-   each turn starts, and pass `finished=True` to the upload that ends a turn: without
-   it a session with a look-back of 0 never uploads a turn. Use one `TurnUploader` for
-   one agent, make those uploads in the order the turns began, and hand each the
-   conversation as far as the turn it ends: the count of turn starts goes by all
-   three. Send every user row: one
-   that opens no turn as `synthetic`, and a `synthetic` row with no text after one the
-   harness folded two messages into.
+   new session id while it goes on, call `Uploader.carry_private` when it does, also in
+   a process started for the new id later, and keep what `settled` says: a session is
+   made private this way once. If the harness can call a session new and copy turns
+   into it, pass `copied=`, keep what it says, and start such a session, and what goes
+   on from it, with a look-back of 0 (`TurnUploader.start(id, 0)`). Build the
+   `TurnUploader` with `begins=True`, call `begin` as each turn starts, and pass
+   `finished=True` to the upload that ends a turn: without it a session with a
+   look-back of 0 never uploads a turn. Use one `TurnUploader` for one agent, make
+   those uploads in the order the turns began, and hand each the conversation as far
+   as the turn it ends: the count of turn starts goes by all three. Send every user
+   row: one that opens no turn as `synthetic`, and a `synthetic` row with no text after
+   one the harness folded two messages into.
 4. Add a column to the table above and say what is not ported.
