@@ -89,7 +89,7 @@ synapse login --token     # paste the token above when asked; plain `synapse log
 keeps the answers and the credential in `~/.synapse/config.json`, and wires up every coding
 harness it finds: the Claude Code plugin, Codex's hooks and MCP entry, and the Hermes memory
 provider. Restart Claude Code (or run `/reload-plugins`). In Codex, choose "Trust all and
-continue" when it asks about the new hooks. For Hermes, run `hermes gateway stop`.
+continue" when it asks about the new hooks. In Hermes, start a new session.
 
 Required values, verification steps, importing your existing history, upgrades, and
 troubleshooting: **[docs/install.md](docs/install.md)**.

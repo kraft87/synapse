@@ -156,10 +156,13 @@ Then it wires every harness it finds, and each needs one step from you:
   calls each Synapse tool (`recall`, `remember`, `fetch`, `recall_feedback`) it asks for
   approval: choose "Always allow", or a stray keypress can cancel a memory write.
 - **Hermes**: it installs a memory provider in `$HERMES_HOME/plugins/synapse/` and selects
-  it (`synapse install hermes [--hermes-home PATH] [--replace]` does that alone). Then run
-  `hermes gateway stop`: `hermes chat` and the TUI run in Hermes's gateway, which loads the
-  provider when it starts, and the next `hermes chat` starts it again. Local sessions only,
-  and not on Windows yet: see [plugin/README.md](../plugin/README.md#hermes).
+  it (`synapse install hermes` does that step alone). Start a new `hermes` session; one
+  already open stays without Synapse. `hermes memory status` should show
+  `synapse ← active`. Hermes runs one external memory provider at a time: if another one
+  (Honcho, Hindsight, mem0) is selected, the output says `left memory.provider at '<name>'`
+  and Synapse is not active. `synapse install hermes --replace` switches to Synapse, and
+  `hermes config set memory.provider <name>` switches back. Local sessions only, and not on
+  Windows yet: see [plugin/README.md](../plugin/README.md#hermes).
 
 `synapse status` shows which harnesses are wired. Re-running `synapse login` wires a harness
 you install later and never asks for a new sign-in on an enrolled machine (`--reenroll` does

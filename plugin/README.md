@@ -281,9 +281,10 @@ set` when Hermes already has a config there, by writing a new two-line file when
 none. Hermes runs one external memory provider at a time, so a different one already
 selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
 either way. `synapse update` rebuilds the folder for a new client version, and `synapse
-status` says whether it is wired. Restart Hermes to load it: `hermes chat` and the TUI run
-their turns in Hermes's gateway daemon, so stop it with `hermes gateway stop` (the next
-`hermes chat` starts it again).
+status` says whether the provider is installed; `hermes memory status` says whether it is
+the active one (`synapse ← active`). Start a new `hermes` session to use it; a session
+already open stays without it. After `synapse update`, run `hermes gateway stop` first, so
+the gateway loads the new code (the next `hermes` starts it again).
 
 Not on Windows yet: Hermes runs `hermes chat` and the TUI in its gateway, and Synapse cannot
 match a Windows account to those sessions, so they get nothing.
@@ -294,7 +295,9 @@ recall nudge each turn, the memory tools (`recall`, `recall_full_turns`, `fetch`
 `fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded.
 Chat-platform sessions (Telegram, Discord, Slack and the rest, through Hermes's gateway),
 the API server, the Bot Chat and Desktop Group Chats, cron jobs, side agents and subagents
-get nothing, not even the tools, and a session stops for good at the first turn another
+get no board, no nudge and no uploads. Hermes may still list the memory tools to the model
+there (it does on the API server), but a call returns "Synapse is enabled for local sessions
+only" and reads nothing; subagents get no Synapse tools at all. A session stops for good at the first turn another
 agent or person wrote: there, others talk to the agent, and they must not read your memory
 or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
 its branches stay off after a rename or a restart. To turn one back on, delete every file
