@@ -8,51 +8,26 @@ two, and everything that is still open.
 
 ## 2026-11-13 — hooks: the shipper reads from its cursor, and the waiting hooks import less (plugin 0.24.12)
 
-**What changed**
+**What changed** (the detail and the measurements are in the pull request)
 
-- **Claude Code's shipper parsed the whole transcript after every turn.** It read every
-  line to find the few past its cursor. On a 32.6 MB transcript (7,011 records) that
-  was about 0.4 s and 95 MB of memory per turn, in the detached worker. The cost grew
-  with the session and added up across sessions running side by side.
-- **Now it looks at the size first.** A transcript whose size has not changed since its
-  last complete upload is not opened.
-- **A transcript with a cursor is read from the cursor.** The same file: 10 to 20 ms
-  and 20 MB.
-- **The cursor entry keeps the session ids the file holds** (`sids`, in
-  `ingest_cursors.json`). A transcript is held back while any id its records carry is in
-  private mode. That rule used to find the ids by reading the whole file. It now takes
-  the ones before the cursor from the entry, so a private record anywhere in the file
-  still holds the file back.
-- **An entry with no ids has its file read whole**: an entry an older plugin wrote (once,
-  at the first upload after the update), one a failed first upload left, and a file
-  with more than 64 ids (every time).
-- **A truncated file** (its cursor is past the end) is read whole, and its ids are
-  worked out again.
-- **The hooks a user waits for import less.** Each hook is a new python3, so its imports
-  are time at the prompt. Four hooks run at every prompt or after every recall and only
-  read flags. Two run after every turn and only start the worker. All six loaded the
-  request stack (`urllib.request`, `http.client`, `ssl`, `socket`) and `dataclasses`
-  without using them.
-  - `context.py` names `Client` and `Settings` for type checking only.
-  - `config.py`, Codex's `common.py`, the two shippers and `synapse_ingest_retry.py`
-    import what sends a request inside the function that sends one.
-  - `Settings` is an immutable class written out by hand. A changed copy is
-    `settings.replace(...)`; `dataclasses.replace(settings, ...)` no longer works.
-  - `config.SURFACE` (this machine's display name) is worked out at its first read,
-    because the hostname needs `socket`. Codex's `common.SURFACE` had no reader and is
-    gone.
-
-| Hook (median of 40 runs, old and new taken in turn) | Before | After |
-|---|---|---|
-| Claude Code, each prompt (`recall_nudge.py`) | 129.9 ms | 68.9 ms |
-| Claude Code, after a recall (`recall_feedback_nudge.py`) | 133.0 ms | 66.0 ms |
-| Codex, each prompt (`user_prompt_submit.py`) | 138.4 ms | 68.8 ms |
-| Codex, after a recall (`post_tool_use.py`) | 133.6 ms | 67.0 ms |
-| Claude Code, after each turn (`ingest_hook.py`, no worker started) | 143.9 ms | 86.1 ms |
-| Codex, after each turn (`synapse_stop_hook.py`, worker started) | 191.7 ms | 120.3 ms |
-
-A python3 that only imports `json`, `os` and `sys` took 45.8 ms in the same run. Measured
-on cortex while other work was running: read the ratio, not the milliseconds.
+- **Claude Code's shipper reads from its cursor.** After every turn the detached
+  worker parsed the whole transcript to find the few records past its cursor. It now
+  looks at the size first (an unchanged file is not opened) and reads from the cursor
+  on. On a 32.6 MB transcript: about 0.4 s and 95 MB before, 10 to 20 ms and 20 MB
+  after.
+- **The private check is as strict as before.** A transcript is held back while any
+  session id its records carry is in private mode. The cursor entry now keeps those
+  ids (`sids`, in `ingest_cursors.json`), so the ones before the cursor still count.
+  An entry with no ids (from an older plugin, or after a failed first upload), a file
+  with more than 64 ids and a truncated file are read whole.
+- **The hooks a user waits for import less.** The six hooks that run at each prompt,
+  after each recall and after each turn loaded the request stack and `dataclasses`
+  without using them. They take about half the time now (each prompt: 130 ms before,
+  69 ms after, on cortex).
+- **For code that uses the core:** `Settings` is an immutable class written out by
+  hand. A changed copy is `settings.replace(...)`; `dataclasses.replace(settings, ...)`
+  no longer works. `config.SURFACE` is worked out at its first read, and Codex's
+  `common.SURFACE`, which had no reader, is gone.
 
 **On each machine**
 
@@ -62,24 +37,12 @@ on cortex while other work was running: read the ratio, not the milliseconds.
 
 **Proven**
 
-- `tests/test_ingest_hook_cursor.py` (14 new): a read from any byte returns what a
-  whole read keeps past it, at a line start, inside a line, at the end and past it; an
-  unchanged file is not opened; a file with a cursor is read from it; the entry keeps
-  the ids; a private id that only records before the cursor carry holds the file back;
-  an entry with no usable ids, and a file with more than 64, are read whole; a truncated
-  file forgets the old ids.
-- New `tests/test_hook_imports.py`: runs the six hooks as their harness does, under
-  `-X importtime`, and fails when one loads the request stack, `dataclasses` or
-  `tempfile` again. A control run proves the check sees a stack that is loaded.
-- `tests/test_client_core_settings.py`: the hand-written `Settings` cannot be assigned
-  to or deleted from, leaves the token and the sources out of `repr`, compares by what
-  was resolved, and `replace` gives a changed copy and refuses an unknown name.
-- `tests/test_claude_on_core.py`: the machine name is the hostname, asked for once at
-  its first read, and not at all when a name is set.
-- 42 changes tried against the new rules (each should break a test): all 42 caught.
-- The full non-database suite, and the Hermes tests against a Hermes checkout.
-- Measured on cortex, on a real 32.6 MB transcript: a whole read took 401 to 411 ms
-  with 95 MB peak memory; a read from the cursor 10.6 to 19.1 ms with 20 MB.
+- Tests: `tests/test_ingest_hook_cursor.py` (the cursor read and the private check),
+  `tests/test_hook_imports.py` (runs the six hooks and fails when one loads the request
+  stack again), `tests/test_client_core_settings.py`. 42 single changes to the new
+  rules were tried, and the tests failed on each.
+- Measured on cortex on a real 32.6 MB transcript, and over 40 runs of each hook, old
+  and new taken in turn.
 
 **Still open**
 
