@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,11 +28,10 @@ use_core()
 from synapse_client import messages  # noqa: E402
 from synapse_client.harnesses.hermes import history  # noqa: E402
 from synapse_client.harnesses.hermes import messages as hm  # noqa: E402
+from synapse_client.harnesses.hermes import sessions as hs  # noqa: E402
 from synapse_client.settings import Settings  # noqa: E402
 from synapse_client.turn_upload import TurnUploader  # noqa: E402
 from synapse_client.upload import Uploader  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not hasattr(os, "getuid"), reason="the owner subject is POSIX")
 
 _SCHEMA = """
 CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -56,7 +54,10 @@ _T0 = 1_790_000_000.0
 
 
 def _owner() -> str:
-    return f"uid:{os.getuid()}"
+    """This machine's owner as Hermes names it: ``uid:`` on POSIX, ``sid:`` on Windows."""
+    subject = hs.owner_subject()
+    assert subject, "no owner subject on this machine"
+    return subject
 
 
 def _local(name: str) -> str:
