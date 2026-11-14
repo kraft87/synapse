@@ -29,6 +29,12 @@ changed, what to do on each machine, what was proven, and what is still open.
   character can change. Each fact is classified twice, among different neighbours, and a
   word is renamed only when both passes name it. Retired facts, web facts, entity names
   and summaries, edges, dates and labels are not touched.
+- **The ingest guard drops two more of Synapse's own prompts.** `is_harness_call`
+  (`ingestion/contamination.py`) now refuses a single-turn session that opens "A personal
+  AI memory stores ...": the rename classifier's prompt and the golden-question
+  generators'. 140 generator calls were ingested on 2026-11-09. They hold stored facts
+  beside the owner's name, so they answered a question that names the owner before real
+  history did.
 
 **What to do on each machine**
 
@@ -93,6 +99,8 @@ text the script wrote.
   meaning holds, the grammar does not.
 - Entity rows already split for one person (a namesake stored twice, the owner's login
   names) are not merged by this change.
+- The guard stops new generator calls at ingest; the 140 episodes already stored are
+  still there.
 
 ## 2026-11-13 — notes: a related note is kept beside the old one, and replaced text is kept (schema 070, optional)
 

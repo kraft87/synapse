@@ -79,6 +79,12 @@ _HARNESS_PREFIXES = (
     # KG fact-dedup prompt — distinct wording from the "knowledge graph deduplication
     # assistant" above (60 stranded)
     "You are a fact deduplication assistant",
+    # scripts/rename_owner_in_facts.py::PROMPT (tests/test_contamination.py pins it to the
+    # real prompt), and the golden-question generators, which open the same way ("A
+    # personal AI memory stores facts about its owner, ..."). 140 of the generators'
+    # single-turn calls were ingested on 2026-11-09; they embed stored facts beside the
+    # owner's name, so they outranked real history for a question that names the owner.
+    "A personal AI memory stores ",
 )
 # scripts/recall_benchmark.py::_JUDGE — starts "QUESTION: " (too generic alone),
 # so it must be paired with the template's second stanza nearby.
