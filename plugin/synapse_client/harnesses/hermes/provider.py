@@ -47,8 +47,8 @@ and hands the upload to a thread of the provider's own (background.py), which ru
 at a time, in the order the turns ended. The core uploads them
 (turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
 before it as context; a session's first upload looks back at most ten turns, whatever
-Hermes says of the session (an agent Hermes builds for each turn is told that the
-session is new). ``on_session_end`` and ``on_pre_compress`` name
+Hermes says of the session (``resumed`` says only that its store held a reply as the
+agent was built). ``on_session_end`` and ``on_pre_compress`` name
 no session: they upload under the id Hermes named last (live.py) when that is the bound
 one or goes on from it, and nothing otherwise, since nothing says then whose turns they
 hold. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
@@ -249,8 +249,9 @@ class SynapseMemoryProvider(MemoryProvider):
         earlier = carried.to_ask(home, verdict.continues)
         private_too = carried.carry(uploader, home, earlier, session_id, None)
         turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=LOOKBACK)
-        # The same look-back whatever ``resumed`` says: an agent Hermes builds for each
-        # turn is told the session is new, and would send the whole conversation again.
+        # The same look-back whatever ``resumed`` says. That is only whether the store
+        # held a reply as the agent was built: a session Hermes calls new can hold turns
+        # (its first message got no reply; a managed worker is told so at every turn).
         copies = carried.copies(home, session_id, verdict.continues)  # an old record
         turns.start(str(session_id or ""), 0 if copies else LOOKBACK, continues=verdict.continues)
         cwd = kwargs.get("cwd")

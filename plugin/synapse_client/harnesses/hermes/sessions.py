@@ -21,6 +21,9 @@ the gateway identity of ``_GATEWAY_IDENTITY_PARAMS`` (agent/agent_init_params.py
 - ``agent_context`` other than "primary" (a subagent, a memory flush or other fork):
   INERT. A ``platform`` other than "cli", "tui", "desktop", "acp" (every messaging
   platform, "api_server", "bot_room", "a2a", "kanban", "webhook", ...): INERT.
+- A gateway identity with no ``chat_type``: INERT, as any that is not a local dm. A
+  managed worker's agent gets one (``gateway.managed_workers``, off by default; run at
+  bca51750: agent/managed_worker.py passes the route, the user and the chat id only).
 - ``platform`` "acp" with no gateway identity: INERT. ``hermes acp`` runs its sessions
   in the gateway, which names the chat, and its fork is a branch that records its
   parent (acp_adapter/gateway_server.py). The ACP session manager in the adapter's own

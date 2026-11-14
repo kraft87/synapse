@@ -294,7 +294,10 @@ agent or person wrote: there, others talk to the agent, and they must not read y
 or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
 its branches stay off after a rename or a restart. To turn one back on, delete every file
 there that names it (each holds the id it is for), once nothing in the chat says Bot Chat
-or Group any more. The reasons, the limits and the Hermes source behind them:
+or Group any more. With `gateway.managed_workers: true` in Hermes's config (off by
+default) Synapse is off in your own sessions too: Hermes then runs each turn in a
+worker process and does not tell it that the chat is a local one. The reasons, the
+limits and the Hermes source behind them:
 [docs/client-harnesses.md](../docs/client-harnesses.md).
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
@@ -311,9 +314,7 @@ Not sent: the system prompt, Hermes's compaction summaries (nor a message of you
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its
 own bookkeeping fields. The first upload an agent makes for a session looks back ten
 finished turns, whatever Hermes says of how new the session is, and sends the ones it
-has not sent itself; the server keeps one copy of a turn it has already. With
-`gateway.managed_workers` on, Hermes builds an agent for every turn, so every upload
-there is such a first one.
+has not sent itself; the server keeps one copy of a turn it has already.
 Uploads that fail wait in `$HERMES_HOME/synapse/outbox/` and go with the next
 successful one. A session marked
 private (`/private on` typed in it, or `synapse private on <session-id>` in a terminal;
@@ -337,7 +338,8 @@ any other, and its first upload sends up to ten of the copied turns, whatever th
 session they came from was. An ACP session Hermes runs outside its gateway (the
 adapter's own session manager, which `hermes acp` does not start) gets nothing from
 Synapse, as a chat-platform session does: its forks name no session, so a private one
-could not be followed. Clients 0.24.10 to 0.24.15 did guess, and recorded the sessions
+could not be followed (on a Hermes old enough for `hermes acp` to run its sessions that
+way, update Hermes). Clients 0.24.10 to 0.24.15 did guess, and recorded the sessions
 they took for such forks under `$HERMES_HOME/synapse/copied/`. Those records are read
 for one more release: a recorded session, and one that goes on from it, uploads only
 the turns that end in it from now on.

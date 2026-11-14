@@ -10,12 +10,13 @@ in its place:
 
   * an ACP session with no gateway identity is INERT (sessions.from_keywords): that is
     the adapter's own session manager, whose forks name no session;
-  * a session's first upload looks back ten turns whatever ``resumed`` says: a gateway
-    with managed workers builds an agent for every turn and tells each one that the
-    session is new.
+  * a session's first upload looks back ten turns whatever ``resumed`` says: Hermes can
+    call a session new that holds turns (one whose first message got no reply; a
+    managed worker is told so at every turn).
 
 These are Hermes's own sequences of hooks, as recorded at bca51750 (the probe traces
-``s11_acp_fork``, ``s12_seeded``, ``s14_gw_branch`` and ``s18_acp_init``), and what is
+``s11_acp_fork``, ``s12_seeded``, ``s14_gw_branch``, ``s18_acp_init`` and
+``s19_managed``), and what is
 left of the old rule: a session an earlier client recorded as holding copies
 (``<hermes_home>/synapse/copied/``) still uploads none of them, for one more release.
 
@@ -142,23 +143,44 @@ def test_the_fork_hermes_acp_makes_names_its_original(plugin, server, tmp_path, 
 # ---------------------------------------------------------------------------
 
 
-def test_a_session_served_by_an_agent_per_turn_uploads_each_turn_once_it_ends(
-    plugin, server, tmp_path
-):
-    """A gateway with ``gateway.managed_workers`` on builds an agent for every turn and
-    tells each the session is new. Every turn goes up as it ends, with the turn before
-    it as context. No agent sends the whole conversation again: each looks back ten
-    turns. Nothing is recorded of the session."""
+def test_agents_built_one_after_the_other_each_look_back_ten_turns(plugin, server, tmp_path):
+    """Hermes can build an agent for every turn of a session and tell each one that the
+    session is new: a managed worker gets ``resumed=False, message_count=0`` at every
+    turn (``s19_managed``). A worker's session is INERT today (the next test), so this
+    is the rule by itself, in a gateway session that is ACTIVE: every turn goes up as it
+    ends, with the turn before it as context, and no agent sends the whole conversation
+    again. Nothing is recorded of the session."""
     home = tmp_path / "hermes-a"
-    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    _store(home)
     for n in range(1, 15):
-        worker = _open(plugin, home, _PARENT, platform="tui", message_count=2 * (n - 1))
+        worker = gs._start_gateway(pl._new(plugin), home, resumed=False, message_count=0)
         before = len(server.posts())
-        _say(worker, _conversation(n), _PARENT)
+        _say(worker, _conversation(n), gs._LOCAL)
         users = [text for _, texts in _posted(server)[before:] for text in texts]
         # The turn that ended, the nine before it, and the one before those as context.
         assert users == _questions(max(1, n - _LOOKBACK), n)
     assert server.puts() == [] and not (home / "synapse" / "copied").exists()
+
+
+def test_a_managed_workers_session_is_inert(plugin, server, tmp_path):
+    """``gateway.managed_workers`` (off by default) runs each turn in a process of its
+    own, and Hermes hands that agent the chat's route, user and id but no ``chat_type``
+    (run at bca51750, ``s19_managed``; agent/managed_worker.py). The session does not
+    read as a local one: no board, no tools, no upload. These are the recorded
+    keywords."""
+    home = tmp_path / "hermes-a"
+    _store(home)
+    keywords = gs._gateway(resumed=False, message_count=0)
+    del keywords["chat_type"]
+    for n in range(1, 4):
+        worker = pl._new(plugin)
+        worker.initialize(gs._LOCAL, hermes_home=str(home), **keywords)
+        assert worker.system_prompt_block() == "" and worker.prefetch("x") == ""
+        assert "local sessions only" in worker.handle_tool_call("recall", {"query": "x"})
+        _say(worker, _conversation(n), gs._LOCAL)
+        worker.on_session_end(_conversation(n))
+        worker.shutdown()
+    assert server.seen == []
 
 
 def test_a_new_session_longer_than_the_look_back_sends_its_last_ten_turns(plugin, server, tmp_path):

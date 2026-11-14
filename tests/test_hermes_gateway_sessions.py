@@ -231,6 +231,8 @@ def test_the_owners_local_shapes_pass_the_keywords(kwargs):
         ({"platform": "discord", "chat_id": "1", "chat_type": "group", "user_id": "9"}, "platform"),
         ({"platform": "cli", "chat_id": "123"}, "not a local session"),
         ({"platform": "acp"}, "ACP session with no gateway identity"),
+        # A managed worker's agent (trace s19_managed): no chat_type.
+        ({k: v for k, v in _gateway().items() if k != "chat_type"}, "not a local session"),
         (_in_process(platform="acp"), "ACP session with no gateway identity"),
     ],
 )

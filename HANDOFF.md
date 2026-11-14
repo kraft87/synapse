@@ -15,8 +15,7 @@ two, and everything that is still open.
   It was built for the fork of the ACP adapter's own session manager. `hermes acp` does
   not run that manager: it runs its sessions in the gateway, where a fork is a branch
   that names its original. And the guessing kept ordinary turns from being uploaded: a
-  chat whose first message got no reply, a first turn whose upload never ran, and, with
-  `gateway.managed_workers` on, every steered or folded turn and every turn's context.
+  chat whose first message got no reply, and a first turn whose upload never ran.
 - **Two rules stand in its place.**
   1. An ACP session with no gateway identity gets nothing from Synapse, as a
      chat-platform session does. That is the adapter's own session manager. Its forks
@@ -37,8 +36,6 @@ two, and everything that is still open.
   the last ten. Before, a session Hermes called new sent them all. This needs a session
   none of whose uploads ran. The same limit holds after `synapse private off --forget`
   when the agent uploaded nothing for the session before it went private.
-- With `gateway.managed_workers` on, each turn's upload holds the ten turns before it
-  again. The server keeps one copy of a turn (span-id dedup).
 - `/private` typed in an ACP session outside the gateway is refused: that session
   uploads nothing.
 
@@ -64,6 +61,9 @@ two, and everything that is still open.
   stores its own turn only; one of a private session gets its row on the server and
   uploads nothing; one of a private session whose marker had lapsed asks the server
   first, and uploads nothing. `/private on` still works in an ACP session.
+- An independent review of the commit found no order of Hermes's hooks that uploads a
+  private session's turn under another id, and none that loses a turn beyond the cost
+  above.
 
 **Open**
 
@@ -78,8 +78,14 @@ two, and everything that is still open.
   copied turns, whatever the session they came from was. Unchanged.
 - The `copied/` path, with `messages.joined` and the look-back of 0, can go in the
   release after this one. Nothing prunes `settled/`, `copied/` or `inert/`.
-- Not run: `gateway.managed_workers` in a real gateway (replayed in tests from its
-  recorded keywords), and a real `hermes chat` or TUI client.
+- **With `gateway.managed_workers: true`, Synapse is off in every session.** Found in
+  this work, and not new in this version: Hermes runs each turn in a worker process and
+  hands its agent no `chat_type`, so the session does not read as a local one. Run at
+  bca51750 with the real plugin: three turns, no request at all. The setting is off by
+  default, and Hermes allows it only for a CLI session on a custom provider. The
+  README said until now that such turns were uploaded without context; that was read
+  from the source, not run, and wrong. Not decided: whether to accept such a session.
+- Not run: a real `hermes chat` or TUI client.
 
 ## 2026-11-14 — hermes: `/private` takes the session it is typed in off the record (plugin 0.24.15)
 
