@@ -10,7 +10,8 @@ everything. This script makes the stored text agree with what the prompt now wri
 
 Which "user" is the owner is a judgement, so a model makes it; the edit itself is not. Each
 "user" word in a fact (``TOKEN``: "User", "the user", "user's", any case, never part of a
-longer word such as "users", "user_id" or "end-user") is numbered, a classifier names the
+longer word such as "users", "user_id" or "end-user", never "a user" or "user input") is
+numbered, a classifier names the
 numbers that mean the memory's owner, and the script swaps exactly those for the owner's
 name ("the user's" -> "<name>'s"). No other character of a fact can change. Each fact is
 classified twice, among different neighbours, and a word is renamed only when both passes
@@ -89,6 +90,16 @@ FACT_CHARS = 1000
 # "USER.md", "@user", "end-user", "user-facing"); a sentence-final "user." still counts.
 TOKEN = re.compile(r"(?<![\w\-/.@])(?:the\s+)?user(?:['\u2019]s)?(?![\w\-/]|\.\w)", re.IGNORECASE)
 
+# Two places where the word is never the owner, whatever the classifier says, so it is not
+# numbered at all. After an indefinite determiner it is some user, and a name cannot stand
+# there ("a user's token", "each user"). Before one of these nouns, without a possessive,
+# it names a part of a conversation or a system ("user turn", "the user account").
+SOME_USER = re.compile(r"\b(?:a|an|any|each|every|another|one|no|some)\s+$", re.IGNORECASE)
+USER_THING = re.compile(
+    r"\s+(?:turns?|messages?|prompts?|inputs?|agents?|accounts?|ids?|roles?|tokens?|interface)\b",
+    re.IGNORECASE,
+)
+
 PROMPT = """A personal AI memory stores one-sentence facts extracted from the conversations \
 between ONE person, the memory's owner, and their assistant. The owner's name is {owner}. \
 Older facts call the owner "User", "the user" or "user" in place of the name. Each line below \
@@ -135,8 +146,16 @@ class OwnerMarksReply(BaseModel):
 
 
 def marks(fact: str) -> list[re.Match[str]]:
-    """The "user" words of ``fact``, in order."""
-    return list(TOKEN.finditer(fact))
+    """The "user" words of ``fact`` that could mean the owner, in order."""
+    out = []
+    for m in TOKEN.finditer(fact):
+        possessive = m.group(0)[-2:].lower() in ("'s", "\u2019s")
+        if SOME_USER.search(fact, 0, m.start()) or (
+            not possessive and USER_THING.match(fact, m.end())
+        ):
+            continue
+        out.append(m)
+    return out
 
 
 def marked(fact: str) -> str:

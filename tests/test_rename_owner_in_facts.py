@@ -41,6 +41,14 @@ _SPEC.loader.exec_module(ro)
         ("end-user docs and user-facing text", []),
         ("@user mentions and /home/user/ paths", []),
         ("UserPromptSubmit hook fires per prompt", []),
+        # Some user, not this one: a name cannot follow an indefinite determiner.
+        ("a user's token is checked and each user sees one user at a time", []),
+        ("No user is shown another user's notes", []),
+        # A part of a conversation or a system, unless it is somebody's.
+        ("the user turn, a User Message, user input and the user account", []),
+        ("the default urllib user agent and the user ID", []),
+        ("User's account was locked and the user's role changed", ["User's", "the user's"]),
+        ("per user request, the user data stays", ["user", "the user"]),
     ],
 )
 def test_which_words_are_marked(fact: str, words: list[str]) -> None:
@@ -96,11 +104,11 @@ def test_classify_batch_maps_line_numbers_back_to_facts(monkeypatch) -> None:
         return _reply((1, [1]), (2, []))
 
     monkeypatch.setattr(ro, "structured_call", fake)
-    rows = _rows("User owns a car", "a user who signs in sees the banner")
+    rows = _rows("User owns a car", "the user who signs in sees the banner")
     assert ro.classify_batch(object(), rows, owner="Sam", model="m") == {"u1": [1], "u2": []}
     assert "The owner's name is Sam." in seen[0]
     assert "1|[[1: User]] owns a car" in seen[0]
-    assert "2|a [[1: user]] who signs in sees the banner" in seen[0]
+    assert "2|[[1: the user]] who signs in sees the banner" in seen[0]
 
 
 def test_a_reply_that_skips_a_line_is_split_until_each_fact_answers(monkeypatch) -> None:
