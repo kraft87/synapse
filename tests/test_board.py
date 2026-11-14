@@ -465,6 +465,41 @@ def test_route_auth_and_project_param(conn, db_url):
         assert "Alpha project state" in r2.json()["text"]
 
 
+def test_route_serves_the_preferences_block_with_the_board_when_asked(conn, db_url):
+    """One request for a session start: the board and the preferences, both rendered
+    here. A client from before ``?parts=`` asks for neither by name and gets the board."""
+    _wipe(conn)
+    conn.execute("DELETE FROM preferences WHERE owner_id = %s", (_OWNER,))
+    db = Database(db_url)
+    _note(db, type="feedback", hook="User prefers the proper fix")
+    db.insert_preference(
+        owner_id=_OWNER,
+        project=None,
+        pref="User wants short answers",
+        polarity="rule",
+        embedding=None,
+        embed_model=None,
+        source_ref="ep:1",
+    )
+    db.close()
+    h = {"Authorization": f"Bearer {_TOKEN}"}
+    with _client(db_url, resolve_trust=_full_trust) as client:
+        old = client.get("/context", headers=h).json()
+        both = client.get("/context?parts=board,preferences", headers=h).json()
+        prefs = client.get("/context?parts=preferences", headers=h).json()
+    assert "preferences" not in old and "User prefers the proper fix" in old["text"]
+    assert both["text"] == old["text"] and "note_ids" not in both
+    assert both["preferences"] == "[Synapse preferences]\n  - (rule) User wants short answers"
+    assert prefs == {"status": "ok", "trust": "full", "preferences": both["preferences"]}
+
+    # A caller the server cannot place is served no preference, as on /preferences/top.
+    with _client(db_url) as client:
+        unknown = client.get("/context?parts=board,preferences", headers=h).json()
+    assert unknown["trust"] == "restricted" and unknown["preferences"] == ""
+    conn.execute("DELETE FROM preferences WHERE owner_id = %s", (_OWNER,))
+    _wipe(conn)
+
+
 def test_route_records_board_telemetry(conn, db_url):
     from mcp_server.recall import Recall
 

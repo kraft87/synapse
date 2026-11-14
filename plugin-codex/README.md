@@ -35,8 +35,8 @@ It differs where Codex works differently:
 - **One session-start hook, with a deadline.** Codex runs each hook entry as its own
   process and asks you to trust each one, so one script does the work of the Claude
   plugin's several SessionStart hooks. Codex kills it at 20 s. The board and preferences
-  are fetched side by side (each request at most 10 s) while the skills sync runs, and 15 s
-  after the hook starts it prints whatever has arrived.
+  are one request (at most 10 s), made while the skills sync runs, and 15 s after the hook
+  starts it prints whatever has arrived.
 - **The upload warning is also a Codex warning** (`systemMessage`), not only a line in the
   model's context.
 - **Tool names.** The prompt directive names the tools as `synapse recall` and

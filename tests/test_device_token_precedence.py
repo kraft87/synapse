@@ -248,12 +248,12 @@ def test_the_notice_survives_a_disabled_board_and_a_down_server(monkeypatch, tmp
         monkeypatch,
         tmp_path,
         record=_record(),
-        env={"SYNAPSE_INGEST_TOKEN": _STALE, "SYNAPSE_BOARD": "0"},
+        env={"SYNAPSE_INGEST_TOKEN": _STALE, "SYNAPSE_BOARD": "0", "SYNAPSE_PREFS_BLOCK": "0"},
     )
     hook = _load("board_block")
     seen = fake_urlopen(monkeypatch, {"status": "ok", "text": "BOARD"})
     hook.main()
-    assert seen == []  # board disabled: no request
+    assert seen == []  # the board and the preferences disabled: no request
     out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert out.startswith("[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored")
 

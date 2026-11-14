@@ -27,7 +27,13 @@ except Exception:  # pragma: no cover - environment dependent
 import ingestion.preferences_gate as pg  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from ingestion.db_connection import _EMBED_DIMS, _vector_literal  # noqa: E402
-from mcp_server.preferences_routes import _OWNER, _top_preferences  # noqa: E402
+from ingestion.surfaces import FULL_TRUST, UNKNOWN_SURFACE, SurfaceTrust  # noqa: E402
+from mcp_server.preferences_routes import (  # noqa: E402
+    _OWNER,
+    BLOCK_LINES,
+    _top_preferences,
+    top_block,
+)
 from tests.helpers.embed import onehot  # noqa: E402
 
 
@@ -165,6 +171,54 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     assert top["polarity"] == "rule" and top["assert_count"] == 2
     assert top["since"] and len(top["since"]) == 10  # YYYY-MM-DD
     db.close()
+    _wipe(conn)
+
+
+def _prefer(db, slot, pref, polarity="rule", project=None):
+    return db.insert_preference(
+        owner_id=_OWNER,
+        project=project,
+        pref=pref,
+        polarity=polarity,
+        embedding=onehot(slot),
+        embed_model="test",
+        source_ref=f"ep:{slot}",
+    )
+
+
+def test_the_block_served_with_the_board_is_scoped_like_the_route(conn, db_url):
+    """``GET /context?parts=preferences`` renders these rows on the server (top_block):
+    the same rows, for the same caller, as ``/preferences/top``."""
+    _wipe(conn)
+    db = Database(db_url)
+    _prefer(db, 10, "User wants short answers", "rule")
+    _prefer(db, 11, "User likes tabs in Go", "like", "alpha")
+    _prefer(db, 12, "User dislikes mocks", "dislike", "beta")
+    db.close()
+
+    header, *lines = top_block(db_url, FULL_TRUST).splitlines()
+    assert header == "[Synapse preferences]"
+    assert sorted(lines) == [
+        "  - (dislikes) User dislikes mocks",
+        "  - (likes) User likes tabs in Go",
+        "  - (rule) User wants short answers",
+    ]
+    alpha = SurfaceTrust(trust="restricted", allowed_projects=("alpha",), known=True)
+    assert top_block(db_url, alpha) == "[Synapse preferences]\n  - (likes) User likes tabs in Go"
+    # Nothing to show is no block at all, header included.
+    assert top_block(db_url, UNKNOWN_SURFACE) == ""
+    _wipe(conn)
+
+
+def test_the_block_holds_the_strongest_few(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    ids = [_prefer(db, 20 + n, f"User rule number {n}") for n in range(BLOCK_LINES + 2)]
+    db.reassert_preference(ids[-1])  # asserted twice: first, though it was stored last
+    db.close()
+    header, *lines = top_block(db_url, FULL_TRUST).splitlines()
+    assert header == "[Synapse preferences]" and len(lines) == BLOCK_LINES
+    assert lines[0] == f"  - (rule) User rule number {BLOCK_LINES + 1}"
     _wipe(conn)
 
 

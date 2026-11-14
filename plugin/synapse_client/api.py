@@ -42,15 +42,25 @@ class Client:
             token_origins=(settings.ingest_url,),
         )
 
-    def context(self, project: str | None = None, timeout: float = 10) -> dict[str, Any]:
-        """``GET /context``: the rendered board for ``project`` (``status``, ``text``,
-        ``trust``, ...). Raises; a 401 is how an unenrolled machine is told no."""
+    def context(
+        self, project: str | None = None, timeout: float = 10, *, parts: Iterable[str] = ()
+    ) -> dict[str, Any]:
+        """``GET /context``: what the server renders for a session start (``status``,
+        ``trust``, and a key for each part). ``parts`` names the parts wanted: ``board``
+        (``text``, the board for ``project``) and ``preferences`` (the preferences
+        block); none asks for the board alone. A server from before ``parts`` answers
+        with the board whatever is asked. Raises; a 401 is how an unenrolled machine is
+        told no."""
         params = {"project": project} if project else {}
+        wanted = ",".join(parts)
+        if wanted:
+            params["parts"] = wanted
         return _object(self.transport.get_json("/context", params, timeout=timeout), "/context")
 
-    def preferences(self, limit: int = 8, timeout: float = 10) -> list[dict[str, Any]]:
+    def preferences(self, limit: int = 7, timeout: float = 10) -> list[dict[str, Any]]:
         """``GET /preferences/top``: the top preference items (``pref``, ``polarity``,
-        ...), ``[]`` when the server has none. Raises."""
+        ...), ``[]`` when the server has none. For a server from before ``/context``
+        carried the preferences block. Raises."""
         reply = _object(
             self.transport.get_json("/preferences/top", {"limit": limit}, timeout=timeout),
             "/preferences/top",

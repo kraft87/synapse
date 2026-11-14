@@ -1738,9 +1738,9 @@ def test_sync_skills_stays_off_unless_opted_in(hook, monkeypatch):
 def test_session_start_main_syncs_the_sessions_cwd(hook, monkeypatch, tmp_path, payload, expected):
     seen = []
     monkeypatch.setattr(hook, "_sync_skills", lambda cwd=None: seen.append(cwd))
-    for name in ("_upload_warning", "_prefs_text", "token_override_notice"):
+    for name in ("_upload_warning", "token_override_notice"):
         monkeypatch.setattr(hook, name, lambda: None)
-    monkeypatch.setattr(hook, "_board_text", lambda project: None)
+    monkeypatch.setattr(hook, "_served", lambda project: ("", ""))
     monkeypatch.setattr(hook, "_spawn_catchup", lambda skip="": None)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
