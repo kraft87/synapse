@@ -36,7 +36,6 @@ PRIVATE = "private"  # refused, nothing sent or queued: its session is in privat
 #: What ``Uploader.settle`` answers besides PRIVATE.
 OPEN = "open"  # the session is on the record: it may be uploaded
 WAITING = "waiting"  # the server has not said whether a session it continues is private
-TAKEN = "taken"  # the server's answer has just made the session private
 
 Log = Callable[[str], None]
 
@@ -82,14 +81,13 @@ class Uploader:
         """Say ``line`` where a loss is said (``warn``)."""
         self._say(line, self._warn)
 
-    def _held(self, session_id: str, *, asking: bool = True) -> bool:
-        """Whether this uploader holds ``session_id`` itself; with ``asking`` False,
-        only as a session known to be private."""
+    def _held(self, session_id: str) -> bool:
+        """Whether this uploader holds ``session_id`` itself."""
         with self._holding:
             return (
                 session_id in self._unmarked
                 or session_id in self._owed
-                or (asking and session_id in self._asking)
+                or session_id in self._asking
             )
 
     def _holds(self, sessions: Iterable[str]) -> bool:
@@ -107,14 +105,6 @@ class Uploader:
         continues is private (``carry_private``)."""
         with self._holding:
             return session_id in self._asking
-
-    def private_here(self, session_id: str) -> bool:
-        """Whether ``session_id`` is known on this machine to be private: by its marker
-        (private.is_private), or held here as such by ``carry_private``. One held only
-        until the server has answered (``asking``) is not, by that alone."""
-        return self._held(session_id, asking=False) or private.is_private(
-            self.client.settings, session_id, self._log
-        )
 
     def _private_here(self, session_id: str, lines: list[str]) -> bool:
         """Whether ``session_id`` is known on this machine to be private: held here as
@@ -167,12 +157,11 @@ class Uploader:
         ``settled`` is called once the question is closed for ``session_id``: the server
         said no earlier id is private (it is called with False), or the session was
         made private here and the server has its own row (True). It is the caller's
-        note that the session need not be asked about again, and of how the question
-        ended: a session made private this way holds turns spoken off the record, also
-        once it is back on it. A session carried again while its question is open (the
-        server has not answered, or is still to be told) has each call's ``settled``
-        called. Not called when there was nothing to ask, nor for a session made
-        private here whose question closed before the call. Never raises."""
+        note that the session need not be asked about again: put back on the record
+        after that, it stays there, whole. A session carried again while its question
+        is open (the server has not answered, or is still to be told) has each call's
+        ``settled`` called. Not called when there was nothing to ask, nor for a session
+        made private here whose question closed before the call. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
         failed = ""
         lines: list[str] = []
@@ -302,29 +291,6 @@ class Uploader:
         not be told about is said to ``warn`` each time. Once the server has answered,
         every other session it is still to be told about is told too (``settle_owed``).
         Never raises."""
-        return self._settle(session_id, timeout)[0]
-
-    def settle(self, session_id: str, *, timeout: float = 5) -> str:
-        """Where ``session_id`` stands for an upload, once what is open for it has been
-        tried (``settle_private``): OPEN, it may be uploaded; WAITING, the server has not
-        said whether a session it continues is private; TAKEN, the server's answer has
-        just made it private, in this call; PRIVATE, it is private any other way (its
-        own marker, or held here). A session with nothing open costs no request. Never
-        raises."""
-        if not self.is_private(session_id):
-            return OPEN
-        if self._settle(session_id, timeout)[1]:
-            return TAKEN
-        with self._holding:
-            if session_id in self._asking:
-                return WAITING
-            held = session_id in self._unmarked or session_id in self._owed
-        marked = held or private.is_private(self.client.settings, session_id, self._log)
-        return PRIVATE if marked else OPEN
-
-    def _settle(self, session_id: str, timeout: float) -> tuple[bool, bool]:
-        """``settle_private``: its answer, and whether the server's answer made
-        ``session_id`` private here and now."""
         said = ""
         while not said:
             with self._holding:
@@ -334,7 +300,7 @@ class Uploader:
             try:
                 source = self._source(ids, timeout)
             except Exception:
-                return False, False
+                return False
             failed = ""
             with self._holding:
                 # Asked about more ids meanwhile (carry_private): those are next.
@@ -347,7 +313,20 @@ class Uploader:
                     self._asking.pop(session_id, None)
             if source:
                 said = self._carried(source, session_id, failed)
-        return self._finish(session_id, timeout, said), bool(said)
+        return self._finish(session_id, timeout, said)
+
+    def settle(self, session_id: str, *, timeout: float = 5) -> str:
+        """Where ``session_id`` stands for an upload, once what is open for it has been
+        tried (``settle_private``): OPEN, it may be uploaded; WAITING, the server has not
+        said whether a session it continues is private; PRIVATE, it is private (its own
+        marker, held here, or made so by the server's answer just now). A session with
+        nothing open costs no request. Never raises."""
+        if not self.is_private(session_id):
+            return OPEN
+        self.settle_private(session_id, timeout=timeout)
+        if self.asking(session_id):
+            return WAITING
+        return PRIVATE if self.is_private(session_id) else OPEN
 
     def _finish(self, session_id: str, timeout: float, said: str = "") -> bool:
         """Tell the server about ``session_id`` if it is still to be told, say how that

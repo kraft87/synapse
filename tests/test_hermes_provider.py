@@ -718,12 +718,13 @@ def test_a_server_down_at_the_switch_is_told_at_the_next_turn(plugin, server, tm
     _say(provider, _conversation(2))
     assert len(server.puts()) == told + 1
     # The server has the row now and the marker is gone: the session is as private as
-    # one `on` and then `off` were run for. The turn that began while the server was
-    # still owed the row began off the record. The next one is sent, alone, and the
-    # server drops it.
-    assert server.posts() == []
+    # one `on` and then `off` were run for. Nothing holds it back here any more, and
+    # the server drops what it is sent.
+    sent = [["question 1", "question 2"]]
+    assert [_users(body["records"]) for body in server.posts()] == sent
     _say(provider, _conversation(3))
-    assert [_users(body["records"]) for body in server.posts()] == [["question 3"]]
+    sent.append(["question 2", "question 3"])  # the turn, after the one before it
+    assert [_users(body["records"]) for body in server.posts()] == sent
     assert len(server.puts()) == told + 1  # told once: not asked again
 
 

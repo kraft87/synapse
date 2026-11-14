@@ -56,19 +56,17 @@ are remembered in memory only: the server dedups on span id, so a restart that r
 a turn costs a request, not a duplicate. A private session sends nothing: the core's
 uploader checks, here and again when the outbox drains.
 
-Private mode is kept per session id, and a conversation gets a new one when it is
-branched, or compressed with rotation on. The new session holds turns of the one it came
-from, so it is off the record when that one is (upload.Uploader.carry_private): by that
-one's marker, or, with no marker, by what the server answers when asked at the session's
-first upload, until when nothing is uploaded for it. That is settled once per session
-(carried.py): where the agent moves to the new id (``on_session_switch``), where Hermes
-builds a new agent for it (``initialize``, from the session store) and before the first
-upload under any other id (``_follow``, from the store too). ``/new`` and ``/resume``
-open another conversation: nothing is carried to it. Put back on the record (``synapse
-private off --forget``), such a session keeps the turns from before out, under any id it
-goes on with and in agents built for it later (carried.py's record), and uploads those
-an agent sees begin there (``on_turn_start``); so does one Hermes said was new, once its
-first turn start or upload shows it holds copies (an ACP fork: carried.noter records it).
+Private mode covers whole sessions and is kept per session id; a conversation gets a new
+id when it is branched, or compressed with rotation on. The new session holds turns of
+the one it came from, so it is off the record when that one is
+(upload.Uploader.carry_private): by that one's marker, or, with no marker, by what the
+server answers when asked at the session's first upload, until when nothing is uploaded
+for it. That is settled once per session (carried.py): at ``on_session_switch``, at
+``initialize`` (from the session store) and before the first upload under any other id
+(``_follow``). ``/new`` and ``/resume`` open another conversation: nothing is carried to
+it. Put back on the record (``synapse private off --forget``), a session is back whole.
+A session Hermes said was new that turns out to hold copies (an ACP fork) uploads only
+the turns an agent sees begin in it (``on_turn_start``), as does what goes on from it.
 
 Compression
 -----------
@@ -237,8 +235,9 @@ class SynapseMemoryProvider(MemoryProvider):
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
+        # Only an active session's verdict names the sessions it goes on from.
         earlier = carried.to_ask(home, verdict.continues)
-        private_too = mode == ACTIVE and carried.carry(uploader, home, earlier, session_id, None)
+        private_too = carried.carry(uploader, home, earlier, session_id, None)
         # A session first met at an upload is looked back at as a resumed one is.
         turns = TurnUploader(
             uploader,
@@ -248,8 +247,9 @@ class SynapseMemoryProvider(MemoryProvider):
             begins=True,
             copied=carried.noter(home, kwargs.get("message_count")),
         )
-        # Turns spoken off the record are not looked back at.
-        lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
+        lookback = LOOKBACK if kwargs.get("resumed") else None
+        if carried.copies(home, session_id, verdict.continues):
+            lookback = 0  # copies are not looked back at
         turns.start(str(session_id or ""), lookback, continues=verdict.continues)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
@@ -377,8 +377,8 @@ class SynapseMemoryProvider(MemoryProvider):
         return None
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
-        """Note the turn's model, and that a turn starts in the session Hermes named
-        last (``_begin``). A turn someone else wrote (sessions.foreign, from the
+        """Note the turn's model, and that a turn starts in the session this instance
+        is bound to (``_begin``). A turn someone else wrote (sessions.foreign, from the
         ``author_*`` keywords agent/turn_context.py passes) turns the instance INERT
         before its nudge and tools, as ``sync_turn`` does with ``turn_author``."""
         model = kwargs.get("model")
@@ -387,12 +387,12 @@ class SynapseMemoryProvider(MemoryProvider):
         author = kwargs.get("author_id"), kwargs.get("author_name"), kwargs.get("author_is_bot")
         if hs.foreign(self._owner_id, *author):
             self._authored()
-        self._begin(self._live.id, bool(kwargs.get("previous_message")))
+        self._begin(self._session_id, bool(kwargs.get("previous_message")))
 
     def _begin(self, session_id: str, earlier: bool) -> None:
-        """A turn starts in ``session_id`` (TurnUploader.begin): what the uploader goes
-        by to tell a new turn from one spoken off the record. ``earlier``: Hermes says
-        the conversation held a user message before this one. Never raises."""
+        """A turn starts in ``session_id``, the bound id, where a session said to be new
+        is counted until its first upload (TurnUploader.begin): how a new turn is told
+        from a copy. ``earlier``: a user message came before this one. Never raises."""
         turns = self._turns
         try:
             if turns is not None and self._mode == ACTIVE:
@@ -432,15 +432,16 @@ class SynapseMemoryProvider(MemoryProvider):
                 # The id left is the bound one and, after a move Hermes did not announce,
                 # the one its hooks named since.
                 earlier = [old, here, parent_session_id] if carries else []
-                private_too = carries and carried.carry(uploader, self._home, earlier, new, 5)
+                if carries:
+                    carried.carry(uploader, self._home, earlier, new, 5)
+                copies = carries and carried.copies(self._home, new, earlier)
             except Exception:
                 self._mode = INERT  # undecided is not on the record
                 raise
             with self._lock:
                 if reset or goes_on:
                     if self._turns is not None:
-                        # Turns spoken off the record are not looked back at.
-                        lookback = 0 if private_too else LOOKBACK
+                        lookback = 0 if copies else LOOKBACK  # copies: no look-back
                         self._turns.start(new or old, lookback, continues=earlier)
                     self._cut = None
                 elif kwargs.get("reason") == "compression":
@@ -551,13 +552,13 @@ class SynapseMemoryProvider(MemoryProvider):
         if known or uploader is None or turns is None:
             return
         if not continues:
-            if carried.carry(uploader, self._home, (), session_id, None):
+            if carried.copied(self._home, session_id):
                 turns.keep_out(session_id)  # recorded as holding copies: no look-back
             return
         earlier = carried.to_ask(self._home, continues)
-        private_too = carried.carry(uploader, self._home, earlier, session_id, None)
-        # Turns spoken off the record are not looked back at.
-        turns.start(session_id, 0 if private_too else LOOKBACK, continues=continues)
+        carried.carry(uploader, self._home, earlier, session_id, None)
+        copies = carried.copies(self._home, session_id, continues)  # no look-back
+        turns.start(session_id, 0 if copies else LOOKBACK, continues=continues)
         with self._lock:
             self._followed.add(session_id)
 

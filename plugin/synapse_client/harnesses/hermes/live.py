@@ -6,9 +6,8 @@ provider was built for or last switched to need not be the agent's: Hermes point
 agent at another session without a call when another holder's compression started one
 (agent/turn_facade_lease.py, agent/session_persistence.py). A flush under the old id
 would upload the new session's turns as the old one's, past the new one's private mode.
-So the provider notes each id a hook names, and a turn start goes by the last. So does
-a flush, when the provider can tell the turns are that session's (provider.py,
-``_upload``).
+So the provider notes each id a hook names, and a flush goes by the last, when the
+provider can tell the turns are that session's (provider.py, ``_upload``).
 
 Two kinds of hook name an id. ``initialize``, ``on_session_switch`` and ``prefetch`` run
 as the agent is in that session (``moved``). ``sync_turn`` runs on Hermes's background
@@ -19,7 +18,7 @@ said so.
 
 Still unseen: a move Hermes did not announce, until a hook names the new id. A flush
 that runs before then (the turn's prompt gave no prefetch, and its ``sync_turn`` is still
-queued) goes under the id from before, and a turn start is counted there.
+queued) goes under the id from before.
 """
 
 from __future__ import annotations
