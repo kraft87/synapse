@@ -292,7 +292,7 @@ _WORKER = textwrap.dedent(
     sys.path.append(sys.argv[1])
     from synapse_client.outbox import Outbox
 
-    box = Outbox(sys.argv[2])
+    box = Outbox(sys.argv[2], log=lambda line: print(line, file=sys.stderr, flush=True))
     log = sys.argv[3]
 
     def send(payload):
@@ -317,14 +317,17 @@ def test_concurrent_drains_deliver_each_payload_exactly_once(tmp_path):
     log.mkdir()
     procs = [
         subprocess.Popen(
-            [sys.executable, "-c", _WORKER, str(PLUGIN), str(box.directory), str(log), "go"]
+            [sys.executable, "-c", _WORKER, str(PLUGIN), str(box.directory), str(log), "go"],
+            stderr=subprocess.PIPE,
+            text=True,
         )
         for _ in range(4)
     ]
-    for proc in procs:
-        assert proc.wait(timeout=60) == 0
+    said = [proc.communicate(timeout=60)[1] for proc in procs]
+    assert [proc.returncode for proc in procs] == [0] * 4, said
     sent = [int(entry.name.split("-")[0]) for entry in log.iterdir()]
-    assert sorted(sent) == list(range(total))
+    left = sorted(os.listdir(box.directory))
+    assert sorted(sent) == list(range(total)), (said, left)
     assert box.pending() == 0
 
 
