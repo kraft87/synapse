@@ -10,6 +10,7 @@ SYNAPSE_HOME a temp dir.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import socket
@@ -183,11 +184,29 @@ def plugin(hermes_stub, user, tmp_path) -> Iterator[types.ModuleType]:
         sys.modules.pop("_hermes_user_memory_test", None)
 
 
-def _new(module: types.ModuleType) -> Any:
+def _new(module: types.ModuleType, *, waits: bool = True) -> Any:
+    """A provider. Its ``sync_turn`` hands the upload to a thread of its own and
+    returns (background.py). With ``waits``, the call here returns once that thread has
+    no upload left, so a test can look at what was sent right after it: the upload
+    still runs on the provider's thread. Without, ``sync_turn`` is the provider's own."""
     ctx = _Ctx()
     module.register(ctx)
     (provider,) = ctx.providers
+    if waits:
+        hand_over = provider.sync_turn
+
+        @functools.wraps(hand_over)
+        def sync_turn(*args: Any, **kwargs: Any) -> None:
+            hand_over(*args, **kwargs)
+            assert _uploaded(provider), "a turn upload did not finish"
+
+        provider.sync_turn = sync_turn
     return provider
+
+
+def _uploaded(provider: Any, seconds: float = 60.0) -> bool:
+    """Wait until the provider's thread has no turn upload left; whether that came."""
+    return provider._later.wait(seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +222,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, body: Any) -> None:
         data = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except OSError:
+            pass  # the client gave up on a slow answer (``delay``)
 
     def _record(self, body: Any = None) -> None:
         self.server.seen.append(
@@ -1099,7 +1121,10 @@ def test_availability_reads_config_only(plugin, user):
 
 
 def test_every_thread_goes_through_hermes():
-    source = (PLUGIN / "synapse_client" / "harnesses" / "hermes" / "provider.py").read_text(
-        encoding="utf-8"
-    )
-    assert "Thread(" not in source and "spawn_context_thread(" in source
+    """No module of the harness builds a thread itself: the provider passes Hermes's
+    ``spawn_context_thread`` to the one that runs its turn uploads (background.py)."""
+    folder = PLUGIN / "synapse_client" / "harnesses" / "hermes"
+    sources = {path.name: path.read_text(encoding="utf-8") for path in folder.glob("*.py")}
+    assert [name for name, source in sources.items() if "Thread(" in source] == []
+    assert "spawn_context_thread(" in sources["provider.py"]
+    assert 'Background(spawn_context_thread, "synapse-sync")' in sources["provider.py"]

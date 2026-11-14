@@ -65,6 +65,71 @@ Then take the new image. No client change: the board text is the server's.
   them apart covers new facts only.
 - The same sentence is not in the clients' own prompt nudges.
 
+## 2026-11-14 — hermes: a turn's upload runs after `sync_turn` has returned (plugin 0.24.14)
+
+**What changed**
+
+- **`sync_turn` made its requests inside the call.** Hermes's guide says the hook must
+  not block. Hermes runs it on one worker for each agent. That worker also runs the
+  agent's prefetches and the two hooks of `/new`, and Hermes takes a call past 30
+  seconds for a stuck one. One call asked the server about each session the turn's
+  session continues, sent a batch for each few turns and drained the outbox the home
+  shares. With six batches in the outbox and a server that took 6 seconds for a request,
+  one call ran 42 seconds.
+- **Now the hook hands the upload over and returns.** The provider has a thread of its
+  own (`background.py`, started through Hermes's `spawn_context_thread`). It runs one
+  upload at a time, in the order the turns ended, with the same upload code and the same
+  private-mode checks as before. It ends when no upload is left.
+- **The session a turn is for is settled in the hook.** Hermes can move the agent to
+  another session (`/new`) before a waiting upload is sent. The upload still goes under
+  the session its turn ended in, and private mode is checked for that session when the
+  upload runs.
+- **`shutdown` waits at most 5 seconds for the uploads handed over.** Hermes calls it as
+  it closes a session, after `on_session_end`.
+- **At most 16 uploads wait.** With a server that answers nothing, each upload takes its
+  whole timeout (20 seconds). One more turn is not queued: it goes up with the next
+  upload that runs.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.14. Nothing to migrate, nothing on the server.
+2. Restart Hermes where it is running (the gateway daemon, an open TUI or Desktop): a
+   running process keeps the plugin code it loaded.
+
+**Proven**
+
+- Tests: `tests/test_hermes_background_sync.py`. The hook is back before its request is
+  answered. Uploads keep the order of their turns. A backlog in the outbox does not keep
+  the hook. A turn handed over with no session id is not sent under the session the
+  agent went to since, with the old session on the record or private. Three of the new
+  rules were taken out in turn; the tests failed each time. Every other Hermes test
+  runs its uploads on the new thread too.
+- In real Hermes bca51750 (`tests/test_hermes_integration.py`, both plugin isolation
+  modes): with a server that takes 1.5 seconds to answer, Hermes's worker has run the
+  hook in under 1 second, and Hermes's own shutdown waits for the upload in flight.
+  Without the wait in `shutdown` that test fails in both modes.
+- In a real Hermes gateway and through real `hermes acp`, against a fake server: a
+  branch or fork of an open, a private and a lapsed-private session gives the same
+  uploads as 0.24.13 (the child of a private session uploads nothing). With six batches
+  queued and a server that takes 6 seconds a request, the next turn ran while the
+  backlog went up; all eight turns arrived and the outbox ended empty.
+
+**Still open**
+
+- An upload that waits in memory when the process is killed is not in the outbox. The
+  session's next agent sends its turns: a resumed session looks back ten turns.
+- An upload still running after the 5 seconds at close has its batch in the outbox. A
+  later drain sends it, not sooner than 60 seconds after its request began.
+- A turn not queued at the limit leaves the uploader's count of turn starts one too
+  high, as a sync that Hermes's gate skipped always did. That count is used only for a
+  session that holds copied turns.
+- Hermes's gate no longer sees a slow Synapse server, since the hook returns at once.
+  The limit of 16 waiting uploads is what bounds the work now.
+- The 0.24.10 notes say Hermes records no origin for an ACP fork. Run at Hermes bca51750
+  on 2026-11-14, a `hermes acp` fork is a recorded branch: its row names its parent.
+  The rules 0.24.10 added for forks with no recorded origin are still in the code.
+  Whether to remove them is not decided.
+
 ## 2026-11-13 — codex: a turn is uploaded with its model and cwd (plugin 0.24.13)
 
 **What changed**
