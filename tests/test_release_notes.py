@@ -633,7 +633,10 @@ def test_pr_changing_the_client_under_the_same_version_fails(repo, change):
     head = repo.commit(change)
     with pytest.raises(rn.ReleaseError, match=r"version is still 1\.0\.1: bump it") as err:
         rn.check_pr(repo.path, repo.server, head)
-    assert "next free: 1.0.2" in str(err.value) and next(iter(change)) in str(err.value)
+    said = str(err.value)
+    assert "Next free: 1.0.2 for a fix" in said and next(iter(change)) in said
+    # Both numbers are offered, each with what it is for: a patch is a choice.
+    assert "1.1.0 when the client gains something" in said
 
 
 @needs_git
@@ -655,7 +658,15 @@ def test_pr_taking_a_released_version_fails(repo):
     head = repo.commit({**_client("1.0.2"), "plugin/x.py": "x\n"})
     with pytest.raises(rn.ReleaseError, match=r"1\.0\.2 is already released") as err:
         rn.check_pr(repo.path, repo.server, head)
-    assert "next free: 1.0.3" in str(err.value)
+    assert "Next free: 1.0.3 for a fix" in str(err.value)
+    assert "1.1.0 when the client gains something" in str(err.value)
+
+
+@needs_git
+def test_the_minor_on_offer_skips_one_that_is_released(repo):
+    repo.git("tag", "v1.1.0", repo.v100)
+    assert rn.next_minor(repo.path, "1.0.1") == "1.2.0"
+    assert rn.next_free(repo.path, "1.0.1") == "1.0.2"
 
 
 @needs_git

@@ -6,6 +6,11 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+Which number a client change takes: the patch for a fix, a docs change or an internal
+change; the minor (`0.24.x` to `0.25.0`) when the client gains something a user can use or
+has to do differently, such as a new command, harness, platform or setting, or a changed
+default.
+
 ## 2026-11-14 — board: the server records what each session start was served (plugin 0.24.21)
 
 **What changed**
