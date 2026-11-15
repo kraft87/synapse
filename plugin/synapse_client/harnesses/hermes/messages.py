@@ -36,7 +36,10 @@ actually sent, with the memory context it injected, our own nudge included), not
   the row stays in the records to show that this reply answers something later than
   that turn (the core's ``messages.joined``). No user row is left out, whatever it
   holds. A picture is not such a row: it reads ``[screenshot]``, as in the store
-  (agent/session_persistence.py ``_durable_content``).
+  (agent/session_persistence.py ``_durable_content``), unless it has no text and a
+  message before it still waits for its reply (a run that failed): it is then an empty
+  ``synthetic`` row, as the released client sent it, so that message goes with the
+  reply.
 - A user row whose ``display_kind`` is one Hermes stamps on the row that opens a run it
   starts itself (_RUN_KINDS: a background task's report, a gateway event, an
   auto-continue, a hidden Desktop send, a skill run) is ``synthetic`` and ``begins``,
@@ -48,14 +51,12 @@ actually sent, with the memory context it injected, our own nudge included), not
 - A user row Hermes folded the next message into (agent/agent_runtime_helpers.py
   ``_merge_consecutive_users``: a marker, a note or a message that got no reply, then
   the next message, joined by a blank line, the first one's text kept as
-  ``_merged_turn_prefix``) is sent as the two rows it was (``_split``) when the first
-  holds something Hermes wrote (synthetic by its text, or a ``display_kind`` the store
-  holds for the row's uid or a row it absorbed before the message): the first part is
-  sent as an empty synthetic row under the row's own uid, its text left out (a marker,
-  a note, and a message that got no reply, which the importer does not store either),
-  and the user's message under the last uid Hermes noted it absorbed. A first part the
-  user wrote alone (a message that got no reply, then the message) keeps the row whole,
-  as one ask.
+  ``_merged_turn_prefix``) is sent as the two rows it was (``_split``) when the part in
+  front of the message is Hermes's alone (``_hermes_wrote``): that part as an empty
+  synthetic row under the row's own uid, its text left out, and the user's message under
+  the last uid Hermes noted it absorbed. Otherwise the row goes whole, as the released
+  client sent it: a message the user typed is never dropped where the released client
+  stored it (a marker's text then goes beside it).
   Any other row that holds more than one message (rows a compression merged, which
   leave only ``_absorbed_message_uids``) is sent as it is, followed by a ``synthetic``
   row with no text, which says so to the core: ``messages.joined`` cannot read it off
@@ -311,19 +312,20 @@ def _kind(message: Any, kinds: Mapping[str, str] | None) -> Any:
 
 
 def _hermes_wrote(head: Mapping[str, Any], row: Mapping[str, Any], kinds: Any) -> bool:
-    """Whether the part of a folded row in front of the message holds something Hermes
-    wrote: its text reads as Hermes's own, or the store holds a ``display_kind`` for the
-    row's uid or for a row it absorbed before the message (a marker or a note folded in
-    after a message that got no reply). The importer reads such rows as their own rows,
-    and a message that got no reply as a turn that never completed: neither is stored as
-    the user's words, and the live path agrees."""
-    record = _record(_kind(head, kinds))
+    """Whether the part of a folded row in front of the message is Hermes's alone: its
+    text reads as Hermes's own (the released client sent such a row as synthetic, the
+    message in it included, so splitting it loses nothing it stored), or the store holds
+    a ``display_kind`` for the row's uid and the row absorbed only the message (the
+    part in front is that one row). A part that may hold a message the user typed (a
+    longer fold whose text does not read as Hermes's) is not split: the row goes whole,
+    as the released client sent it."""
+    record = _record(head)
     if record is not None and record.get("synthetic"):
         return True
     absorbed = row.get("_absorbed_message_uids")
-    earlier = absorbed[:-1] if isinstance(absorbed, list) else []
-    uids = [row.get("message_uid"), *earlier]
-    return bool(kinds) and any(isinstance(u, str) and kinds.get(u) for u in uids)
+    alone = isinstance(absorbed, list) and len(absorbed) == 1
+    uid = row.get("message_uid")
+    return alone and bool(kinds) and isinstance(uid, str) and bool(kinds.get(uid))
 
 
 def _split(message: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
@@ -350,6 +352,20 @@ def _split(message: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
     return [head, rest]
 
 
+_PICTURE = re.compile(r"\[screenshot(?: detail=\w+)?\]")
+
+
+def _only_pictures(record: Record) -> bool:
+    """A real user row whose text is pictures only (``[screenshot]`` lines)."""
+    lines = str(record.get("content") or "").split("\n")
+    return (
+        record["role"] == "user"
+        and not record.get("synthetic")
+        and any(lines)
+        and all(_PICTURE.fullmatch(line) for line in lines)
+    )
+
+
 def to_records(
     messages: Iterable[Any] | None, kinds: Mapping[str, str] | None = None
 ) -> list[Record]:
@@ -358,10 +374,14 @@ def to_records(
     whose live dict has lost it (Hermes rebuilt the agent, or merged the row). Never
     modifies the messages, never raises over a malformed entry (it is skipped)."""
     records: list[Record] = []
+    asking = False  # a real user row is waiting for its reply
     for message in messages or ():
         parts = _split(message) if isinstance(message, Mapping) else None
-        if parts is not None and not _hermes_wrote(parts[0], message, kinds):
-            parts = None  # a message that got no reply: the two stay one turn's ask
+        if parts is not None and (asking or not _hermes_wrote(parts[0], message, kinds)):
+            # The row goes whole, as the released client sent it: the part in front may
+            # be the user's, or a message before it is still waiting for its reply (a
+            # run that failed), which the released client stored with this reply.
+            parts = None
         for index, one in enumerate(parts or (message,)):
             one = _kind(one, kinds)
             record = _record(one)
@@ -373,7 +393,18 @@ def to_records(
                 # empty, to say a message landed here.
                 record = {k: v for k, v in record.items() if k not in ("begins", "kind")}
                 record.update(content="", synthetic=True)
+            if asking and _only_pictures(record):
+                # A picture with no text after a message still waiting for its reply (a
+                # run that failed): the released client sent it as an empty synthetic
+                # row, so the message went with the reply to the picture. So here.
+                record = {**record, "content": "", "synthetic": True}
             records.append(record)
+            if record["role"] == "user" and not record.get("synthetic") and record["content"]:
+                asking = True
+            elif (
+                record["role"] == "assistant" and record["content"] and not record.get("tool_calls")
+            ):
+                asking = False
             if (
                 parts is None
                 and record["role"] == "user"

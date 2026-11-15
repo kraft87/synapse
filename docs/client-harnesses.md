@@ -447,8 +447,10 @@ rows sent, the keys of turns sent whole, one JSON file per session, changed unde
 client wrote is read and never rewritten; a damaged one is moved aside. It is read again
 at every upload, so an agent Hermes rebuilt mid-session and a second `on_session_end`
 send nothing again. A turn none of whose rows were shipped goes whole, with the turn
-before it as `[context]` when that one went whole too (a turn that went in parts may
-still have its last part in the outbox). A turn some of whose rows were shipped (a
+before it as `[context]`, as the released client sends it. Row ids are recorded only
+for a turn all of whose rows have uids; a turn sent before Hermes could write all its
+rows goes again once they have uids, as in the released client, and the server's
+content dedup keeps one copy. A turn some of whose rows were shipped (a
 background report and the reply to it, a reply to a picture, the rest of a run after a
 flush inside it) sends only the rows after the last of them; such a part, like a run
 Hermes started itself, goes at the head of a batch of its own with no context, led by a
@@ -457,14 +459,14 @@ one-line `[result]` label that names what it continues and its time. Spans stay
 ledger is written once a batch is delivered or queued in the outbox. A session the
 ledger does not know looks back ten complete turns; the turns before the window are
 noted as passed over (not looked at again here, still sent by `synapse import hermes`).
-`synapse private off --forget` clears the session's record (keeping the text keys of
-turns sent before Hermes could write their rows): a turn the server dropped while only
-its row kept the session private was recorded as shipped, and goes again. A running
-provider notices the cleared record at its next upload and sends every finished turn of
-the session again (the server's span dedup keeps one of each); no restart is needed. A
-reset (`on_session_switch` with `reset`) clears the session's record too, as the
-released client forgot what it had sent. A turn sent before Hermes could write its rows
-(keyed by its text) is not sent again once its rows have uids.
+`synapse private off --forget` clears the session's record: a turn the server dropped
+while only its row kept the session private was recorded as shipped, and goes again. A
+running provider notices the cleared record at its next upload and looks back ten
+complete turns, as after a restart (the server's span dedup keeps one of each); no
+restart is needed. Each clear causes one such look-back. A record that cannot be read
+changes nothing: what the provider remembers stays. A reset (`on_session_switch` with
+`reset`) clears the session's record too, as the released client forgot what it had
+sent.
 
 **What is uploaded.** The normaliser keeps only `role`, the text content, tool-call names
 and arguments (capped at 1000 characters), tool results (capped at 2000), `timestamp`
@@ -476,12 +478,12 @@ summaries (`_compressed_summary`). A user-role row Hermes wrote itself (a nudge,
 task-list snapshot, a `/steer` message, a marker, a control frame, a `/skill` scaffold)
 is sent marked `synthetic`, with its text, which the server skips. A row Hermes folded
 the next message into (`_merged_turn_prefix`: a marker or a note nobody answered, then
-the message) is sent as two rows when what was folded in front of the message holds
-something Hermes wrote (by its text, or a kind the store holds for the row or a row it
-absorbed): the folded part as an empty synthetic row, its text left out (a marker, a
-note, and a message that got no reply, which the importer does not store either), and
-the message under the last uid Hermes noted it absorbed. A message that got no reply,
-then a message, with nothing of Hermes's between, stays one ask. A row that opens a
+the message) is sent as two rows when the part in front of the message is Hermes's
+alone (its text reads as Hermes's, or the store holds a kind for the row and the row
+absorbed only the message) and no message before it waits for a reply: the folded part
+as an empty synthetic row, its text left out, and the message under the last uid Hermes
+noted it absorbed. Otherwise the row goes whole, as the released client sent it: a
+message the user typed is not dropped (a marker's text then goes beside it). A row that opens a
 run Hermes starts itself (`display_kind` `async_delegation_complete`,
 `process_complete`, `internal_notification`, `auto_continue`, `hidden`,
 `skill_invocation`) is synthetic too, sent with no text, and opens a turn of its own
@@ -517,16 +519,8 @@ to a session the row continues (a branch or compression clone keeps its uid) is 
 and is left out, as is a prompt's accept-time row the TUI wrote during a run
 (`display_metadata._queued_prompt`). The import plans against the provider's ledger: a
 row the provider or an earlier import shipped is not sent again, and what the import
-sends is written there. The stored rows are not scrubbed, so the import has Hermes scrub
-what it read with Hermes's own `_redact_messages_for_egress`, run by Hermes's
-interpreter (found beside the `hermes` program; `harnesses/hermes/scrub.py`). The child
-runs isolated (`-I`), in a new empty directory, with no `PYTHONPATH`, and names the
-file it took the scrub from; the answer is used only when that file belongs to the
-interpreter's own install. When that cannot run, nothing is sent unless
-`--no-hermes-scrub` is given. The summary before the confirmation and the last line of
-the run say whether secrets were masked by Hermes or sent as stored. Clients 0.24.19 to
-0.24.22 sent the stored text unscrubbed, leaving secrets to the server's own redaction
-at ingest.
+sends is written there. The import sends the stored text as it is; the server redacts
+the credentials it recognises at ingest.
 
 **Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
 spool (a `remember` call that fails is reported to the model, not queued), the

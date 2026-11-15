@@ -153,12 +153,12 @@ def _hash(records: Sequence[Record]) -> str:
     return "sha256:" + hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
-def content_key(turn: Sequence[Record]) -> str:
-    """A key for what ``turn`` says, without its ids and times: the same turn sent before
-    its rows had ids (Hermes could not write them yet) and read again once they have
-    them keys the same."""
-    real = [{k: v for k, v in r.items() if k not in ("id", "ts")} for r in _real(turn)]
-    return "text:" + _hash(real)
+def keyed(turn: Sequence[Record]) -> bool:
+    """Whether every record of ``turn`` that is not synthetic has an id: the harness
+    stored all its rows. A turn that is not keyed is cut and keyed as a whole, by
+    ``turn_key``, never shipped row by row."""
+    real = _real(turn)
+    return bool(real) and all(isinstance(r.get("id"), str) and r["id"] for r in real)
 
 
 def ids(records: Sequence[Record]) -> list[str]:
@@ -168,8 +168,10 @@ def ids(records: Sequence[Record]) -> list[str]:
 
 def unshipped(turn: Turn, shipped: Collection[str]) -> Turn | None:
     """What of ``turn`` is still to be shipped: all of it when none of its rows is in
-    ``shipped``; the rows after the last one that is, when they hold a record that is
-    not synthetic; None when nothing is left."""
+    ``shipped`` or it is not ``keyed``; the rows after the last one that is, when they
+    hold a record that is not synthetic; None when nothing is left."""
+    if not keyed(turn):
+        return turn  # not all its rows were stored: it goes whole, by its key
     last = -1
     for i, record in enumerate(turn):
         if record.get("id") in shipped:
@@ -191,9 +193,9 @@ def pending(
     before it (its context, or None). A turn is sent when its key is in ``sent``, or
     when its rows are in ``shipped`` (row ids): of a turn shipped in part, what is left
     (``unshipped``) is the turn here. A part that ``continues`` has no context. With
-    ``shipped``, a turn before is context only when it went whole (its key is in
-    ``sent``, or it goes whole here): a turn that went in parts may have its last part
-    still waiting in an outbox, and as context the server would store it whole. With
+    ``shipped``, a turn that went in parts is context only once its last part was
+    delivered (its key is then in ``sent``): until then that part may wait in an
+    outbox, and as context the server would store the turn whole. With
     ``lookback``, only the last ``lookback`` complete turns are considered."""
     done = [turn for turn in all_turns if complete(turn)]
     start = max(0, len(done) - lookback) if lookback is not None else 0
@@ -208,8 +210,13 @@ def pending(
         if part is done[i]:
             whole_here.add(i)
         before = done[i - 1] if i > 0 and not continues(part) else None
-        if before is not None and shipped and turn_key(before) not in sent:
-            before = before if i - 1 in whole_here else None
+        if (
+            before is not None
+            and turn_key(before) not in sent
+            and i - 1 not in whole_here
+            and any(uid in shipped for uid in ids(before))
+        ):
+            before = None  # its last part may still wait in an outbox
         out.append((before, part))
     return out
 

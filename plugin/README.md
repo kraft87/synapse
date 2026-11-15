@@ -329,12 +329,11 @@ arguments (first 1000 characters), tool results (first 2000) and timestamp. The 
 what Hermes hands its memory provider, which Hermes has scrubbed of secrets; each row is
 sent once, and what was sent is kept in `~/.synapse/shipped/hermes/` (one record per
 server). `synapse private off --forget` clears a session's record, and the running
-provider sends its turns again at its next upload. From Hermes's
+provider looks back ten turns again at its next upload. From Hermes's
 session store, `$HERMES_HOME/state.db`, read-only, the provider reads only how Hermes
 labelled each row and who started each turn. A reply you stopped while it came in is
 stored by Hermes as far as it got, and goes up with the next one. A background task's
 report is not sent, only the reply to it.
-Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its
 own bookkeeping fields. The first upload an agent makes for a session looks back ten

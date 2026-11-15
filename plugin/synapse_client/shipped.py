@@ -82,6 +82,9 @@ class Shipped(NamedTuple):
     #: How many times the record was cleared (``forget``): a process that read it before
     #: knows what it remembers is gone.
     cleared: int = 0
+    #: False when the record could not be read: what was shipped is unknown, and a
+    #: caller must change nothing it remembers.
+    readable: bool = True
 
 
 def _body(session_id: str, record: Shipped) -> bytes:
@@ -94,6 +97,11 @@ def _body(session_id: str, record: Shipped) -> bytes:
         "cleared": record.cleared,
     }
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def unreadable() -> Shipped:
+    """The record of a session that could not be read."""
+    return Shipped(frozenset(), frozenset(), False, readable=False)
 
 
 def nothing() -> Shipped:
@@ -127,9 +135,26 @@ class Ledger:
         name = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()[:40]
         return self.directory / f"{name}.json"
 
+    def _make_directory(self) -> None:
+        """The ledger's directory and the ones above it it creates, owner-only where
+        the platform has modes: a name derived from the server's URL and token is not
+        anyone else's business."""
+        missing = []
+        path = self.directory
+        while not path.exists() and path != path.parent:
+            missing.append(path)
+            path = path.parent
+        for one in reversed(missing):
+            try:
+                one.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            if os.name != "nt":
+                os.chmod(one, 0o700)
+
     def _open_lock(self, file: Path) -> IO[Any]:
         """``file``'s lock file, open and locked: ``_close_lock`` it."""
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self._make_directory()
         handle = open(file.with_name(file.name + ".lock"), "a+b")
         try:
             _lock(handle)
@@ -156,7 +181,7 @@ class Ledger:
             return nothing(), True
         except OSError as err:
             self._say(f"synapse: the shipped record of {session_id} could not be read ({err})")
-            return nothing(), False
+            return unreadable(), False
         try:
             data = json.loads(raw.decode("utf-8"))
         except ValueError:
@@ -199,7 +224,7 @@ class Ledger:
                 self._close_lock(handle)
         except OSError as err:
             self._say(f"synapse: the shipped record of {session_id} could not be read ({err})")
-            return nothing()
+            return unreadable()
 
     def add(
         self,
@@ -216,6 +241,8 @@ class Ledger:
         handle = self._open_lock(file)
         try:
             now, writable = self._read(file, session_id)
+            if not now.readable:
+                raise OSError(f"the shipped record of {session_id} could not be read")
             merged = Shipped(
                 now.uids | _strings(uids),
                 now.keys | _strings(keys),
@@ -233,10 +260,9 @@ class Ledger:
     def forget(self, session_id: str) -> None:
         """Forget what was shipped for ``session_id``: ``synapse private off --forget``
         put it back on the record, and the turns the server dropped while it was private
-        must go again. Kept: the keys of turns sent by their text before Hermes could
-        write their rows (``messages.content_key``), so they are not sent once more under
-        the ids they got since. The record notes that it was cleared (``cleared``). RAISES
-        OSError when the record exists and cannot be written."""
+        must go again. The record stays, empty, and notes that it was cleared
+        (``cleared``), so a running provider knows. RAISES OSError when the record exists
+        and cannot be written."""
         if not session_id or not self.directory.is_dir():
             return
         file = self._file(session_id)
@@ -246,12 +272,9 @@ class Ledger:
         try:
             now, writable = self._read(file, session_id)
             if not writable:
-                return
-            kept = frozenset(k for k in now.keys if k.startswith("text:"))
-            self._write(
-                file,
-                _body(session_id, Shipped(frozenset(), kept, True, frozenset(), now.cleared + 1)),
-            )
+                raise OSError(f"the shipped record of {session_id} cannot be changed")
+            cleared = Shipped(frozenset(), frozenset(), True, frozenset(), now.cleared + 1)
+            self._write(file, _body(session_id, cleared))
         finally:
             self._close_lock(handle)
 
