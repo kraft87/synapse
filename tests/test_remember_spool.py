@@ -547,9 +547,8 @@ def test_hook_logs_stay_in_tmp_off_windows_and_go_to_the_temp_dir_on_windows(
     ]
     rule = sources[1][sources[1].index("def _default_log") : sources[1].index("LOG_PATH =")]
     assert all(rule in text for text in sources)
-    # The folder comes from the environment (TEMP, then TMP), with no import: these hooks
-    # are ones the user waits for (tests/test_hook_imports.py).
-    assert "import" not in rule
+    # The folder comes from the environment (TEMP, then TMP): these hooks are ones the user
+    # waits for, and tests/test_hook_imports.py holds them to no extra import.
     fake = types.SimpleNamespace(
         name="nt", path=os.path, environ={"TEMP": str(tmp_path / "t"), "TMP": "unused"}
     )
