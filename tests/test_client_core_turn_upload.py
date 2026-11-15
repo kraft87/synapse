@@ -408,13 +408,19 @@ def test_a_row_the_harness_adds_after_a_reply_may_have_begun_a_turn(tmp_path):
     assert _records(wire) == [_turn(3)]
 
 
-def test_a_reply_the_user_did_not_ask_for_goes_up_with_a_turn_of_the_sessions_own(tmp_path):
+def test_a_reply_the_user_did_not_ask_for_goes_up_alone_after_its_turn(tmp_path):
+    """The rows a turn gained after it was sent go up by themselves, once: the turn is
+    not sent again. They lead a batch of their own with a label and no context, so the
+    server files them as one episode of their own."""
     turns, wire = _turns(tmp_path)
     said = _turn(1) + _turn(2)
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     said = said + _goes_on(1, shown=True)
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
-    assert _records(wire)[1] == said  # turn 2 as it is now, after turn 1 as its context
+    label = {"role": "tool", "content": "more of the turn before", "name": "continued"}
+    assert _records(wire)[1] == [label, *_goes_on(1, shown=True)]
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert len(wire.posts) == 2
 
 
 # ---------------------------------------------------------------------------
