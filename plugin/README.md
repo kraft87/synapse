@@ -306,9 +306,8 @@ recall nudge each turn, the memory tools (`recall`, `recall_full_turns`, `fetch`
 `fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded.
 Chat-platform sessions (Telegram, Discord, Slack and the rest, through Hermes's gateway),
 the API server, the Bot Chat and Desktop Group Chats, cron jobs, side agents and subagents
-get no board, no nudge and no uploads. Hermes may still list the memory tools to the model
-there (it does on the API server), but a call returns "Synapse is enabled for local sessions
-only" and reads nothing; subagents get no Synapse tools at all. A session stops for good at the first turn another
+get no board, no nudge, no memory tools and no uploads. A call to a memory tool there
+returns "Synapse is enabled for local sessions only" and reads nothing. A session stops for good at the first turn another
 agent or person wrote: there, others talk to the agent, and they must not read your memory
 or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
 its branches stay off after a rename or a restart. To turn one back on, delete every file

@@ -20,8 +20,8 @@ Hermes lines it rests on):
 - INERT, everything else: every messaging platform, the API server, hosted rooms and
   peer agents, the Bot Chat, a Group Chat member, a cron job, a subagent or other fork,
   a side agent the daemon builds, a session created by someone else, one the store does
-  not know, and any shape not listed. Nothing is injected or uploaded and a tool call
-  returns a JSON error: someone else must not read the owner's memory through the
+  not know, and any shape not listed. Nothing is injected or uploaded, the model is
+  shown no tool (``get_tool_schemas``), and a tool call returns a JSON error: someone else must not read the owner's memory through the
   agent, nor have their messages stored as the owner's. The reason is logged once.
 
 The session's rows in the store are read again before the system prompt block, each
@@ -561,6 +561,15 @@ class SynapseMemoryProvider(MemoryProvider):
     # -- tools ---------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
+        """The Synapse tools. Hermes asks twice as it builds an agent (agent/agent_init.py
+        ``_init_memory``): as it registers the provider (MemoryManager.add_provider, which
+        routes the tool names), before ``initialize``, and after it, to show the tools to
+        the model (memory_manager_tools.inject_memory_provider_tools; tools/mcp_tool_agent.py
+        asks again when it rebuilds the list). Before ``initialize`` every tool is served,
+        so a call is routed here and refused. After it, a session where Synapse is off gets
+        none: the model, and the people in that chat, do not see them."""
+        if self._mode is not None and self._mode != ACTIVE:
+            return []
         try:
             return tools.schemas()
         except Exception:
