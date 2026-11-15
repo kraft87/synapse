@@ -69,9 +69,47 @@ def test_forget_removes_one_session(tmp_path: Path) -> None:
     assert led.load("b").uids == {"2"} and not led.load("missing").known
 
 
-def test_forget_keeps_text_keys_and_counts(tmp_path: Path) -> None:
+def test_forget_empties_the_record_and_counts(tmp_path: Path) -> None:
     led = Ledger(tmp_path)
-    led.add("a", ["u1"], ["k1", "text:abc"])
+    led.add("a", ["u1"], ["k1"])
     led.forget("a")
     got = led.load("a")
-    assert got.uids == frozenset() and got.keys == {"text:abc"} and got.cleared == 1
+    assert got.uids == frozenset() and got.keys == frozenset() and got.cleared == 1
+
+
+def test_a_record_that_cannot_be_read_is_unknown_not_cleared(tmp_path: Path) -> None:
+    """review-round5 probe15: a record that could not be read was taken for a cleared
+    one, and every hook sent the whole session again. It is unknown, unchanged."""
+    import os
+
+    if os.name == "nt" or os.geteuid() == 0:
+        return  # file modes do not stop this reader
+    led = Ledger(tmp_path / "led")
+    led.add("a", ["u1"])
+    file = led._file("a")
+    file.chmod(0o000)
+    try:
+        got = led.load("a")
+        assert not got.readable and not got.known
+        try:
+            led.add("a", ["u2"])
+            raise AssertionError("add must raise when the record cannot be read")
+        except OSError:
+            pass
+    finally:
+        file.chmod(0o600)
+
+
+def test_ledger_directories_are_owner_only(tmp_path: Path) -> None:
+    import os
+    import stat
+
+    led = Ledger(tmp_path / "shipped" / "hermes" / "key")
+    led.add("a", ["u1"])
+    if os.name != "nt":
+        for d in (
+            tmp_path / "shipped",
+            tmp_path / "shipped" / "hermes",
+            tmp_path / "shipped" / "hermes" / "key",
+        ):
+            assert stat.S_IMODE(d.stat().st_mode) == 0o700, d

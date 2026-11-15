@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import re
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,9 @@ from synapse_client.shipped import Ledger  # noqa: E402
 from synapse_client.turn_upload import TurnUploader  # noqa: E402
 from synapse_client.upload import Uploader  # noqa: E402
 
+from tests.helpers.released_0_24_22 import hermes_messages as released_hm  # noqa: E402
+from tests.helpers.released_0_24_22 import turn_upload as released_tu  # noqa: E402
+
 SEEDS = int(os.environ.get("SYNAPSE_FUZZ_SEEDS", "40"))
 MODEL = "[System: The active model for this chat has changed to gpt-x via provider y.]"
 NUDGE = "[System: Continue now. Execute the required tool calls.]"
@@ -61,7 +65,8 @@ EVENTS = [
     "turn", "tools", "report", "alike", "nudged", "marker", "note", "picture", "failed",
     "steer", "compact", "rebuild", "skip", "down", "flush", "queued", "rotate", "unwritten",
     "private", "secret", "written_later", "store_gone", "forget_live", "fold2", "queued2",
-    "report_first",
+    "report_first", "twin", "unanswered", "partial_later", "late_report", "rekey",
+    "clear_other",
 ]  # fmt: skip
 
 
@@ -130,8 +135,18 @@ class Run:
         self.alike = ""
         self.alike_uses = 0
         self.scrubbed: dict[str, str] = {}  # uid -> the text Hermes hands over for it
+        # Everything the provider saw, to play again through the released client.
+        self.trace: list[tuple[Any, ...]] = []
+        self.twins: list[str] = []  # the same words twice, two real turns
+        self.asked: list[str] = []  # a message that got no reply before a fold
+        # Turns sent before all their rows were written: the server keeps the first copy
+        # under a span the later, keyed copy does not match, so a look-back that starts
+        # right after one stores it again, in the released client as here (open).
+        self.late: list[str] = []
 
     def new_agent(self) -> TurnUploader:
+        if hasattr(self, "trace"):
+            self.trace.append(("restart",))
         uploader = Uploader(self.server, self.outbox)  # type: ignore[arg-type]
         return TurnUploader(
             uploader, client="hermes", source="hermes-sync", lookback=10, ledger=self.ledger
@@ -150,6 +165,7 @@ class Run:
     def sync(self, finished: bool = True) -> None:
         """A hook: the provider converts the list it was handed, with the store's kinds."""
         listed = [dict(m) for m in self.live]
+        self.trace.append(("sync", self.sid, [dict(m) for m in listed], finished, self.server.down))
         got = source.read(self.home, self.sid, listed)
         assert not got.mismatched, got.mismatched
         records = hm.to_records(listed, got.kinds)
@@ -311,6 +327,7 @@ class Run:
             )
         # (the run's own rows hold no secret: ``secret`` writes a whole run of its own)
         self.agent.start(child, 10)
+        self.trace.append(("start", child))
         self.both("assistant", final)
 
     def unwritten(self) -> None:
@@ -327,12 +344,15 @@ class Run:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("", encoding="utf-8")
         self.server.rows.add(self.sid)
+        self.trace += [("marker", self.sid, True), ("row", self.sid, True)]
         self.turn()
         self.sync()
         marker.unlink()
+        self.trace.append(("marker", self.sid, False))
         self.turn()
         self.sync()
         self.server.rows.discard(self.sid)
+        self.trace.append(("row", self.sid, False))
         self.ledger.forget(self.sid)  # what `synapse private off --forget` does here
         self.agent = self.new_agent()  # a restart
 
@@ -353,6 +373,7 @@ class Run:
         """Rows Hermes could not write at one hook get their uids by the next."""
         user, final = self.tok("USER"), self.tok("FINAL")
         self.must += [user, final]
+        self.late += [user, final]
         rows = [
             {"role": "user", "content": user, "timestamp": 1e9 + self.n},
             {"role": "assistant", "content": final, "timestamp": 1e9 + self.n + 1},
@@ -388,12 +409,15 @@ class Run:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("", encoding="utf-8")
         self.server.rows.add(self.sid)
+        self.trace += [("marker", self.sid, True), ("row", self.sid, True)]
         self.turn()
         self.sync()
         marker.unlink()
+        self.trace.append(("marker", self.sid, False))
         self.turn()
         self.sync()
         self.server.rows.discard(self.sid)
+        self.trace.append(("row", self.sid, False))
         self.ledger.forget(self.sid)
         self.turn()
 
@@ -448,50 +472,141 @@ class Run:
         self.live = [self.handed(m) for m in self.store.compact(self.sid, keep=2)]
         self.turn()
 
-    def play(self) -> None:
+    # -- review round 5 (followups/hermes-turn-cut/review-round5/fuzz5.py) -----------
+
+    def partial_later(self) -> None:
+        """The user row stored on time, the reply only by the next hook."""
+        user, final = self.tok("USER"), self.tok("FINAL")
+        self.must += [user, final]
+        self.late += [user, final]
+        self.both("user", user)
+        late = {"role": "assistant", "content": final, "timestamp": 1e9 + self.n}
+        self.live.append(late)
+        self.sync()
+        stored = self.store.add(self.sid, "assistant", final)
+        late["message_uid"], late["timestamp"] = stored["message_uid"], stored["timestamp"]
+        self.turn()
+
+    def twin(self) -> None:
+        """A turn sent before its rows were written, then the same words as a real turn."""
+        user, final = self.tok("USER"), self.tok("FINAL")
+        self.twins += [user, final]
+        self.late += [user, final]
+        rows = [
+            {"role": "user", "content": user, "timestamp": 1e9 + self.n},
+            {"role": "assistant", "content": final, "timestamp": 1e9 + self.n + 1},
+        ]
+        self.live += rows
+        self.sync()
+        for row in rows:
+            stored = self.store.add(self.sid, row["role"], row["content"])
+            row["message_uid"], row["timestamp"] = stored["message_uid"], stored["timestamp"]
+        self.turn()
+        self.sync()
+        self.both("user", user)
+        self.both("assistant", final)
+
+    def rekey(self) -> None:
+        """Another server (or token): a ledger of its own, and a new agent."""
+        self.ledger = Ledger(self.server.settings.home / "shipped" / "hermes" / f"key{self.n}")
+        self.n += 1
+        self.agent = self.new_agent()
+
+    def clear_other(self) -> None:
+        """Another process clears the record (``off --forget``) of a session on the record."""
+        self.sync()
+        Ledger(self.ledger.directory).forget(self.sid)
+        self.turn()
+
+    def unanswered(self) -> None:
+        """A message that got no reply, a ``/model`` marker, then a message, folded."""
+        lost, user, final = self.tok("ASKED"), self.tok("USER"), self.tok("FINAL")
+        self.must += [user, final]
+        self.asked.append(lost)
+        first = self.store.add(self.sid, "user", lost)
+        marker = self.store.add(self.sid, "user", MODEL, display_kind="model_switch")
+        message = self.store.add(self.sid, "user", user)
+        merged = dict(first)
+        merged["content"] = lost + "\n\n" + MODEL + "\n\n" + user
+        merged["_merged_turn_prefix"] = lost + "\n\n" + MODEL
+        merged["_absorbed_message_uids"] = [marker["message_uid"], message["message_uid"]]
+        self.live.append(merged)
+        self.both("assistant", final)
+
+    def late_report(self) -> None:
+        """A message that got no reply, then a report folded into it, then the reply."""
+        lost, text, final = self.tok("ASKED"), self.tok("LATEREPORT"), self.tok("FINAL")
+        self.must.append(final)
+        self.asked.append(lost)
+        first = self.store.add(self.sid, "user", lost)
+        body = f"[ASYNC DELEGATION COMPLETE]\n{text}"
+        report = self.store.add(self.sid, "user", body, display_kind="async_delegation_complete")
+        merged = dict(first)
+        merged["content"] = lost + "\n\n" + body
+        merged["_merged_turn_prefix"] = lost
+        merged["_absorbed_message_uids"] = [report["message_uid"]]
+        self.live.append(merged)
+        self.both("assistant", final)
+
+    def play(self, script: list[str] | None = None) -> None:
+        """A random conversation, or the events of ``script`` in order."""
         self.turn()
         self.sync()  # the session's first upload: nothing before it to look back past
         self.alike = self.tok("ALIKE")
-        for _ in range(self.rnd.randint(6, 26)):
-            event = self.rnd.choice(EVENTS)
-            if event == "compact":
-                self.compact()
-                continue
-            if event == "rebuild":
-                self.rebuild()
-                continue
-            if event == "skip":  # the run ends while no upload runs
-                self.turn()
-                continue
-            if event == "private":
-                self.private()
-            elif event == "down":
-                self.server.down = True
-                self.turn()
-                self.sync()
-                self.server.down = False
-                continue
-            elif event == "alike":
-                self.report(self.alike)
-                self.alike_uses += 1
-            elif event in ("turn", "tools"):
-                self.turn(tools=event == "tools")
-            else:
-                getattr(self, event)()
-            self.sync()
+        events = (
+            script
+            if script is not None
+            else [self.rnd.choice(EVENTS) for _ in range(self.rnd.randint(6, 26))]
+        )
+        for event in events:
+            self.step(event)
         self.turn()
         self.sync()
 
-    def problems(self) -> list[str]:
+    def step(self, event: str) -> None:
+        if event == "compact":
+            self.compact()
+            return
+        if event == "rebuild":
+            self.rebuild()
+            return
+        if event == "skip":  # the run ends while no upload runs
+            self.turn()
+            return
+        if event == "private":
+            self.private()
+        elif event == "down":
+            self.server.down = True
+            self.turn()
+            self.sync()
+            self.server.down = False
+            return
+        elif event == "alike":
+            self.report(self.alike)
+            self.alike_uses += 1
+        elif event == "rekey":
+            self.rekey()
+            return
+        elif event in ("turn", "tools"):
+            self.turn(tools=event == "tools")
+        else:
+            getattr(self, event)()
+        self.sync()
+
+    def problems(self, server: Server | None = None) -> list[str]:
+        """What ``server`` (the branch's by default) got wrong on this sequence."""
+        server = server or self.server
+
         def times(token: str) -> int:
             n = 0
-            for ep in self.server.episodes:
+            for ep in server.episodes:
                 lines = [ln for ln in ep.content.split("\n") if not ln.startswith("[context]")]
                 n += any(token in ln for ln in lines)
             return n
 
-        wire = "\n".join(self.server.wire)
+        wire = "\n".join(server.wire)
         out = [f"{t} stored {times(t)} times" for t in self.must if times(t) != 1]
+        out += [f"{t} (twin) stored {times(t)} times" for t in self.twins if times(t) != 2]
         if times(self.alike) != self.alike_uses:
             out.append(f"{self.alike}: {times(self.alike)} of {self.alike_uses} stored")
         out += [f"{t} stored {times(t)} times" for t in self.at_most if times(t) > 1]
@@ -499,11 +614,230 @@ class Run:
         return out
 
 
+def released(run: Run, tmp: Path) -> Server:
+    """The same sequence through the released client 0.24.22: its record conversion, cut
+    and uploader (an agent's memory of what it sent, a look-back of ten at each new
+    agent), the same Uploader, Outbox and server."""
+    server = Server(tmp)
+    outbox = Outbox(tmp / "outbox")
+
+    def agent() -> Any:
+        uploader = Uploader(server, outbox)  # type: ignore[arg-type]
+        return released_tu.TurnUploader(
+            uploader, client="hermes", source="hermes-sync", lookback=10
+        )
+
+    turns = agent()
+    for event in run.trace:
+        if event[0] == "restart":
+            turns = agent()
+        elif event[0] == "start":
+            turns.start(event[1], 10)
+        elif event[0] == "marker":
+            marker = Path(server.settings.private_dir) / event[1]
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            if event[2]:
+                marker.write_text("", encoding="utf-8")
+            elif marker.exists():
+                marker.unlink()
+        elif event[0] == "row":
+            (server.rows.add if event[2] else server.rows.discard)(event[1])
+        elif event[0] == "sync":
+            _, sid, listed, finished, down = event
+            server.down = down
+            turns.upload(released_hm.to_records(listed), sid, timeout=5, finished=finished)
+            if not down:
+                turns.uploader.drain(5)
+            server.down = False
+    return server
+
+
+def worse(run: Run, old: Server) -> list[str]:
+    """Where the branch stores less than the released client, or a text more often."""
+
+    def times(server: Server, token: str) -> int:
+        n = 0
+        for ep in server.episodes:
+            lines = [ln for ln in ep.content.split("\n") if not ln.startswith("[context]")]
+            n += any(token in ln for ln in lines)
+        return n
+
+    out = []
+    for token in dict.fromkeys([*run.must, *run.at_most, *run.asked, *run.twins, run.alike]):
+        new, was = times(run.server, token), times(old, token)
+        if was and not new:
+            out.append(f"{token}: released stored it {was} times, the branch never")
+        elif token in run.twins and not min(was, 2) <= new <= max(was, 2 + (token in run.late)):
+            out.append(f"{token}: released stored it {was} times, the branch {new}")
+        elif (
+            token not in run.twins
+            and token != run.alike
+            and new > max(was, 1 + (token in run.late))
+        ):
+            out.append(f"{token}: released stored it {was} times, the branch {new}")
+    return out
+
+
 @pytest.mark.parametrize("seed", range(SEEDS))
 def test_every_message_and_reply_is_stored_once(seed: int, tmp_path: Path) -> None:
-    run = Run(seed, tmp_path)
+    run = Run(seed, tmp_path / "branch")
     try:
         run.play()
     finally:
         run.store.close()
-    assert run.problems() == []
+    old = released(run, tmp_path / "released")
+    assert never_worse(run, old, late=True) == []
+    assert worse(run, old) == []
+    # What the branch gets wrong that the released client gets right on this sequence
+    # (where both get a text wrong, worse() has compared how often each stored it).
+    alike = {problem.split()[0] for problem in run.problems(old)}
+    assert [p for p in run.problems() if p.split()[0] not in alike and not _late(run, p)] == []
+
+
+def _late(run: Run, problem: str) -> bool:
+    """A turn sent before all its rows were written, stored twice (``Run.late``)."""
+    token = problem.split()[0]
+    return token in run.late and ("stored 2 times" in problem or "stored 3 times" in problem)
+
+
+_TEXT = re.compile(r"(?:USER|FINAL|ASKED)-\d+-\d+-text")
+
+
+def counts(server: Server) -> dict[str, int]:
+    """How many episodes hold each user text and final reply, context lines aside."""
+    out: dict[str, int] = {}
+    for ep in server.episodes:
+        lines = [ln for ln in ep.content.split("\n") if not ln.startswith("[context]")]
+        for token in set(_TEXT.findall("\n".join(lines))):
+            out[token] = out.get(token, 0) + 1
+    return out
+
+
+def never_worse(run: Run, old: Server, *, late: bool = False) -> list[str]:
+    """Every user text and final reply the released client stored, the branch stored, and
+    none more often than the released client (or once). ``late``: a turn sent before
+    all its rows were written may be stored once more (``Run.late``)."""
+    new, was = counts(run.server), counts(old)
+    out = [f"{t}: released {n}, branch 0" for t, n in was.items() if not new.get(t)]
+    for t, n in new.items():
+        limit = max(was.get(t, 0), 2 if t in run.twins else 1)
+        if late and t in run.late:
+            limit += 1
+        if n > limit:
+            out.append(f"{t}: released {was.get(t, 0)}, branch {n}")
+    return out
+
+
+# The sequences the review rounds reproduced (followups/hermes-turn-cut/review-round*/),
+# each played through the branch and through the released client 0.24.22.
+REVIEWED = {
+    "r1 queued prompt": ["queued", "turn"],
+    "r1 steer": ["steer", "tools"],
+    "r2 rebuild loses kinds": ["marker", "rebuild", "note", "turn"],
+    "r2 reports": ["report", "nudged", "report_first"],
+    "r2 picture": ["picture", "turn"],
+    "r3 compaction in place": ["tools", "compact", "turn", "compact"],
+    "r3 rotation in a run": ["rotate", "turn"],
+    "r3 failed run": ["failed", "turn"],
+    "r3 outbox": ["down", "down", "flush", "turn"],
+    "r3 secret": ["secret", "turn"],
+    "r4 written later": ["written_later", "turn"],
+    "r4 store gone": ["store_gone", "turn", "store_gone"],
+    "r4 forget live": ["forget_live", "turn"],
+    "r4 fold with a note": ["fold2", "marker"],
+    "r4 two queued": ["queued2", "turn"],
+    "r4 unwritten": ["unwritten", "turn"],
+    "r5 twin": ["twin", "turn"],
+    "r5 reply written a hook late": ["partial_later", "turn"],
+    "r5 private then written later": ["private", "written_later", "private"],
+    "r5 clears": ["clear_other", "clear_other", "down", "clear_other"],
+    "r5 unanswered": ["unanswered", "turn"],
+    "r5 late report": ["late_report"],
+    "r5 rekey": ["rekey", "turn", "rekey"],
+}
+
+
+@pytest.mark.parametrize("name", sorted(REVIEWED))
+def test_never_worse_than_released(name: str, tmp_path: Path) -> None:
+    run = Run(0, tmp_path / "branch")
+    try:
+        run.play(REVIEWED[name])
+    finally:
+        run.store.close()
+    old = released(run, tmp_path / "released")
+    assert never_worse(run, old) == []
+    assert worse(run, old) == []
+    alike = {problem.split()[0] for problem in run.problems(old)}
+    assert [p for p in run.problems() if p.split()[0] not in alike] == []
+
+
+def _long(run: Run, turns: int) -> list[str]:
+    """``turns`` finished turns, uploaded; their user texts."""
+    first = len(run.must)
+    for _ in range(turns):
+        run.turn()
+        run.sync()
+    return [t for t in run.must[first:] if t.startswith("USER")]
+
+
+def test_a_clear_sends_one_look_back_and_no_more(tmp_path: Path) -> None:
+    """review-round5 probe15: after a clear every hook sent the whole session again
+    (302 kB each). One clear is one look-back of ten turns, like a restart of the
+    released client; the hooks after it send their own turn only."""
+    run = Run(0, tmp_path)
+    users = _long(run, 30)
+    Ledger(run.ledger.directory).forget(run.sid)
+    before = len(run.server.wire)
+    run.turn()
+    run.sync()
+    resent = [u for u in users if any(u in body for body in run.server.wire[before:])]
+    assert 0 < len(resent) <= 10
+    after = len(run.server.wire)
+    for _ in range(3):
+        run.turn()
+        run.sync()
+    assert not [u for u in users if any(u in body for body in run.server.wire[after:])]
+    assert never_worse(run, released(run, tmp_path / "released")) == []
+
+
+def test_a_clear_while_the_server_is_down_queues_one_copy(tmp_path: Path) -> None:
+    """review-round5 probe15: a clear while the server was down queued a full copy of
+    the session at every hook. The look-back is queued once."""
+    run = Run(0, tmp_path)
+    users = _long(run, 30)
+    Ledger(run.ledger.directory).forget(run.sid)
+    run.server.down = True
+    for _ in range(4):
+        run.turn()
+        run.sync()
+    run.server.down = False
+    queued = [
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in run.outbox.directory.rglob("*")
+        if p.is_file()
+    ]
+    for user in users:
+        assert sum(user in body for body in queued) <= 1, user
+    run.turn()
+    run.sync()
+    assert never_worse(run, released(run, tmp_path / "released")) == []
+
+
+def test_a_record_that_cannot_be_read_sends_nothing_again(tmp_path: Path) -> None:
+    """review-round5 probe15: an unreadable record was taken for a cleared one, and the
+    session went again at every hook. It changes nothing."""
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("file modes do not stop this reader")
+    run = Run(0, tmp_path)
+    users = _long(run, 12)
+    file = run.ledger._file(run.sid)
+    file.chmod(0o000)
+    try:
+        before = len(run.server.wire)
+        for _ in range(3):
+            run.turn()
+            run.sync()
+        # The last of them leads the next upload as its context.
+        assert not [u for u in users[:-1] if any(u in body for body in run.server.wire[before:])]
+    finally:
+        file.chmod(0o600)

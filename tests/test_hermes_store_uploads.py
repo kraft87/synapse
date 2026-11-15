@@ -138,9 +138,6 @@ def _import(home: Path) -> int:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    # Hermes's own scrub stands in as the identity (test_hermes_scrub.py runs the real one).
-    module.scrub.interpreter = lambda: "hermes-python"
-    module.scrub.rows = lambda sessions, python, home=None: sessions
     return module.main(["--hermes-home", str(home), "--yes"])
 
 
@@ -910,6 +907,34 @@ def test_turns_the_server_dropped_as_private_go_again_after_forget(chat, server,
         assert count(episodes, f"USERTOKEN-{n}") == 1, n
 
 
+def test_an_import_after_forget_brings_back_a_turn_sent_before_its_rows(chat, server, tmp_path):
+    """review-round5 probe18: a turn went before Hermes wrote its rows, while only the
+    server's row kept the session private, so the server dropped it; its rows were
+    written later. After ``off --forget`` an import stored nothing (the text key outlived
+    the clear). The import sends it, as the released importer (which kept no record)."""
+    from synapse_client.settings import Settings
+    from synapse_client.shipped import forget_everywhere
+
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    server.private_rows.add(chat.sid)
+    rows = [
+        {"role": "user", "content": "USERTOKEN-2 while the server drops"},
+        {"role": "assistant", "content": "FINALTOKEN-2"},
+    ]
+    before = len(server.posts())
+    chat.sync([*chat.live, *rows])
+    dropped = set(range(before, len(server.posts())))
+    for row in rows:
+        stored_row = chat.store.add(chat.sid, row["role"], row["content"])
+        row.update(message_uid=stored_row["message_uid"], timestamp=stored_row["timestamp"])
+    chat.live += rows
+    server.private_rows.discard(chat.sid)
+    forget_everywhere(Settings.load(), chat.sid)  # what `off --forget` does on this machine
+    chat.provider.shutdown()
+    assert _import(chat.home) == 0
+    assert count(stored(server, dropped), "USERTOKEN-2") == 1
+
+
 @pytest.mark.parametrize("reason", ["resume", "branch"])
 def test_a_recorded_copy_left_by_a_switch_posts_nothing(plugin, server, tmp_path, reason):
     """review-round3 finding 2 (probe3): a home a client 0.24.10 to 0.24.15 recorded as
@@ -1018,40 +1043,12 @@ def test_the_same_provider_notices_off_forget(chat, server, tmp_path):
         assert count(episodes, f"USERTOKEN-{n}") == 1, n
 
 
-def test_rows_written_after_one_hook_are_not_sent_again(chat, server):
-    """review-round4 fuzz ``written_later``: rows Hermes could not write at one hook go up
-    keyed by their text; written by the next flush they carry uids. After a cleared
-    record (``off --forget``) the same turn was sent again under its uids (two
-    episodes). The same turn read with ids counts as shipped (messages.content_key),
-    and ``forget`` keeps those text keys."""
-    from synapse_client.settings import Settings
-    from synapse_client.shipped import forget_everywhere
-
-    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
-    rows = [
-        {"role": "user", "content": "USERTOKEN-2 written later", "timestamp": 1.0},
-        {"role": "assistant", "content": "FINALTOKEN-2 written later", "timestamp": 2.0},
-    ]
-    chat.sync([*chat.live, *rows])
-    for row in rows:
-        done = chat.store.add(chat.sid, row["role"], row["content"])
-        row["message_uid"], row["timestamp"] = done["message_uid"], done["timestamp"]
-    chat.live += rows
-    chat.turn("USERTOKEN-3", "FINALTOKEN-3")
-    forget_everywhere(Settings.load(), chat.sid)
-    chat.turn("USERTOKEN-4", "FINALTOKEN-4")
-    rebuilt = chat.agent()
-    chat.live += chat.store.turn(chat.sid, "USERTOKEN-5", "FINALTOKEN-5")
-    chat.sync(provider=rebuilt)
-    episodes = stored(server)
-    for token in ("USERTOKEN-2", "FINALTOKEN-2", "USERTOKEN-3", "USERTOKEN-4", "USERTOKEN-5"):
-        assert count(episodes, token) == 1, token
-
-
-def test_an_unanswered_message_then_a_marker_then_a_message(chat, server):
-    """review-round4 probe7 ``unanswered then marker then message``: live stored the marker
-    text and the unanswered message as the user's words; the import stores only the
-    answered message. Live now agrees, and no marker text is stored."""
+def test_a_message_that_got_no_reply_before_a_marker_is_kept(chat, server):
+    """review-round5 probe16: U1 got no reply, ``/model`` wrote a marker, then U2 and a
+    reply. Hermes folds the three into one list row. Round 4 stored only U2; the
+    released client stored U1 (with the marker's text) and U2, and so does the branch
+    now: a message the user typed is never dropped. The importer stores only U2 for this
+    shape (open, DESIGN.md)."""
     chat.turn("USERTOKEN-first", "FINALTOKEN-first")
     sid, s = chat.sid, chat.store
     unanswered = s.add(sid, "user", "USERTOKEN-unanswered earlier message")
@@ -1067,11 +1064,7 @@ def test_an_unanswered_message_then_a_marker_then_a_message(chat, server):
     chat.sync([*chat.live, merged, reply])
     live = stored(server)
     assert count(live, "USERTOKEN-after switch") == 1
-    assert count(live, "USERTOKEN-unanswered") == 0
-    assert all("active model" not in ep.content for ep in live)
-    posted = len(server.posts())
-    assert _import(chat.home) == 0
-    assert len(server.posts()) == posted
+    assert count(live, "USERTOKEN-unanswered") == 1
 
 
 def test_a_note_folded_with_a_marker_never_goes_on_the_wire(chat, server):
@@ -1135,3 +1128,30 @@ def test_an_unreadable_store_says_the_admission_check_did_not_run(plugin, server
         r.getMessage() for r in caplog.records if "admission check could not run" in r.getMessage()
     ]
     assert len(said) == 1 and "turn_author check alone" in said[0]
+
+
+@pytest.mark.parametrize("name", ["hermes_handed_v0.23.1.json", "hermes_handed_main.json"])
+def test_the_live_path_sends_what_hermes_handed_over_not_the_store(plugin, server, tmp_path, name):
+    """review-round3 probe4: the live path sends what Hermes handed the provider, which
+    Hermes scrubbed of secrets; the store's rows are not scrubbed. The fixtures are one
+    run as Hermes v0.23.1 and main wrote it to the store (``raw``) and handed it over
+    (``handed``, their own ``_redact_messages_for_egress``)."""
+    data = json.loads((Path(__file__).resolve().parent / "fixtures" / name).read_text("utf-8"))
+    home = tmp_path / "hermes-a"
+    store = HermesStore(home)
+    store.session(SID)
+    for raw in data["raw"]:
+        store.add(
+            SID,
+            raw["role"],
+            raw["content"],
+            uid=raw["message_uid"],
+            tool_calls=raw.get("tool_calls"),
+            tool_name=raw.get("tool_name"),
+            tool_call_id=raw.get("tool_call_id"),
+        )
+    provider = _start(_new(plugin), home, SID, platform="tui")
+    provider.sync_turn("q", "a", session_id=SID, messages=data["handed"])
+    wire = json.dumps([b["records"] for b in server.posts()])
+    assert server.posts() and "SECRETTEST" in wire
+    assert not [s for s in (data["key"], data["gh"], "wJalrXUtnFEMI") if s in wire]
