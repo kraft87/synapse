@@ -47,6 +47,7 @@ _DB_FILES = {
     "test_web_artifacts.py",
     "test_web_enqueue.py",
     "test_backfill_web_chunks.py",
+    "test_ingest_research_brief_db.py",
     "test_contradiction.py",
     "test_extractor.py",
     "test_extraction_twins_db.py",

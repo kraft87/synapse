@@ -13,8 +13,14 @@ explicitly and wins over every other rule. Without it the row stays unlabelled, 
 a restricted surface is never served, until the poller's classifier labels it
 (ingestion/web_audience.py). Before 063 is applied the flag is accepted and ignored.
 
-Idempotent via tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE). Re-running with
-``--audience`` on an already-ingested brief updates its label.
+Keyed by tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE; the date is the file's
+mtime). A re-run with the same content is a no-op. A re-run with changed content (a
+corrected brief) updates the row and deletes its web_chunks in the same transaction, so
+the web-lane cron chunks, contextualizes and embeds the new text on its next run and no
+chunk of the old text stays served (extraction_queue rows of those chunks go with them,
+ON DELETE CASCADE). A changed brief also loses its audience label, which was decided on
+the old text: the poller's classifier labels it again, unless ``--audience`` is given.
+Re-running with ``--audience`` on an already-ingested brief updates its label.
 
 Usage:
     SYNAPSE_DB_URL=postgresql://... \
@@ -114,11 +120,33 @@ def main() -> int:
             ),
         )
         row = cur.fetchone()
+        status = "ingested"
+        artifact_id = row[0] if row else None
+        dropped_chunks = 0
+        audience_reset = False
+        if row is None:
+            artifact_id, dropped_chunks, audience_reset = update_if_changed(
+                conn,
+                tool_use_id,
+                content=content,
+                content_hash=content_hash,
+                title=title,
+                fetched_at=fetched_at,
+                keep_audience=args.audience is not None,
+            )
+            status = "updated" if artifact_id is not None else "unchanged"
         labelled = set_audience(conn, tool_use_id, args.audience) if args.audience else None
         conn.commit()
 
-    if row:
-        print(f"ingested research_brief id={row[0]} ({tool_use_id}, {len(content)} chars)")
+    if status == "ingested":
+        print(f"ingested research_brief id={artifact_id} ({tool_use_id}, {len(content)} chars)")
+    elif status == "updated":
+        print(
+            f"updated research_brief id={artifact_id} ({tool_use_id}, {len(content)} chars; "
+            f"content changed, {dropped_chunks} stale web_chunks deleted for re-chunking)"
+        )
+        if audience_reset:
+            print("audience label cleared: the poller's classifier labels the new text")
     else:
         print(f"already ingested ({tool_use_id}); no-op")
     if labelled is False:
@@ -130,6 +158,54 @@ def main() -> int:
     elif labelled:
         print(f"audience={args.audience}")
     return 0
+
+
+def update_if_changed(
+    conn: psycopg.Connection,
+    tool_use_id: str,
+    *,
+    content: str,
+    content_hash: str,
+    title: str,
+    fetched_at: datetime,
+    keep_audience: bool,
+) -> tuple[int | None, int, bool]:
+    """Replace a stored brief whose content differs from ``content``.
+
+    Returns (id, chunks deleted, audience cleared); id is None when the stored hash
+    already matches, and nothing is written. The brief's web_chunks are deleted in the
+    caller's transaction: the lane chunks only artifacts that have no chunks
+    (scripts/backfill_web_chunks.py), so this is what makes it re-process the row. New
+    chunks get new ids, so a contextualize or embed pass still holding the old ids
+    updates nothing. The audience label was decided on the old text, so it is cleared
+    for the poller's classifier, unless the caller sets one explicitly (``keep_audience``).
+    """
+    row = conn.execute(
+        """
+        UPDATE web_artifacts
+        SET content_markdown = %s, content_hash = %s, title = %s,
+            raw_chars = %s, fetched_at = %s
+        WHERE tool_use_id = %s AND content_hash IS DISTINCT FROM %s
+        RETURNING id
+        """,
+        (content, content_hash, title, len(content), fetched_at, tool_use_id, content_hash),
+    ).fetchone()
+    if row is None:
+        return None, 0, False
+    artifact_id = int(row[0])
+    dropped = conn.execute(
+        "DELETE FROM web_chunks WHERE web_artifact_id = %s", (artifact_id,)
+    ).rowcount
+    audience_reset = False
+    if not keep_audience and WEB_AUDIENCE_PROBE.ready(conn, "ingest-brief"):
+        audience_reset = (
+            conn.execute(
+                "UPDATE web_artifacts SET audience = NULL WHERE id = %s AND audience IS NOT NULL",
+                (artifact_id,),
+            ).rowcount
+            > 0
+        )
+    return artifact_id, dropped, audience_reset
 
 
 def set_audience(conn: psycopg.Connection, tool_use_id: str, audience: str) -> bool:
