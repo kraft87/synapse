@@ -35,6 +35,16 @@ needs a new version.
   client changed, v<new> already tagged               -> fail
   otherwise                     -> pass
 
+WHICH NUMBER MOVES is the author's call, by what the change is to someone using the
+client, and a failed check names both free numbers so the choice is made each time:
+
+  patch (0.24.7 -> 0.24.8)  a fix, a docs change, an internal change
+  minor (0.24.7 -> 0.25.0)  the client gains something a user can use or has to do
+                            differently: a new command, harness, platform or setting,
+                            or a changed default
+
+The check takes any version above the base's; it does not judge which of the two fits.
+
 Notes are every HANDOFF.md entry (a ``## `` heading and the lines under it) whose heading
 names ``plugin <version>``, heading included, in file order, cut to GitHub's body limit.
 With none, the notes say so and quote the commit subject.
@@ -245,6 +255,27 @@ def next_free(repo: Path, version: str) -> str:
             return candidate
 
 
+def next_minor(repo: Path, version: str) -> str:
+    """The first minor version above ``version`` with no tag, as ``MAJOR.MINOR.0``."""
+    major, minor, _patch = parse_version(version)
+    while True:
+        minor += 1
+        candidate = f"{major}.{minor}.0"
+        if tag_commit(repo, f"v{candidate}") is None:
+            return candidate
+
+
+def choices(repo: Path, version: str) -> str:
+    """The two free numbers above ``version`` and what each is for (the module docstring
+    has the rule). Both are named so a patch is a choice, not the only number on offer."""
+    return (
+        f"Next free: {next_free(repo, version)} for a fix, a docs change or an internal "
+        f"change; {next_minor(repo, version)} when the client gains something a user can "
+        "use or has to do differently (a new command, harness, platform or setting, or a "
+        "changed default)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Notes
 # ---------------------------------------------------------------------------
@@ -407,13 +438,13 @@ def check_pr(repo: Path, base_rev: str, head_rev: str) -> str:
         moved = f"is still {old}" if new == old else f"went from {old} down to {new}"
         raise ReleaseError(
             f"Client changed but the version {moved}: bump it in {MANIFEST} and "
-            f"{PACKAGE_INIT} (next free: {next_free(repo, old)}).\n{_listing(changed)}"
+            f"{PACKAGE_INIT}. {choices(repo, old)}\n{_listing(changed)}"
         )
     tagged = tag_commit(repo, f"v{new}")
     if tagged is not None:
         raise ReleaseError(
             f"Client {new} is already released (tag v{new} is {tagged[:12]}): pick a "
-            f"version above it (next free: {next_free(repo, new)}).\n{_listing(changed)}"
+            f"version above it. {choices(repo, new)}\n{_listing(changed)}"
         )
     return f"Client changed and its version goes {old} -> {new}; merging releases v{new}."
 

@@ -314,6 +314,7 @@ _EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8
 # flat-high (0.68-0.94 at full length) so an episode floor is a no-op, but facts are short and
 # fully scored, so off-topic ones genuinely score low. Costs ONE extra rerank of ~12 short facts
 # per recall(), ONLY when enabled. Keeps >=1 fact so a query can't lose its facts bucket.
+# The examples/env presets set 0.42 for rerank-3-lite.
 _RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
 
 # Abstention-floor SHADOW logging. An 84-run benchmark measured ZERO abstentions and ~30%

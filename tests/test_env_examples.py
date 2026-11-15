@@ -168,3 +168,17 @@ def test_slashed_model_ids_only_under_the_openai_provider(sample: Path):
         f"{sample.name}: OpenRouter-spelled model id under SYNAPSE_LLM_PROVIDER={provider!r}: "
         f"{slashed}. The Claude CLI wants its own dashed name and refuses this at startup."
     )
+
+
+@pytest.mark.parametrize("sample", _samples(), ids=lambda p: p.name)
+def test_every_sample_pins_the_fact_floor_for_its_reranker(sample: Path):
+    """The fact floor is on the reranker scale too. Without it every recall serves up to
+    _FACT_LIMIT facts whatever the question, so each preset carries the value for its
+    reranker."""
+    got = _assigned(sample).get("SYNAPSE_RECALL_FACT_FLOOR")
+    assert got is not None, f"{sample.name} does not set SYNAPSE_RECALL_FACT_FLOOR"
+    floor = float(got)
+    if _assigned(sample).get("SYNAPSE_RERANK_MODEL", "").startswith("BAAI/"):
+        assert floor == 0.0, "no calibrated fact floor exists for the bundled local reranker"
+    else:
+        assert 0.0 < floor < 1.0
