@@ -43,18 +43,27 @@ class Client:
         )
 
     def context(
-        self, project: str | None = None, timeout: float = 10, *, parts: Iterable[str] = ()
+        self,
+        project: str | None = None,
+        timeout: float = 10,
+        *,
+        parts: Iterable[str] = (),
+        session: str | None = None,
     ) -> dict[str, Any]:
         """``GET /context``: what the server renders for a session start (``status``,
         ``trust``, and a key for each part). ``parts`` names the parts wanted: ``board``
         (``text``, the board for ``project``) and ``preferences`` (the preferences
         block); none asks for the board alone. A server from before ``parts`` answers
-        with the board whatever is asked. Raises; a 401 is how an unenrolled machine is
-        told no."""
+        with the board whatever is asked. ``session`` is the id of the session the reply
+        is for: the server records which lines it served to it (schema 071), and a
+        server from before that ignores it. Raises; a 401 is how an unenrolled machine
+        is told no."""
         params = {"project": project} if project else {}
         wanted = ",".join(parts)
         if wanted:
             params["parts"] = wanted
+        if session:
+            params["session"] = session
         return _object(self.transport.get_json("/context", params, timeout=timeout), "/context")
 
     def preferences(self, limit: int = 7, timeout: float = 10) -> list[dict[str, Any]]:

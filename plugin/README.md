@@ -311,7 +311,8 @@ limits and the Hermes source behind them:
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
 with this machine's device token. At session start: one `GET /context` (the board and
-the preferences). Each tool call: one MCP `tools/call`. After each turn that ended with
+the preferences), with the project label and the session id (not for a private
+session), so the server can record which lines it served to the session. Each tool call: one MCP `tools/call`. After each turn that ended with
 a reply, not after one that failed or was cut short: a `POST /ingest` (format
 `messages`, client `hermes`) holding the session id, the project label and working
 directory, the model name, and per message its role, text, tool-call names and

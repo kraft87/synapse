@@ -454,6 +454,31 @@ def test_session_start_order_is_notice_warning_board_preferences(
     assert req["headers"]["user-agent"] == _user_agent()
 
 
+def test_session_start_names_its_session_to_the_server(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    """The payload's session id goes with the request, so the server records what this
+    session was served (schema 071); the printed block does not change."""
+    _enroll(scratch, server.url)
+    server.answer("/context", _SERVED)
+    hook = _start(monkeypatch, tmp_path)
+    payload = {"cwd": str(tmp_path), "session_id": "019a-codex-session"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+    text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
+    assert text == f"{_BOARD_TEXT}\n\n{_PREFS_TEXT}"
+    assert _asked(server) == [
+        (
+            "/context",
+            {
+                "project": tmp_path.name,
+                "parts": "board,preferences",
+                "session": "019a-codex-session",
+            },
+        )
+    ]
+
+
 def test_session_start_explains_a_machine_that_is_not_enrolled(
     scratch, monkeypatch, tmp_path, server, capsys
 ):

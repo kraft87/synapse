@@ -183,6 +183,22 @@ def _preferences(client: Client, reply: Mapping[str, Any], left: float) -> str:
     return preferences_block(client.preferences(limit=_PREFS_MAX_LINES, timeout=left))
 
 
+def session_served(settings: Settings, session_id: str | None) -> str | None:
+    """The session id to send with a ``/context`` request, or None: none given, or the
+    session is not shown to be on the record (``private.state`` is not OPEN). The server
+    records the ids it served under it, and records nothing for an id it holds as
+    private; the local marker keeps the id off the request too, for the time before the
+    server has that row. Never raises."""
+    if not session_id:
+        return None
+    try:
+        from . import private
+
+        return session_id if private.state(settings, session_id) == private.OPEN else None
+    except Exception:
+        return None
+
+
 def server_parts(
     client: Client,
     project: str | None,
@@ -192,9 +208,14 @@ def server_parts(
     login_hint: str = DEFAULT_LOGIN_HINT,
     not_enrolled: str | None = None,
     restricted: str | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """What the server renders for a session start, from ONE request: the board part
     and the preferences block.
+
+    ``session_id`` is the harness's id for the session the blocks are for, the id its
+    turns are uploaded under. It is sent so the server can record which lines it served
+    to that session (``session_served``); not for a session in private mode.
 
     The board part is the board for ``project``, or the reason this machine is served
     none: a 401 for an unenrolled machine becomes ``not_enrolled_block``, and a reply
@@ -220,7 +241,13 @@ def server_parts(
         started = time.monotonic()
         try:
             # The project is the board's: the preferences are not scoped by one.
-            reply = client.context(project if want_board else None, timeout=timeout, parts=parts)
+            session = session_served(settings, session_id)
+            reply = client.context(
+                project if want_board else None,
+                timeout=timeout,
+                parts=parts,
+                **({"session": session} if session else {}),
+            )
         except urllib.error.HTTPError as err:
             if want_board and err.code == 401 and not settings.enrolled:
                 return not_enrolled_block(login_hint) if not_enrolled is None else not_enrolled, ""

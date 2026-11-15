@@ -227,6 +227,46 @@ def test_project_falls_back_to_process_cwd(monkeypatch, tmp_path, stdin):
     assert calls == [("/context", {"project": tmp_path.name, "parts": "board"})]
 
 
+_SID = "0b6c2f1e-4d3a-4c55-9a7e-2f1d8b9c0a11"
+
+
+def test_the_payloads_session_id_goes_with_the_request(monkeypatch, tmp_path, capsys):
+    """The server records which lines it served to this session (schema 071), under the
+    id its turns are uploaded with."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    stdin = json.dumps({"cwd": "/home/user/services/synapse", "session_id": _SID})
+    calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
+    assert calls == [("/context", {"project": "synapse", "parts": "board", "session": _SID})]
+    assert _context(capsys) == "b"  # what is printed does not change
+
+
+@pytest.mark.parametrize("sid", [None, "", 7, ["x"]], ids=["absent", "empty", "int", "list"])
+def test_no_usable_session_id_sends_none(monkeypatch, tmp_path, sid):
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    payload = {"cwd": "/home/user/services/synapse"}
+    if sid is not None:
+        payload["session_id"] = sid
+    calls = _run(monkeypatch, mod, json.dumps(payload), {"status": "ok", "text": "b"})
+    assert calls == [("/context", {"project": "synapse", "parts": "board"})]
+
+
+def test_a_private_sessions_id_is_not_sent(monkeypatch, tmp_path, capsys):
+    """A session in private mode (its local marker) is not named to the server: the
+    board is still served, and nothing ties the serve to the session."""
+    _isolated_env(monkeypatch, tmp_path)
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    (private_dir / _SID).write_text("")
+    monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(private_dir))
+    mod = _load_hook()
+    stdin = json.dumps({"cwd": "/home/user/services/synapse", "session_id": _SID})
+    calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
+    assert calls == [("/context", {"project": "synapse", "parts": "board"})]
+    assert _context(capsys) == "b"
+
+
 def test_a_401_on_an_unenrolled_machine_explains_itself(monkeypatch, tmp_path, capsys):
     """The one error worth a block: this machine holds no credential of its own, so it
     will go on being served nothing until someone signs in. Silence would read as

@@ -295,11 +295,16 @@ class SynapseMemoryProvider(MemoryProvider):
         """The credential notice and upload warning (local), then the board and the
         preferences, which are one request; left out when it is not back within
         START_BUDGET."""
-        label = self._project
+        label, session_id = self._project, self._session_id or None
         got: list[tuple[str, str]] = []
 
         def run() -> None:
-            got.append(context.server_parts(client, label, settings, timeout=START_BUDGET))
+            # The session id lets the server record what this session was served.
+            got.append(
+                context.server_parts(
+                    client, label, settings, timeout=START_BUDGET, session_id=session_id
+                )
+            )
 
         thread = spawn_context_thread(run, name="synapse-session-start")
         thread.start()

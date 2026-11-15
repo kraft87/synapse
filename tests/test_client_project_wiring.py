@@ -758,7 +758,9 @@ def codex_start(monkeypatch) -> SimpleNamespace:
     `boards` collects the project each board fetch was asked for."""
     mod = _load(_SESSION_START, "codex_session_start_project_wiring_test")
     boards: list[str | None] = []
-    monkeypatch.setattr(mod, "_served", lambda project: (boards.append(project) or "[board]", ""))
+    monkeypatch.setattr(
+        mod, "_served", lambda project, session_id=None: (boards.append(project) or "[board]", "")
+    )
     monkeypatch.setattr(mod, "_sync_skills", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_spawn_catchup", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_upload_warning", lambda *a, **k: None)

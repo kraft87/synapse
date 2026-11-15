@@ -6,6 +6,46 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — board: the server records what each session start was served (plugin 0.24.20)
+
+**What changed**
+
+- **New table `board_serves` (schema 071, optional).** One row per `GET /context` that
+  built the board or the preferences block: the note (`n:`), event (`t:`) and preference
+  ids in the order the reply shows them, a sha256, line count and token estimate of each
+  block, the preferences text (at most 7 lines; preferences have no history table), and
+  the session id, project, surface, trust and User-Agent. Stored episodes do not hold the
+  injected text, so before this no board line could be measured.
+- **The reply does not change.** The row is written after the reply is sent, as a
+  background task, and any failure is dropped. A database without 071 records nothing.
+- **The client names the session.** Claude Code and Codex send the hook payload's
+  `session_id`, Hermes the id `initialize` gets, as `?session=`: the id its turns are
+  uploaded under. A session whose private-mode marker is set or unreadable is not named,
+  and the server records nothing for a session in `private_sessions`.
+- Rows older than 180 days are deleted by the writer, at most once an hour.
+
+**What to do on each machine**
+
+- Server: `scripts/apply_schema.sh "$SYNAPSE_DB_URL"` (071 is not manual), then deploy.
+  Before 071 the new image records nothing and runs as before.
+- Clients: `synapse update`. A client before 0.24.20 is recorded without a session id.
+
+**What was proven**
+
+- On a scratch database with the full schema: the route's text is byte-identical to
+  `build_board` and `top_block`; the recorded ids equal the `n:`/`t:` ids parsed from the
+  served text, in order; a private session gets no row; a restricted device's row holds
+  only what it was shown; a database without the table records nothing.
+
+**Still open**
+
+- The row records what the server sent, not what the model kept: Codex drops a reply
+  that comes after its deadline, and a continuing Hermes session restores its stored
+  prompt.
+- Clients before 0.24.11 read `/preferences/top`, which is not recorded.
+- The board hash changes whenever the banner's episode count does; per-line questions use
+  the ids.
+
 ## 2026-11-14 — hermes: `synapse import hermes` imports past Hermes sessions (plugin 0.24.19)
 
 **What changed**

@@ -688,9 +688,9 @@ def test_board_block_leads_with_the_credential_notice(scratch, monkeypatch, caps
 
 @pytest.mark.parametrize("value", ["0", " 0"])
 def test_board_block_kill_switch(scratch, monkeypatch, capsys, server, value):
-    """SYNAPSE_BOARD=0 asks for no board, and for no project (the payload is not read);
-    the credential notice and the preferences still show. Only exactly "0" switches it
-    off: " 0" does not, as it never has."""
+    """SYNAPSE_BOARD=0 asks for no board, and for no project (the payload's folder is
+    not labelled); the credential notice and the preferences still show. Only exactly
+    "0" switches it off: " 0" does not, as it never has."""
     _home(scratch, server, enrolled=True)
     monkeypatch.setenv("SYNAPSE_BOARD", value)
     monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
@@ -703,8 +703,6 @@ def test_board_block_kill_switch(scratch, monkeypatch, capsys, server, value):
     else:
         text = _NOTICE_ENV_SHELL + "\n\n" + _BOARD + "\n\n" + _PREFS_TEXT
         assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
-    # The payload names the folder, which only the board is scoped by.
-    assert (sys.stdin.tell() == 0) is (value == "0")
 
 
 def test_preferences_kill_switch(scratch, monkeypatch, capsys, server):
