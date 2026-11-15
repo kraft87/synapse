@@ -1228,6 +1228,35 @@ def test_the_claude_plugins_own_copy_has_no_codex_installer(tmp_path):
         harness.install_codex(_URL)
 
 
+_TRUST_STEP = "start codex, run /hooks and trust the Synapse hooks"
+
+
+@pytest.mark.parametrize(
+    ("changed", "pending", "said"),
+    [
+        (False, [], "Codex: already wired"),
+        (True, [], "Codex: wired; Codex already trusts the Synapse hooks"),
+        (True, ["synapse_stop_hook.py"], f"Codex: wired; {_TRUST_STEP}"),
+        (False, ["synapse_stop_hook.py"], f"Codex: already wired; {_TRUST_STEP}"),
+        (True, None, f"Codex: wired; {_TRUST_STEP}"),
+        (False, None, "Codex: already wired"),
+    ],
+    ids=["unchanged", "mcp only", "new hooks", "never trusted", "unreadable", "unreadable, same"],
+)
+def test_the_codex_trust_step_is_said_only_when_codex_would_ask(
+    monkeypatch, changed, pending, said
+):
+    """Codex records which hooks the user trusted (plugin-codex/install.py
+    ``untrusted_hooks`` reads it): the step is said for a hook it would list in /hooks,
+    and when that cannot be read, for a run that changed something."""
+    harness = _load("harness")
+    installer = types.SimpleNamespace(
+        install=lambda url, dry_run=False: changed, untrusted_hooks=lambda: pending
+    )
+    monkeypatch.setattr(harness, "codex_installer", lambda: installer)
+    assert harness.install_codex(_URL) == said
+
+
 # ---------------------------------------------------------------------------
 # synapse config
 # ---------------------------------------------------------------------------

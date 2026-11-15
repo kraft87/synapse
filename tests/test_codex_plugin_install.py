@@ -207,3 +207,104 @@ def test_main_keeps_the_existing_url_of_a_file_old_windows_lines_broke(installer
     monkeypatch.setattr(sys, "argv", ["install.py"])
     assert installer.main() == 0
     assert seen == ["https://mem.example/mcp"]
+
+
+# The six Synapse hooks of a managed install, and the hash Codex 0.162.1 gives each
+# (``codex app-server``, hooks/list ``currentHash``): what it records as ``trusted_hash``
+# when the user trusts them in /hooks.
+_RUN = '"python3 \\"/home/u/.synapse/bin/synapse_run.py\\" plugin-codex/'
+_TRUSTED_BLOCKS = f"""\
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = {_RUN}hooks/synapse_stop_hook.py"
+timeout = 30
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = {_RUN}hooks/session_start.py"
+timeout = 20
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = {_RUN}hooks/user_prompt_submit.py"
+timeout = 5
+
+[[hooks.PreToolUse]]
+matcher = "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = {_RUN}hooks/pre_tool_use.py"
+timeout = 5
+
+[[hooks.PostToolUse]]
+matcher = "mcp__.*__(recall|recall_full_turns)$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = {_RUN}hooks/post_tool_use.py"
+timeout = 5
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = {_RUN}scripts/private_mode.py --session-end"
+timeout = 3
+"""
+_TRUSTED = {
+    "stop": "a0744f0bec5f820430b01e1ce6710d0edd00fdc20cf34576c05ff11ad861cdde",
+    "session_start": "67455bc3d0be11d89fa03b397a6e62b9ca12ee6b30c485a4762de48e61e2b44c",
+    "user_prompt_submit": "092185c1524e2d7e49844fb8cf29db5da2c2e80e61c5128251ae87abe7cdaa24",
+    "pre_tool_use": "6da91340d6ca8d97de7036c44139a9d5d0df310aeb5eb8aa9fcb6db0030a5f8b",
+    "post_tool_use": "703ff0ad9d81d04d808e72e304eeb625b6e64e0bf40e2103d27ee6ee5bb0e938",
+    "session_end": "7981894e0cb1ca4afcb5527d4ae9d78bab2e9c42a9cc528cd5951380d84a18c3",
+}
+
+
+def _trust_records(path, events=_TRUSTED, group=0) -> str:
+    out = ["\n[hooks.state]\n"]
+    for event, digest in events.items():
+        key = json.dumps(f"{path}:{event}:{group}:0")
+        out.append(f'[hooks.state.{key}]\ntrusted_hash = "sha256:{digest}"\n')
+    return "\n".join(out)
+
+
+def test_trust_is_read_as_codex_records_it(installer):
+    """Codex keys a hook's trust by file, event and place, and records the hash of what
+    the user trusted. The hooks Codex trusted read as trusted; any that changed, moved
+    or has no record does not."""
+    path = installer.CONFIG_PATH
+    path.write_text(_TRUSTED_BLOCKS)
+    everything = sorted(marker for marker, *_ in installer._HOOKS)
+    assert sorted(installer.untrusted_hooks()) == everything
+    path.write_text(_TRUSTED_BLOCKS + _trust_records(path))
+    assert installer.untrusted_hooks() == []
+    # Recorded for another file (a project's .codex/config.toml): not this one's.
+    path.write_text(_TRUSTED_BLOCKS + _trust_records(path.parent / "other" / "config.toml"))
+    assert sorted(installer.untrusted_hooks()) == everything
+    # A command changed since it was trusted.
+    changed = _TRUSTED_BLOCKS.replace("session_start.py", "session_start.py --again")
+    path.write_text(changed + _trust_records(path))
+    assert installer.untrusted_hooks() == ["session_start.py"]
+    # One record missing.
+    missing = {k: v for k, v in _TRUSTED.items() if k != "stop"}
+    path.write_text(_TRUSTED_BLOCKS + _trust_records(path, missing))
+    assert installer.untrusted_hooks() == ["synapse_stop_hook.py"]
+    # A hook of the user's own put before ours in Stop: ours moved, and Codex asks again.
+    mine = '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "mine"\n\n'
+    path.write_text(mine + _TRUSTED_BLOCKS + _trust_records(path))
+    assert installer.untrusted_hooks() == ["synapse_stop_hook.py"]
+    path.write_text("not = [toml")
+    assert installer.untrusted_hooks() is None
+
+
+def test_install_leaves_trust_records_alone_and_needs_none_again(installer):
+    path = installer.CONFIG_PATH
+    path.write_text(_TRUSTED_BLOCKS + _trust_records(path))
+    launcher = installer.Launcher(
+        "python3", root=Path("/unused"), runner=Path("/home/u/.synapse/bin/synapse_run.py")
+    )
+    installer.install("https://memory.example", launcher=launcher)
+    assert "[hooks.state." in path.read_text()
+    assert installer.untrusted_hooks() == []

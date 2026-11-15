@@ -370,9 +370,18 @@ def install_codex(url: str, dry_run: bool = False) -> str:
             f"`irm {url}/install | python -`)"
         )
     changed = installer.install(url, dry_run=dry_run)
-    if not changed:
-        return "Codex: already wired"
-    return "Codex: wired; start codex, run /hooks and trust the Synapse hooks"
+    if changed and dry_run:
+        return "Codex: wired; start codex, run /hooks and trust the Synapse hooks"
+    # The trust step only for a Synapse hook Codex does not trust as it now reads. None:
+    # trust could not be read (or an older installer): the step when anything changed.
+    reader = getattr(installer, "untrusted_hooks", None)
+    pending = reader() if reader else None
+    if pending or (pending is None and changed):
+        what = "wired" if changed else "already wired"
+        return f"Codex: {what}; start codex, run /hooks and trust the Synapse hooks"
+    if changed:
+        return "Codex: wired; Codex already trusts the Synapse hooks"
+    return "Codex: already wired"
 
 
 def codex_wired() -> bool:
