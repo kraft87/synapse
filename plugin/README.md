@@ -78,8 +78,8 @@ claude plugin install synapse@synapse --config SYNAPSE_URL=<your-synapse>
 ```
 
 Then `/reload-plugins` (or restart) to activate the hooks + MCP server. Re-running
-`synapse login` on an enrolled machine keeps its device token and only re-wires;
-`--reenroll` replaces the token.
+`synapse login` on an enrolled machine, or one set up with `--token`, keeps its device token
+and only re-wires; `--reenroll` replaces the token with one from a sign-in.
 
 Already in a session with the plugin installed the old way (`/plugin install`)? `! synapse-login`
 runs the same command from the plugin's own `bin/`, and copies the answers the old install
@@ -178,6 +178,7 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
   this plugin and every other harness already wired. The harnesses are updated by the
   client just installed, in a process of its own.
 - **`synapse status`** — one line per harness: wired, found and not wired, or not found.
+  For Hermes, also installed but not selected, with the provider Hermes runs instead.
 - **`synapse skill retire <name>`** — retire a skill everywhere (below).
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
@@ -287,9 +288,12 @@ and sets `memory.provider: synapse` in that home's `config.yaml`: through `herme
 set` when Hermes already has a config there, by writing a new two-line file when there is
 none. Hermes runs one external memory provider at a time, so a different one already
 selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
-either way. `synapse update` rebuilds the folder for a new client version, and `synapse
-status` says whether the provider is installed; `hermes memory status` says whether it is
-the active one (`synapse ← active`). Start a new `hermes` session to use it; a session
+either way. `synapse update` rebuilds the folder for a new client version. `synapse status`
+says `Hermes: wired` when the provider is installed and selected. When it is installed and
+another provider is selected, it names that provider and the command that switches; `synapse
+login`, `synapse install hermes` and `synapse update` say the same. With `--hermes-home`, the
+command it names carries that home. `hermes memory status` shows the active one
+(`synapse ← active`). Start a new `hermes` session to use it; a session
 already open stays without it. After `synapse update`, run `hermes gateway stop` first, so
 the gateway loads the new code (the next `hermes` starts it again).
 
@@ -302,9 +306,8 @@ recall nudge each turn, the memory tools (`recall`, `recall_full_turns`, `fetch`
 `fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded.
 Chat-platform sessions (Telegram, Discord, Slack and the rest, through Hermes's gateway),
 the API server, the Bot Chat and Desktop Group Chats, cron jobs, side agents and subagents
-get no board, no nudge and no uploads. Hermes may still list the memory tools to the model
-there (it does on the API server), but a call returns "Synapse is enabled for local sessions
-only" and reads nothing; subagents get no Synapse tools at all. A session stops for good at the first turn another
+get no board, no nudge, no memory tools and no uploads. A call to a memory tool there
+returns "Synapse is enabled for local sessions only" and reads nothing. A session stops for good at the first turn another
 agent or person wrote: there, others talk to the agent, and they must not read your memory
 or be stored as you. Such a chat is noted in `$HERMES_HOME/synapse/inert/`, so it and
 its branches stay off after a rename or a restart. To turn one back on, delete every file

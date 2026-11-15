@@ -328,8 +328,11 @@ _RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
 # recall: rerank scores are not comparable across models, and a floor calibrated on one
 # backend replayed against another blanked 39-56% of episode buckets on the LME A/B set
 # (2026-09-10). So the code default is 0 (off) and each examples/env preset sets the value
-# calibrated for its reranker (0.58 for the default stack ~= p10 of 30 days of prod
-# rerank_top_score: p05=0.5039 p10=0.5781 p25=0.6914 p50=0.7891, n=687).
+# for its reranker: 0.40 for the default stack. A floor at the p10 of real top scores (0.58
+# to 0.60) was measured only for how often it fires. Measured for what it costs, it blanks
+# questions memory can answer: on 150 answerable LongMemEval-S questions, 2 lose their
+# episodes at 0.40, 22 at 0.50 and 60 at 0.60, and rated real recalls with a helpful
+# episode sit between 0.40 and 0.60.
 _RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0") or "0")
 # Enforcement gate — ON by default (2026-07-23): the shadow phase validated the floor fires
 # on ~9% of real recalls (the bottom ~p10 by episode-rerank strength). When enforced, recall()

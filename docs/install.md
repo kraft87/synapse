@@ -180,7 +180,8 @@ Then it wires every harness it finds, and each needs one step from you:
   already open stays without Synapse. `hermes memory status` should show
   `synapse ← active`. Hermes runs one external memory provider at a time: if another one
   (Honcho, Hindsight, mem0) is selected, the output says `left memory.provider at '<name>'`
-  and Synapse is not active. `synapse install hermes --replace` switches to Synapse, and
+  and Synapse is not active, and `synapse status` says `installed, not selected`.
+  `synapse install hermes --replace` switches to Synapse, and
   `hermes config set memory.provider <name>` switches back. Local sessions only: see
   [plugin/README.md](../plugin/README.md#hermes).
 
@@ -519,7 +520,8 @@ env var says so in its HANDOFF.md entry.
 - **Codex hooks don't run** (no board, no `hook:` lines, nothing in
   `/tmp/synapse-codex-hook.log`, on Windows `%TEMP%\synapse-codex-hook.log`). Codex skips
   hooks nobody trusted, silently: run `/hooks` in
-  `codex` and press `t` to trust the Synapse ones. `synapse update` never changes their commands, so trust survives
+  `codex` and press `t` to trust the Synapse ones. `synapse login` and `synapse install
+  codex` say so when a Synapse hook has no trust recorded. `synapse update` never changes their commands, so trust survives
   updates.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **"Synapse: no Python 3.11 or newer found" at session start (Windows).** The Claude Code

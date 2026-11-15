@@ -339,8 +339,9 @@ def cmd_login(args) -> int:
                 config.set_home_values({"url": url})
         elif token_only:
             print(
-                f"Using the token already in {synapse_home.config_file()}; this machine never "
-                "enrolled by signing in (`synapse login --reenroll` does that)."
+                f"Using the device token stored in {synapse_home.config_file()} (from "
+                "`synapse login --token`). To replace it with one from a sign-in, for "
+                "example after that token was revoked, run `synapse login --reenroll`."
             )
         else:
             import synapse_login
@@ -745,9 +746,13 @@ def cmd_update(args) -> int:
 
 
 def cmd_status(_args) -> int:
-    """One line per harness: wired, found but not wired, or not found."""
+    """One line per harness: wired, found but not wired, or not found. A harness that
+    can be installed and still not run Synapse (Hermes runs one memory provider) says
+    so itself (``status()``)."""
     for target in harness.harnesses():
-        if target.wired():
+        if hasattr(target, "status"):
+            state = target.status()
+        elif target.wired():
             state = "wired"
         elif target.detect():
             state = "found, not wired"

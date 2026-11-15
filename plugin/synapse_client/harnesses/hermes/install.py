@@ -52,6 +52,7 @@ PLUGIN = "synapse"
 #: prints null); the string "null" is a provider's name to Hermes.
 _BUILT_IN = frozenset({"", "default", "builtin", "built-in", "none"})
 _CONFIG_LINES = "memory:\n  provider: synapse\n"
+_SELECTED = "already selected"
 _TIMEOUT = 60
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -79,13 +80,29 @@ def default_home(env: Mapping[str, str] | None = None) -> Path:
     return Path.home() / (".hermes" + suffix)
 
 
+def _windows(windows: bool | None) -> bool:
+    return sys.platform == "win32" if windows is None else windows
+
+
+def _quoted(home: Path, windows: bool | None) -> str:
+    """``home`` as one word for the user's shell: PowerShell on Windows, else POSIX."""
+    if _windows(windows):
+        return "'" + str(home).replace("'", "''") + "'"
+    return shlex.quote(str(home))
+
+
 def home_prefix(home: Path, windows: bool | None = None) -> str:
     """What sets ``HERMES_HOME`` for the one command after it: a POSIX shell's
     ``VAR=value``, or PowerShell's ``$env:`` on Windows."""
-    if sys.platform == "win32" if windows is None else windows:
-        quoted = str(home).replace("'", "''")
-        return f"$env:HERMES_HOME = '{quoted}'; "
-    return f"HERMES_HOME={shlex.quote(str(home))} "
+    if _windows(windows):
+        return f"$env:HERMES_HOME = {_quoted(home, True)}; "
+    return f"HERMES_HOME={_quoted(home, False)} "
+
+
+def home_option(home: Path, windows: bool | None = None) -> str:
+    """`` --hermes-home <home>`` for a ``synapse install hermes`` command, quoted for the
+    user's shell."""
+    return f" --hermes-home {_quoted(home, windows)}"
 
 
 def _render(template: str) -> str:
@@ -149,29 +166,39 @@ def installed_version(home: Path) -> str:
     return ""
 
 
-def selected_in(config: Path) -> bool:
-    """config.yaml names this provider as ``memory.provider``, read without a YAML parser:
-    only the block layout Hermes and this installer write (``memory:``, then
-    ``provider: synapse`` one level in) counts. False for any other layout or an
-    unreadable file, so it can only spare the user a command, never select anything."""
+def provider_in(config: Path) -> str | None:
+    """``memory.provider`` as config.yaml names it, read without a YAML parser: only the
+    block layout Hermes and this installer write (``memory:``, then ``provider: <name>``
+    one level in) is read. "" when the file sets none; None when it cannot be read or
+    sets ``memory`` in another layout."""
     try:
         lines = config.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
-        return False
-    found, inside, indent = None, False, ""
+        return None
+    found, inside, indent = "", False, ""
     for line in lines:
         body = line.lstrip()
         if not body or body.startswith("#"):
             continue
         if body == line:  # a top-level key
-            inside, indent = line.split("#", 1)[0].rstrip() == "memory:", ""
+            key = line.split("#", 1)[0].rstrip()
+            if key.startswith("memory:") and key != "memory:":
+                return None  # memory: {provider: ...}, or another layout
+            inside, indent = key == "memory:", ""
             continue
         here = line[: len(line) - len(body)]
         indent = indent or here
         match = re.fullmatch(r"provider:\s*([^#]*?)\s*(#.*)?", body)
         if inside and here == indent and match:
             found = match.group(1).strip("'\"")
-    return found == PLUGIN
+    return found
+
+
+def selected_in(config: Path) -> bool:
+    """config.yaml names this provider as ``memory.provider`` (``provider_in``). False
+    for any other layout or an unreadable file, so it can only spare the user a command,
+    never select anything."""
+    return provider_in(config) == PLUGIN
 
 
 class HermesHarness:
@@ -213,7 +240,8 @@ class HermesHarness:
             return False
 
     def wired(self) -> bool:
-        """The plugin folder is there and carries this client's Hermes provider."""
+        """The plugin folder is there and carries this client's Hermes provider. Whether
+        Hermes runs it is ``memory.provider`` (``status``)."""
         try:
             folder = self._home() / "plugins" / PLUGIN
             return (folder / "plugin.yaml").is_file() and (
@@ -221,6 +249,39 @@ class HermesHarness:
             ).is_file()
         except Exception:
             return False
+
+    def status(self) -> str:
+        """What ``synapse status`` says of Hermes: not installed, installed and selected
+        ("wired"), or installed while Hermes runs another provider or none, with the
+        command that selects this one. Never raises."""
+        try:
+            if not self.wired():
+                return "found, not wired" if self.detect() else "not found"
+            selected = self._selected(self._home())
+        except Exception:
+            return "installed; whether Hermes runs it could not be read"
+        return "wired" if selected == _SELECTED else f"installed, {selected}"
+
+    def _selected(self, home: Path) -> str:
+        """Whether ``home`` selects this provider: _SELECTED, else what it selects and
+        the command that switches, as ``install`` words it. config.yaml is read first;
+        the program is asked only when the file does not say (it takes seconds to
+        start)."""
+        config = home / "config.yaml"
+        program = self._program()
+        current = provider_in(config) if config.is_file() else ""
+        if current is None and program:
+            current = self._current(program, home)
+        if current == PLUGIN:
+            return _SELECTED
+        command = self._command(home)
+        if current is None:
+            return f"not selected as far as can be read; select it with `{command}`"
+        if current.lower() in _BUILT_IN:
+            return f"not selected; run `{self._install_command(home)}`"
+        if not program:
+            return f"not selected: memory.provider is {current!r}; select it with `{command}`"
+        return f"not selected: memory.provider is {current!r}, {self._switch(home)}"
 
     def install(self, url: str, *, dry_run: bool = False, **options: Any) -> str:
         """Put the plugin folder in place and select the provider. ``options``:
@@ -253,18 +314,36 @@ class HermesHarness:
             return None
         home = self._home()
         if installed_version(home) == __version__:
-            return f"Hermes: memory provider already at {__version__}"
+            return f"Hermes: memory provider already at {__version__}{self._unselected(home)}"
         try:
             swap_in(home / "plugins")
         except OSError as err:
             return f"Hermes: not updated: {err}"
-        return f"Hermes: memory provider updated to {__version__}"
+        return f"Hermes: memory provider updated to {__version__}{self._unselected(home)}"
+
+    def _unselected(self, home: Path) -> str:
+        """ "; not selected..." when Hermes does not run this provider, else ""."""
+        selected = self._selected(home)
+        return "" if selected == _SELECTED else f"; {selected}"
 
     # -- selecting the provider -------------------------------------------------------
 
     def _command(self, home: Path) -> str:
         prefix = "" if home == default_home(self._env) else home_prefix(home)
         return f"{prefix}hermes config set memory.provider {PLUGIN}"
+
+    def _install_command(self, home: Path, replace: bool = False) -> str:
+        """``synapse install hermes`` for ``home``: the home is named unless it is the
+        default one, which the command finds by itself."""
+        where = "" if home == default_home(self._env) else home_option(home)
+        return f"synapse install hermes{' --replace' if replace else ''}{where}"
+
+    def _switch(self, home: Path) -> str:
+        return (
+            "Hermes runs one external provider; "
+            f"run `{self._install_command(home, replace=True)}` or `{self._command(home)}` "
+            "to switch"
+        )
 
     def _select(self, home: Path, *, dry_run: bool, replace: bool) -> str:
         config = home / "config.yaml"
@@ -273,7 +352,7 @@ class HermesHarness:
             return self._select_with(program, home, dry_run=dry_run, replace=replace)
         if config.exists():
             if selected_in(config):
-                return "already selected"
+                return _SELECTED
             return f"select it with `{self._command(home)}`"
         if dry_run:
             return f"would write {config} selecting it"
@@ -323,15 +402,12 @@ class HermesHarness:
         command = self._command(home)
         if current is None:
             if selected_in(home / "config.yaml"):
-                return "already selected"
+                return _SELECTED
             return f"could not read memory.provider; select it with `{command}`"
         if current == PLUGIN:
-            return "already selected"
+            return _SELECTED
         if current.lower() not in _BUILT_IN and not replace:
-            return (
-                f"left memory.provider at {current!r}, Hermes runs one external provider; "
-                f"run `synapse install hermes --replace` or `{command}` to switch"
-            )
+            return f"left memory.provider at {current!r}, {self._switch(home)}"
         was = f" (was {current!r})" if current.lower() not in _BUILT_IN else ""
         if dry_run:
             return f"would select it{was}"

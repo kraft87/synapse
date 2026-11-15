@@ -106,6 +106,11 @@ Synapse tool (`recall`, `remember`, `fetch`, `recall_feedback`) it asks for appr
 "Always allow", or a stray keypress can cancel a memory write.
 Nothing about this needs `~/.claude`.
 
+Codex records each hook you trust in `config.toml` (`[hooks.state."<path>:<event>:<i>:<j>"]`,
+with the hash of the hook you trusted). `synapse login`, `synapse install codex` and
+`synapse update` read those records. They ask you to trust the hooks only when a Synapse hook
+is new, has changed, or has no trust recorded. Otherwise they say `Codex: already wired`.
+
 From a git checkout, `python3 plugin-codex/install.py --synapse-url http://your-synapse:8765`
 (`py -3` in place of `python3` on Windows)
 writes the same blocks pointing at the checkout; re-run it after upgrades.

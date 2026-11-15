@@ -29,12 +29,15 @@ Usage:
     python3 plugin-codex/install.py [--synapse-url URL] [--dry-run]
 
 ``synapse install codex`` runs the same code. After installing, run ``codex`` once and
-trust the new hooks via /hooks — Codex refuses to run unreviewed hooks.
+trust the new hooks via /hooks: Codex refuses to run unreviewed hooks. Codex records the
+trust in config.toml; ``untrusted_hooks`` reads it, so the trust step is asked for only
+when a Synapse hook is new, changed, or not trusted yet.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import ntpath
 import os
@@ -428,6 +431,85 @@ def install(synapse_url: str, dry_run: bool = False, launcher: Launcher | None =
     return _commit(existing, updated, dry_run)
 
 
+# Codex's names for the events in a hook's trust key (codex-rs/hooks ``hook_event_key_label``).
+_EVENT_KEYS = {
+    "Stop": "stop",
+    "SessionStart": "session_start",
+    "UserPromptSubmit": "user_prompt_submit",
+    "PreToolUse": "pre_tool_use",
+    "PostToolUse": "post_tool_use",
+    "SessionEnd": "session_end",
+}
+
+
+def _hook_hash(event: str, matcher: str | None, handler: dict) -> str:
+    """The hash Codex records when the user trusts a command hook (codex-rs/hooks
+    ``hook_hash``, config ``version_for_toml``): SHA-256 of the sorted, compact JSON of
+    the event's key name, the matcher and the one handler, its timeout normalised as
+    Codex does (SessionEnd 1 to 3 seconds, default 1; others at least 1, default 600)."""
+    timeout = handler.get("timeout")
+    if event == "SessionEnd":
+        timeout = min(max(timeout if isinstance(timeout, int) else 1, 1), 3)
+    else:
+        timeout = max(timeout if isinstance(timeout, int) else 600, 1)
+    identity: dict = {
+        "event_name": _EVENT_KEYS[event],
+        "hooks": [{**handler, "timeout": timeout, "async": bool(handler.get("async", False))}],
+    }
+    if matcher is not None:
+        identity["matcher"] = matcher
+    blob = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _same_file(path: str) -> bool:
+    try:
+        return os.path.samefile(path, CONFIG_PATH)
+    except OSError:
+        return False
+
+
+def untrusted_hooks(text: str | None = None) -> list[str] | None:
+    """The Synapse hooks in config.toml (``text``, else the file) that Codex has no
+    trust recorded for, or one recorded for another version of the hook: ``/hooks``
+    would list them for review. Codex keys a hook's trust by the file, the event and
+    the hook's place (``[hooks.state."<path>:<event>:<group>:<handler>"]``) and records
+    ``trusted_hash``, the hash of what the user trusted (``_hook_hash``). None when the
+    file cannot be read or parsed, or names an event this does not know: say the trust
+    step then. A Codex that hashed another way would show every hook here, never none."""
+    try:
+        config = tomllib.loads(_read() if text is None else text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    states = hooks.get("state") if isinstance(hooks.get("state"), dict) else {}
+    trusted: dict[tuple[str, int, int], str] = {}
+    for key, state in states.items():
+        where, *place = str(key).rsplit(":", 3)
+        if len(place) == 3 and isinstance(state, dict) and _same_file(where):
+            if place[1].isdigit() and place[2].isdigit():
+                trusted[(place[0], int(place[1]), int(place[2]))] = str(state.get("trusted_hash"))
+    out: list[str] = []
+    for event, groups in hooks.items():
+        if event == "state" or not isinstance(groups, list):
+            continue
+        for g, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            for h, handler in enumerate(handlers if isinstance(handlers, list) else ()):
+                command = handler.get("command") if isinstance(handler, dict) else None
+                entry = _marker_of(command) if isinstance(command, str) else None
+                if entry is None:
+                    continue
+                if event not in _EVENT_KEYS:
+                    return None
+                recorded = trusted.get((_EVENT_KEYS[event], g, h))
+                if recorded != _hook_hash(event, group.get("matcher"), handler):
+                    out.append(entry[0])
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install Synapse into Codex CLI")
     parser.add_argument(
@@ -456,8 +538,12 @@ def main() -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    pending = untrusted_hooks()
+    if args.dry_run or pending is None or pending:
+        print("\nDone. Next: start `codex`, run /hooks, and trust the Synapse hooks.")
+    else:
+        print("\nDone. Codex already trusts the Synapse hooks.")
     print(
-        "\nDone. Next: start `codex`, run /hooks, and trust the Synapse hooks.\n"
         "MCP and hooks share the saved Synapse device credential (~/.synapse/config.json);\n"
         "no token is copied into config.toml. Requires Codex with http_headers_helper support."
     )

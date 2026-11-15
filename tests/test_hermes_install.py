@@ -302,6 +302,73 @@ def test_the_home_is_set_the_way_the_users_shell_reads_it():
     )
 
 
+def test_the_replace_hint_names_the_home_it_was_given(tmp_path):
+    """``--hermes-home PATH`` without ``--replace``, another provider selected: the
+    command the report names acts on PATH, not on the default home."""
+    home = tmp_path / "other home"
+    _with_config(home, "memory:\n  provider: honcho\n")
+    elsewhere = hi.HermesHarness(
+        runner=_Hermes("honcho"), which=lambda name: "/bin/hermes", env={"HERMES_HOME": "/x"}
+    )
+    report = elsewhere.install("http://unused", hermes_home=home)
+    assert f"`synapse install hermes --replace{hi.home_option(home)}`" in report
+    assert f"`{hi.home_prefix(home)}hermes config set memory.provider synapse`" in report
+    # In the default home neither command names it.
+    report = _harness(home, _Hermes("honcho"), "/bin/hermes").install(
+        "http://unused", hermes_home=home
+    )
+    assert "`synapse install hermes --replace` or `hermes config set" in report
+
+
+def test_the_home_option_is_quoted_for_the_users_shell():
+    home = Path("/srv/hermes homes/it's")
+    assert hi.home_option(home, windows=False) == f" --hermes-home {shlex.quote(str(home))}"
+    windows = Path("C:/Users/O'Neil/AppData/Local/hermes-work")
+    assert hi.home_option(windows, windows=True) == (
+        f" --hermes-home '{str(windows).replace(chr(39), chr(39) * 2)}'"
+    )
+
+
+_SWITCH = (
+    "Hermes runs one external provider; run `synapse install hermes --replace` or "
+    "`hermes config set memory.provider synapse` to switch"
+)
+
+
+def test_status_says_whether_hermes_runs_the_provider(tmp_path):
+    """Installed is not enough: Hermes runs the one provider config.yaml selects. The
+    status, the install and the update say the same of another provider."""
+    home = tmp_path / "hermes"
+    hermes = _Hermes("honcho")
+    harness = _harness(home, hermes, "/bin/hermes")
+    assert harness.status() == "found, not wired"
+    assert _harness(home).status() == "not found"
+    config = _with_config(home, "model: x\nmemory:\n  provider: honcho\n")
+    report = harness.install("http://unused", hermes_home=home)
+    assert report.endswith(f"; left memory.provider at 'honcho', {_SWITCH}")
+    calls = len(hermes.calls)
+    assert harness.status() == f"installed, not selected: memory.provider is 'honcho', {_SWITCH}"
+    assert harness.update() == (
+        f"Hermes: memory provider already at {__version__}; "
+        f"not selected: memory.provider is 'honcho', {_SWITCH}"
+    )
+    assert len(hermes.calls) == calls  # config.yaml said it: the program was not started
+    # Without the program only Hermes's own command can switch.
+    assert _harness(home).status() == (
+        "installed, not selected: memory.provider is 'honcho'; "
+        "select it with `hermes config set memory.provider synapse`"
+    )
+    config.write_text("model: x\n", encoding="utf-8")
+    assert harness.status() == "installed, not selected; run `synapse install hermes`"
+    config.write_text("memory:\n  provider: 'synapse'\n", encoding="utf-8")
+    assert harness.status() == "wired"
+    assert harness.update() == f"Hermes: memory provider already at {__version__}"
+    # A layout the file read does not know: the program is asked.
+    config.write_text("memory: {provider: honcho}\n", encoding="utf-8")
+    assert harness.status().startswith("installed, not selected: memory.provider is 'honcho'")
+    assert len(hermes.calls) == calls + 1
+
+
 def test_dry_run_changes_nothing(tmp_path):
     home = tmp_path / "hermes"
     report = _harness(home).install("http://unused", dry_run=True, hermes_home=home)

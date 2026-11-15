@@ -1228,6 +1228,35 @@ def test_the_claude_plugins_own_copy_has_no_codex_installer(tmp_path):
         harness.install_codex(_URL)
 
 
+_TRUST_STEP = "start codex, run /hooks and trust the Synapse hooks"
+
+
+@pytest.mark.parametrize(
+    ("changed", "pending", "said"),
+    [
+        (False, [], "Codex: already wired"),
+        (True, [], "Codex: wired; Codex already trusts the Synapse hooks"),
+        (True, ["synapse_stop_hook.py"], f"Codex: wired; {_TRUST_STEP}"),
+        (False, ["synapse_stop_hook.py"], f"Codex: already wired; {_TRUST_STEP}"),
+        (True, None, f"Codex: wired; {_TRUST_STEP}"),
+        (False, None, "Codex: already wired"),
+    ],
+    ids=["unchanged", "mcp only", "new hooks", "never trusted", "unreadable", "unreadable, same"],
+)
+def test_the_codex_trust_step_is_said_only_when_codex_would_ask(
+    monkeypatch, changed, pending, said
+):
+    """Codex records which hooks the user trusted (plugin-codex/install.py
+    ``untrusted_hooks`` reads it): the step is said for a hook it would list in /hooks,
+    and when that cannot be read, for a run that changed something."""
+    harness = _load("harness")
+    installer = types.SimpleNamespace(
+        install=lambda url, dry_run=False: changed, untrusted_hooks=lambda: pending
+    )
+    monkeypatch.setattr(harness, "codex_installer", lambda: installer)
+    assert harness.install_codex(_URL) == said
+
+
 # ---------------------------------------------------------------------------
 # synapse config
 # ---------------------------------------------------------------------------
@@ -2113,6 +2142,17 @@ def test_status_has_a_line_per_harness(cli, capsys):
     assert "Hermes: wired" in capsys.readouterr().out.splitlines()
 
 
+def test_status_takes_a_harness_s_own_words_when_it_has_them(cli, capsys, monkeypatch):
+    """Hermes is installed and runs another memory provider: wired() alone would say
+    "wired"."""
+    cli.found = {"claude": False, "codex": False, "hermes": True}
+    cli.hermes_is_wired = True
+    said = "installed, not selected: memory.provider is 'honcho'"
+    monkeypatch.setattr(_FakeHermes, "status", lambda self: said, raising=False)
+    assert cli.run("status") == 0
+    assert capsys.readouterr().out.splitlines()[-1] == f"Hermes: {said}"
+
+
 _NO_PYTHON = (
     "Synapse: no Python 3.11 or newer found (tried python3, python and py -3). "
     "Install Python from python.org, then start a new session."
@@ -2268,7 +2308,10 @@ def test_a_machine_set_up_with_a_token_is_not_signed_in_again(cli, capsys):
 
     assert cli.signins == [] and cli.login_argv == []
     assert cli.wired == [("codex", _URL, False)]
-    assert "never enrolled by signing in" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Using the device token stored in" in out
+    assert "never enrolled" not in out
+    assert "after that token was revoked, run `synapse login --reenroll`" in out
 
 
 @pytest.mark.parametrize("how", ["prompt", "stdin"])

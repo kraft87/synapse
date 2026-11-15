@@ -875,6 +875,7 @@ def test_an_inert_session_shows_nothing_sends_nothing_and_refuses_tools(
     plugin, server, tmp_path, kwargs
 ):
     provider = _start(_new(plugin), tmp_path / "hermes-a", **kwargs)
+    assert provider.get_tool_schemas() == []  # Hermes shows the model none of them
     assert provider.system_prompt_block() == ""
     assert provider.prefetch("anything") == ""
     _say(provider, _conversation(1), _SID)
@@ -898,6 +899,14 @@ def test_before_initialize_the_schemas_are_served_and_a_call_is_refused(plugin, 
     out = json.loads(provider.handle_tool_call("recall", {"query": "cache"}))
     assert "local sessions only" in out["error"]
     assert server.seen == []
+
+
+def test_an_active_session_shows_the_model_every_tool(plugin, server, tmp_path):
+    provider = _new(plugin)
+    before = provider.get_tool_schemas()
+    _start(provider, tmp_path / "hermes-a")
+    assert provider.get_tool_schemas() == before
+    assert "recall" in {s["name"] for s in before}
 
 
 def test_a_tool_call_reaches_the_server_with_its_arguments(plugin, server, tmp_path):
