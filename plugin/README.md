@@ -78,8 +78,8 @@ claude plugin install synapse@synapse --config SYNAPSE_URL=<your-synapse>
 ```
 
 Then `/reload-plugins` (or restart) to activate the hooks + MCP server. Re-running
-`synapse login` on an enrolled machine keeps its device token and only re-wires;
-`--reenroll` replaces the token.
+`synapse login` on an enrolled machine, or one set up with `--token`, keeps its device token
+and only re-wires; `--reenroll` replaces the token with one from a sign-in.
 
 Already in a session with the plugin installed the old way (`/plugin install`)? `! synapse-login`
 runs the same command from the plugin's own `bin/`, and copies the answers the old install

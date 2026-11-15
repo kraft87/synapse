@@ -2308,7 +2308,10 @@ def test_a_machine_set_up_with_a_token_is_not_signed_in_again(cli, capsys):
 
     assert cli.signins == [] and cli.login_argv == []
     assert cli.wired == [("codex", _URL, False)]
-    assert "never enrolled by signing in" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Using the device token stored in" in out
+    assert "never enrolled" not in out
+    assert "after that token was revoked, run `synapse login --reenroll`" in out
 
 
 @pytest.mark.parametrize("how", ["prompt", "stdin"])
