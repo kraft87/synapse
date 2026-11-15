@@ -203,10 +203,10 @@ class Toggle:
         self._say(f"private mode OFF for {session_id} (marker removed, server row deleted)")
         # The turns the server dropped while it was private may have been noted as shipped
         # (a Hermes session whose marker went before its row did): they go again.
-        try:
-            shipped.forget_everywhere(self.client.settings, session_id)
-        except OSError as err:
-            self._warn(f"  the record of what was sent could not be cleared ({_why(err)})")
+        for directory, failure in shipped.forget_everywhere(self.client.settings, session_id):
+            self._warn(
+                f"  the record of what was sent in {directory} could not be cleared ({_why(failure)})"
+            )
         return 0
 
     def status(self, session_id: str) -> int:

@@ -113,3 +113,28 @@ def test_ledger_directories_are_owner_only(tmp_path: Path) -> None:
             tmp_path / "shipped" / "hermes" / "key",
         ):
             assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+
+
+def test_forget_everywhere_clears_every_ledger_it_can(tmp_path: Path) -> None:
+    """One ledger folder that cannot be cleared does not stop the others; it is reported."""
+    import os
+    from types import SimpleNamespace
+
+    from synapse_client.shipped import forget_everywhere
+
+    if os.name == "nt" or os.geteuid() == 0:
+        return  # file modes do not stop this writer
+    settings = SimpleNamespace(home=tmp_path)
+    folders = [tmp_path / "shipped" / "hermes" / name for name in ("a", "b", "c")]
+    for folder in folders:
+        Ledger(folder).add("s", ["u1"])
+    folders[0].chmod(0o500)  # the first one cannot be written
+    try:
+        failed = forget_everywhere(settings, "s")
+    finally:
+        folders[0].chmod(0o700)
+    assert [folder for folder, _ in failed] == [folders[0]]
+    assert Ledger(folders[0]).load("s").uids == {"u1"}
+    for folder in folders[1:]:
+        got = Ledger(folder).load("s")
+        assert got.uids == frozenset() and got.cleared == 1

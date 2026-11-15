@@ -328,7 +328,13 @@ def directories(settings: Any) -> list[Path]:
         return []
 
 
-def forget_everywhere(settings: Any, session_id: str) -> None:
-    """``Ledger.forget`` in every ledger under the Synapse home. RAISES OSError."""
+def forget_everywhere(settings: Any, session_id: str) -> list[tuple[Path, OSError]]:
+    """``Ledger.forget`` in every ledger under the Synapse home, each on its own: one
+    that cannot be cleared does not stop the others. Returns the ones that failed."""
+    failed: list[tuple[Path, OSError]] = []
     for directory in directories(settings):
-        Ledger(directory).forget(session_id)
+        try:
+            Ledger(directory).forget(session_id)
+        except OSError as err:
+            failed.append((directory, err))
+    return failed

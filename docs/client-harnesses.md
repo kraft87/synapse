@@ -502,6 +502,15 @@ tool calls. Not recovered: the instruction inside a `/skill` scaffold the CLI st
 whole, which is synthetic as a whole; a row Hermes rewrites after it was shipped keeps
 the version shipped; a rewind cannot withdraw what was shipped.
 
+Not stored, as in the released client: after a run fails, a message the user types
+next is lost when Hermes folds it into a marker row (a `/model` switch) or a note row
+(a delivered background notice). That row goes as synthetic, since the failed message
+still waits for its reply. The failed message is stored with the next reply. One rarer
+case is worse than the released client: when such a row is later shown unfolded (an
+in-place compaction that hands back the stored rows), the released client can still
+store the lost message and this one does not. It has not been seen in real Hermes and
+was found by a test. `synapse import hermes` does not recover it either.
+
 **Past sessions.** `synapse import hermes` (plugin/scripts/import_hermes.py) reads
 `<hermes_home>/state.db` read-only, in one transaction, and refuses a schema version it
 does not know. `harnesses/hermes/history.py` holds the rules. A session is imported when
