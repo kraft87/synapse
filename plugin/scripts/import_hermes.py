@@ -6,6 +6,7 @@
     synapse import hermes --yes               # scripted: no prompts, import everything
     synapse import hermes --hermes-home PATH  # another home (default $HERMES_HOME, ~/.hermes)
     synapse import hermes --dry-run           # the summary and one line per session, nothing sent
+    synapse import hermes --no-hermes-scrub   # send the stored text even when Hermes cannot scrub it
 
 Reads ``<hermes_home>/state.db`` read-only and sends the finished turns of the sessions
 the live memory provider would have uploaded, to the same ``/ingest`` route in the same
@@ -14,7 +15,14 @@ through the provider's own reader and records what it sends in the provider's le
 (``<hermes_home>/synapse/shipped``): a row the provider or an earlier import shipped is
 not sent again, and the provider does not send again what the import sent. A turn sent
 twice anyway maps to the same span id, so the server keeps one copy: interrupting and
-re-running is safe. Private sessions, and sessions holding turns of a private one, are skipped:
+re-running is safe.
+
+Hermes's store holds the rows unscrubbed; the live provider gets them from Hermes with
+secrets masked. So the import has Hermes scrub what it read, with Hermes's own code run
+by Hermes's interpreter (harnesses/hermes/scrub.py), before anything is sent. When
+Hermes's scrub cannot be run, nothing is sent: ``--no-hermes-scrub`` sends the stored
+text as clients up to 0.24.22 did, which leaves secrets to the server's own redaction
+at ingest. Private sessions, and sessions holding turns of a private one, are skipped:
 by the marker in the private folder and by the server's row.
 
 Each imported turn runs KG extraction on the server's LLM, so the interactive run asks
@@ -35,7 +43,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from synapse_client import __version__, private
 from synapse_client.api import Client
-from synapse_client.harnesses.hermes import history
+from synapse_client.harnesses.hermes import history, scrub
 from synapse_client.harnesses.hermes.install import default_home
 from synapse_client.settings import Settings
 from synapse_client.shipped import Ledger
@@ -124,18 +132,36 @@ def _short(session_id: str) -> str:
     return session_id if len(session_id) <= 24 else session_id[:22] + ".."
 
 
-def ledger_of(home: str) -> Ledger:
-    """The ledger the live provider keeps under ``home``."""
-    return Ledger(os.path.join(home, "synapse", "shipped"))
+def ledger_of(settings: Settings) -> Ledger:
+    """The ledger the live provider keeps (under the Synapse home)."""
+    return Ledger(os.path.join(str(settings.home), "shipped", "hermes"))
 
 
-def send(client: Client, session, ledger: Ledger | None = None) -> int:
-    """POST one session's turns; returns how many the server took as new. Each body the
-    server took is recorded in ``ledger``. RAISES private.PrivateSession, before any
-    request of that batch, for a session gone private since, and what a failed request
-    raises."""
+def scrubbed(chosen, home: str, python: str | None):
+    """``{session id: [(payload, new turns), ...]}`` for ``chosen``, every payload's
+    records scrubbed by Hermes (scrub.rows), or None when Hermes could not scrub them."""
+    plans = {s.id: history.batches(s) for s in chosen}
+    keyed = {
+        f"{sid}\x00{i}": payload["records"]
+        for sid, plan in plans.items()
+        for i, (payload, _) in enumerate(plan)
+    }
+    done = scrub.rows(keyed, python, home)
+    if done is None:
+        return None
+    for sid, plan in plans.items():
+        for i, (payload, _) in enumerate(plan):
+            payload["records"] = done[f"{sid}\x00{i}"]
+    return plans
+
+
+def send(client: Client, session, ledger: Ledger | None = None, plan=None) -> int:
+    """POST one session's turns (``plan``: its scrubbed bodies, ``scrubbed``; else as
+    read); returns how many the server took as new. Each body the server took is
+    recorded in ``ledger``. RAISES private.PrivateSession, before any request of that
+    batch, for a session gone private since, and what a failed request raises."""
     ingested = 0
-    for payload, new_turns in history.batches(session):
+    for payload, new_turns in plan if plan is not None else history.batches(session):
         reply = client.ingest(payload, timeout=TIMEOUT)
         if ledger is not None:
             try:
@@ -168,11 +194,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--dry-run", action="store_true", help="show what would be imported; send nothing"
     )
+    ap.add_argument(
+        "--no-hermes-scrub",
+        action="store_true",
+        help="send the stored text when Hermes's secret scrub cannot be run "
+        "(the server's own redaction still applies)",
+    )
     args = ap.parse_args(argv)
 
     home = os.path.expanduser(args.hermes_home) if args.hermes_home else str(default_home())
     try:
-        ledger = ledger_of(home)
+        ledger = ledger_of(Settings.load())
         sessions = history.read(home, ledger=ledger)
     except FileNotFoundError:
         print(f"{PROGRAM}: no session store at {os.path.join(home, 'state.db')}", file=sys.stderr)
@@ -251,18 +283,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        return _ship(client, chosen, ledger)
+        plans = scrubbed(chosen, home, scrub.interpreter())
+        if plans is None and not args.no_hermes_scrub:
+            print(
+                f"{PROGRAM}: Hermes's secret scrub could not be run (the hermes program, or "
+                "its agent package, was not found). Nothing was sent. Re-run with "
+                "--no-hermes-scrub to send the stored text; the server still redacts "
+                "credentials it recognises.",
+                file=sys.stderr,
+            )
+            return 1
+        return _ship(client, chosen, ledger, plans)
     except KeyboardInterrupt:
         print("\nInterrupted. Turns already sent are kept (dedup by span_id): re-run to resume.")
         return 130
 
 
-def _ship(client: Client, chosen, ledger: Ledger | None = None) -> int:
+def _ship(client: Client, chosen, ledger: Ledger | None = None, plans=None) -> int:
     ok = failed = refused = ingested_total = 0
     for i, s in enumerate(chosen, 1):
         label = f"[{i}/{len(chosen)}] {_short(s.id)}"
         try:
-            n = send(client, s, ledger)
+            n = send(client, s, ledger, plans.get(s.id) if plans else None)
         except private.PrivateSession:
             refused += 1
             print(f"{label} -> skipped (private mode)", flush=True)

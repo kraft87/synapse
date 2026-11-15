@@ -39,7 +39,7 @@ import urllib.error
 from collections.abc import Sequence
 from typing import Any, TextIO
 
-from . import private
+from . import private, shipped
 from .api import Client
 
 #: What a request to the server raises: no answer, an HTTP error, or a reply that is not
@@ -201,6 +201,12 @@ class Toggle:
                 "server no longer lists the session as private."
             )
         self._say(f"private mode OFF for {session_id} (marker removed, server row deleted)")
+        # The turns the server dropped while it was private may have been noted as shipped
+        # (a Hermes session whose marker went before its row did): they go again.
+        try:
+            shipped.forget_everywhere(self.client.settings, session_id)
+        except OSError as err:
+            self._warn(f"  the record of what was sent could not be cleared ({_why(err)})")
         return 0
 
     def status(self, session_id: str) -> int:

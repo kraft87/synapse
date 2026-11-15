@@ -54,8 +54,6 @@ class _Session:
         self.sent: set[str] = set()
         # Row ids shipped (with a ledger: as recorded on disk, read again at each upload).
         self.shipped: set[str] = set()
-        # Row ids copied from the sessions this one goes on from (``note_copies``).
-        self.copied: set[str] = set()
         # Turns not handed over yet that the conversation may no longer hold when they
         # can be (a compression in place): by key, oldest first, each with its context.
         self.kept: dict[str, _Pair] = {}
@@ -132,20 +130,6 @@ class TurnUploader:
             elif not state.closed:
                 state.close()
 
-    def note_copies(self, session_id: str, uids: Iterable[str]) -> None:
-        """Rows of ``session_id`` with one of ``uids`` are copies of another session's
-        rows (a branch, a compressed continuation): never uploaded under this id, nor
-        sent as context. A turn that goes on after its copied rows sends what follows
-        them, as the rest of a turn shipped in part."""
-        found = {one for one in uids if one}
-        if not found:
-            return
-        with self._lock:
-            state = self._sessions.get(session_id)
-            if state is None:
-                state = self._sessions[session_id] = _Session(self._lookback)
-            state.copied |= found
-
     def _record(
         self, session_id: str, turns: Sequence[messages.Turn], *, passed: bool = False
     ) -> None:
@@ -155,10 +139,12 @@ class TurnUploader:
         if self.ledger is None or not turns:
             return
         uids = [uid for turn in turns for uid in messages.ids(turn)]
-        keys = [messages.turn_key(turn) for turn in turns if not messages.ids(turn)]
+        # A turn that went whole is recorded by its key too: a later turn may then lead
+        # with it as context (messages.pending).
+        keys = [messages.turn_key(turn) for turn in turns if messages.whole(turn)]
         try:
             if passed:
-                self.ledger.add(session_id, keys=keys, passed=uids)
+                self.ledger.add(session_id, passed=uids)
             else:
                 self.ledger.add(session_id, uids, keys)
         except OSError as err:
@@ -252,13 +238,10 @@ class TurnUploader:
                 windowed = older
                 state.lookback = None
             selected: list[_Pair] = []
-            gone = state.shipped | state.copied  # rows not to send again under this id
-            for before, turn in messages.pending(all_turns, state.sent, shipped=gone):
+            for before, turn in messages.pending(all_turns, state.sent, shipped=state.shipped):
                 if opening(turn) in state.copies or opening(turn) == held:
                     continue
-                if before is not None and (
-                    opening(before) in state.copies or opening(before) in state.copied
-                ):
+                if before is not None and opening(before) in state.copies:
                     before = None
                 selected.append((before, turn))
             if waiting:
@@ -278,7 +261,7 @@ class TurnUploader:
                 ]
                 state.kept.clear()
                 # Claimed before the request: a concurrent upload must not send them again.
-                state.sent |= {key(turn) for _, turn in selected}
+                state.sent |= {key(turn) for _, turn in selected if messages.whole(turn)}
                 state.shipped |= {uid for _, turn in selected for uid in messages.ids(turn)}
         self._record(session_id, windowed, passed=True)
         if waiting:

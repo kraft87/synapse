@@ -5,9 +5,9 @@ message dicts of its own transcript (OpenAI-style, plus Hermes's bookkeeping key
 :func:`to_records` keeps only what the server's ``messages`` parser reads and builds new
 dicts; the input is never modified, since those dicts are Hermes's own.
 
-The same conversion serves the dicts Hermes rebuilds from its session store
-(store.py), which is what the provider normally reads, and the live list, which it
-reads when the store cannot be (provider.py).
+The live provider converts the list Hermes hands it, which Hermes scrubbed of secrets
+for providers; it takes only each row's ``display_kind`` from the session store, by uid
+(``kinds``). The importer converts the dicts it rebuilds from the store (store.py).
 
 What a record keeps: ``role`` (user, assistant and tool only), the text content (a
 string, or the text parts of a list joined by newlines; on a user row each image is a
@@ -45,12 +45,16 @@ actually sent, with the memory context it injected, our own nudge included), not
   which can quote files, web pages or other people. Every other kind is written inside
   a run (``steer``) or between runs and answered by none (``model_switch``,
   ``personality_switch``): synthetic, in the turn it lands in.
-- A user row Hermes folded another message into holds messages typed at different
-  times: one typed after a message that got no reply (agent/agent_runtime_helpers.py
-  ``_merge_consecutive_users``, which leaves ``_merged_turn_prefix`` on the row, and
-  ``_absorbed_message_uids`` in the store too), or rows a compression merged
-  (agent/conversation_compression.py and agent/micro_compaction.py leave
-  ``_absorbed_message_uids`` as well). It is sent as it is, followed by a ``synthetic``
+- A user row Hermes folded the next message into (agent/agent_runtime_helpers.py
+  ``_merge_consecutive_users``: a marker, a note or a message that got no reply, then
+  the next message, joined by a blank line, the first one's text kept as
+  ``_merged_turn_prefix``) is sent as the two rows it was (``_split``) when the first
+  is one Hermes wrote (synthetic by its text or by the ``display_kind`` the store holds
+  for the row's uid): that one under the row's own uid, the user's message under the
+  uid Hermes noted it absorbed. A first part the user wrote (a message that got no
+  reply) keeps the row whole, as one ask.
+  Any other row that holds more than one message (rows a compression merged, which
+  leave only ``_absorbed_message_uids``) is sent as it is, followed by a ``synthetic``
   row with no text, which says so to the core: ``messages.joined`` cannot read it off
   one row.
 - An assistant row is a reply only when it shows what the user got. Hermes types the
@@ -119,7 +123,8 @@ _RUN_KINDS = frozenset(
 )
 _MEMORY_CONTEXT = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL)
 _SUMMARY_KEY = "_compressed_summary"
-_MERGED_KEYS = ("_merged_turn_prefix", "_absorbed_message_uids")
+_PREFIX_KEY = "_merged_turn_prefix"
+_MERGED_KEYS = (_PREFIX_KEY, "_absorbed_message_uids")
 _SYNTHETIC_FLAGS = (
     "_todo_snapshot_synthetic",
     "_empty_recovery_synthetic",
@@ -293,19 +298,64 @@ def _record(message: Any) -> Record | None:
     return record
 
 
-def to_records(messages: Iterable[Any] | None) -> list[Record]:
-    """The ``/ingest`` records for Hermes's ``messages``, in order. Never modifies them,
-    never raises over a malformed entry (it is skipped)."""
+def _kind(message: Any, kinds: Mapping[str, str] | None) -> Any:
+    """``message`` with the ``display_kind`` the store holds for its uid, when its live
+    dict has none."""
+    if not kinds or not isinstance(message, Mapping) or message.get("display_kind"):
+        return message
+    kind = kinds.get(str(message.get("message_uid") or ""))
+    return {**message, "display_kind": kind} if kind else message
+
+
+def _split(message: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """A user row Hermes folded the next message into, as the two rows it was: the text
+    that got no reply (``_merged_turn_prefix``, under the row's own uid) and the message
+    after it (under the uid Hermes noted it absorbed, when it noted one). Hermes joins
+    them with a blank line and splits them the same way (agent/agent_runtime_helpers.py
+    ``_merge_consecutive_users``, agent/session_persistence.py
+    ``_content_with_turn_override``). None when the row is not such a row or its text no
+    longer starts with the prefix: it is then sent as it is."""
+    prefix = message.get(_PREFIX_KEY)
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(prefix, str) or not prefix:
+        return None
+    if not isinstance(content, str) or not content.startswith(prefix + "\n\n"):
+        return None
+    head = {k: v for k, v in message.items() if k not in _MERGED_KEYS}
+    head["content"] = prefix
+    rest = {k: v for k, v in head.items() if k not in ("message_uid", "display_kind")}
+    rest["content"] = content[len(prefix) + 2 :]
+    absorbed = message.get("_absorbed_message_uids")
+    if isinstance(absorbed, list) and len(absorbed) == 1 and isinstance(absorbed[0], str):
+        rest["message_uid"] = absorbed[0]
+    return [head, rest]
+
+
+def to_records(
+    messages: Iterable[Any] | None, kinds: Mapping[str, str] | None = None
+) -> list[Record]:
+    """The ``/ingest`` records for Hermes's ``messages``, in order. ``kinds``: the
+    ``display_kind`` the session store holds for a row, by ``message_uid``, for a row
+    whose live dict has lost it (Hermes rebuilt the agent, or merged the row). Never
+    modifies the messages, never raises over a malformed entry (it is skipped)."""
     records: list[Record] = []
     for message in messages or ():
-        record = _record(message)
-        if record is None:
-            continue
-        records.append(record)
-        if (
-            record["role"] == "user"
-            and not record.get("synthetic")
-            and any(message.get(key) for key in _MERGED_KEYS)
-        ):
-            records.append({"role": "user", "content": "", "synthetic": True})
+        parts = _split(message) if isinstance(message, Mapping) else None
+        if parts is not None:
+            head = _record(_kind(parts[0], kinds))
+            if head is None or not head.get("synthetic"):
+                parts = None  # a message that got no reply: the two stay one turn's ask
+        for one in parts or (message,):
+            one = _kind(one, kinds)
+            record = _record(one)
+            if record is None:
+                continue
+            records.append(record)
+            if (
+                parts is None
+                and record["role"] == "user"
+                and not record.get("synthetic")
+                and any(one.get(key) for key in _MERGED_KEYS)
+            ):
+                records.append({"role": "user", "content": "", "synthetic": True})
     return records

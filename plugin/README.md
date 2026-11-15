@@ -325,14 +325,13 @@ session), so the server can record which lines it served to the session. Each to
 a reply, not after one that failed or was cut short: a `POST /ingest` (format
 `messages`, client `hermes`) holding the session id, the project label and working
 directory, the model name, and per message its role, text, tool-call names and
-arguments (first 1000 characters), tool results (first 2000) and timestamp. The turns
-are read from Hermes's session store, `$HERMES_HOME/state.db`, read-only, up to the turn
-that just ended; each stored row is sent once, and what was sent is kept in
-`$HERMES_HOME/synapse/shipped/`. A reply you stopped while it came in is stored by
-Hermes as far as it got, and goes up with the next one. A background task's report is
-not sent, only the reply to it. When the store cannot be read (a newer Hermes whose
-store this client does not know), the conversation Hermes hands over is sent instead,
-and `synapse status` says so.
+arguments (first 1000 characters), tool results (first 2000) and timestamp. The text is
+what Hermes hands its memory provider, which Hermes has scrubbed of secrets; each row is
+sent once, and what was sent is kept in `~/.synapse/shipped/hermes/`. From Hermes's
+session store, `$HERMES_HOME/state.db`, read-only, the provider reads only how Hermes
+labelled each row and who started each turn. A reply you stopped while it came in is
+stored by Hermes as far as it got, and goes up with the next one. A background task's
+report is not sent, only the reply to it.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its

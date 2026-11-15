@@ -1,37 +1,44 @@
-"""Hermes's session store, ``<hermes_home>/state.db``, read for uploads.
+"""Hermes's session store, ``<hermes_home>/state.db``, read by the client.
 
-The live provider and ``synapse import hermes`` read a session's conversation here, with
-the same code, so both send the same rows in the same records (hermes/messages.py
-``to_records``).
+``synapse import hermes`` reads past sessions' rows here (``rows``). The live provider
+reads only two things that are not text: each row's ``display_kind`` (``kinds``) and who
+started each turn the gateway ran (``admitted_others``); the rows it sends come from the
+list Hermes hands it (source.py says why).
 
 What it reads
 -------------
 The store is opened read-only (``mode=ro``), by a URI built from the absolute path
-(``Path.as_uri``, which also spells a Windows path), and read in one transaction, so a
-running Hermes is neither blocked for long nor seen half-way: Hermes writes each flush
-of a turn in one transaction (hermes_state_messages.py ``append_messages_batch``). A
-``schema_version`` other than SCHEMA_VERSIONS, or a table or column this module reads
-that is not there, raises SchemaError before any row is read.
+(``uri``, which also spells a Windows drive or UNC path), and read in one transaction,
+so a running Hermes is neither blocked for long nor seen half-way. A ``schema_version``
+other than SCHEMA_VERSIONS, or a table or column this module reads that is not there,
+raises SchemaError before any row is read.
 
 The rows of a session are the live ones and those an in-place compaction archived
 (``active=1 OR compacted=1``): what the conversation showed at some point. A row
-removed by an undo or rewind is left out. They come in id order, and each
+removed by an undo or rewind is left out, and so is a prompt the TUI wrote as it
+accepted it while a run was going (``display_metadata._queued_prompt``): Hermes writes
+it again, at its place in the conversation, when the run that answers it starts
+(tui_gateway/session_auto_continue.py), and the early row is deactivated then, or
+archived with it by a compaction during the run. They come in id order, and each
 ``message_uid`` once, at its first row: a compaction clones the rows it keeps with
 their uid (its summary takes the uid of a row it replaces), a branch or a compressed
-continuation clones its parent's rows into the new session with theirs. ``until``
-stops the read at the first row of one uid: the last row of the run a hook reports,
-so a run that started since (its user row is written as it is submitted, its tool rows
-as they come) is not read.
+continuation clones its parent's rows into the new session with theirs.
+
+What the store is not: the rows are not scrubbed of secrets (Hermes scrubs only what it
+hands a provider); a queued prompt's first row sits where it was accepted; a row Hermes
+could not write is not there; archived rows stay; a ``display_kind`` can be stamped
+after the run; a row can be rewritten after it was first written.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import urllib.parse
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any
 
 #: The ``schema_version`` values of Hermes's session store this reader knows.
 SCHEMA_VERSIONS = frozenset({33})
@@ -68,6 +75,7 @@ COLUMNS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "display_kind",
             "message_uid",
             "absorbed_message_uids",
+            "display_metadata",
         ),
         "state_meta": ("key", "value"),
         "session_admissions": ("principal_id", "target_session_id"),
@@ -91,28 +99,36 @@ _ROW_NAMES = (
     "display_kind",
     "message_uid",
     "absorbed_message_uids",
+    "display_metadata",
 )
 _ROWS_SQL = (
     "SELECT id, role, content, tool_calls, tool_name, timestamp, _compressed_summary, "
-    "display_kind, message_uid, absorbed_message_uids FROM messages "
+    "display_kind, message_uid, absorbed_message_uids, display_metadata FROM messages "
     "WHERE session_id=? AND (active=1 OR compacted=1) ORDER BY id"
 )
+#: The ``display_metadata`` key the TUI puts on a prompt it wrote as it accepted it
+#: during a run (tui_gateway/session_auto_continue.py).
+_QUEUED = "_queued_prompt"
 
 
 class SchemaError(Exception):
     """The store is not one this reader knows: nothing was read."""
 
 
-class Read(NamedTuple):
-    """A session's conversation as read: the rows as Hermes dicts, and whether the read
-    stopped at the uid it was asked to stop at (always True when none was asked)."""
-
-    messages: list[dict[str, Any]]
-    reached: bool
-
-
 def path(home: str | Path) -> Path:
     return Path(home) / "state.db"
+
+
+def uri(db: Path) -> str:
+    """A read-only SQLite URI for the absolute path ``db``. ``Path.as_uri`` spells a UNC
+    path ``file://server/share/...``, an authority SQLite refuses; it is spelled with an
+    empty authority instead (``file:////server/share/...``), which SQLite hands the
+    system as ``//server/share/...``."""
+    text = str(db)
+    if text.startswith(("\\\\", "//")):
+        tail = text.replace("\\", "/").lstrip("/")
+        return "file:////" + urllib.parse.quote(tail, safe="/:") + "?mode=ro"
+    return db.as_uri() + "?mode=ro"
 
 
 def connect(home: str | Path) -> sqlite3.Connection:
@@ -121,7 +137,7 @@ def connect(home: str | Path) -> sqlite3.Connection:
     db = path(home)
     if not db.is_file():
         raise FileNotFoundError(str(db))
-    return sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=DB_TIMEOUT)
+    return sqlite3.connect(uri(db.resolve()), uri=True, timeout=DB_TIMEOUT)
 
 
 def check_schema(conn: sqlite3.Connection) -> int:
@@ -197,37 +213,42 @@ def message(row: Mapping[str, Any]) -> dict[str, Any]:
     return msg
 
 
-def rows(conn: sqlite3.Connection, session_id: str, until: str | None = None) -> Read:
-    """A session's messages in order, each uid once at its first row (see the module
-    notes); with ``until``, up to and including the first row of that uid. ``reached``
-    is False when ``until`` was asked and no row of the session has it."""
+def rows(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    """A session's messages in order, each uid once at its first row, without the rows
+    a queued prompt's acceptance wrote (see the module notes)."""
     out: list[dict[str, Any]] = []
     seen: set[Any] = set()
     for values in conn.execute(_ROWS_SQL, (session_id,)):
         row = dict(zip(_ROW_NAMES, values, strict=True))
+        meta = loads(row["display_metadata"])
+        if isinstance(meta, dict) and meta.get(_QUEUED):
+            continue
         uid = row["message_uid"]
         key = ("uid", uid) if uid else ("row", row["role"], row["timestamp"], row["content"])
         if key in seen:
             continue
         seen.add(key)
         out.append(message(row))
-        if until is not None and uid == until:
-            return Read(out, True)
-    return Read(out, until is None)
+    return out
 
 
-def uids(conn: sqlite3.Connection, session_ids: Iterable[str]) -> set[str]:
-    """Every ``message_uid`` the sessions ``session_ids`` hold, live or archived."""
-    found: set[str] = set()
-    for sid in session_ids:
-        for (uid,) in conn.execute(
-            "SELECT message_uid FROM messages WHERE session_id=? AND message_uid IS NOT NULL "
-            "AND (active=1 OR compacted=1)",
-            (sid,),
-        ):
-            if isinstance(uid, str) and uid:
-                found.add(uid)
-    return found
+def kinds(conn: sqlite3.Connection, wanted: Iterable[str]) -> dict[str, tuple[str, str]]:
+    """``(role, display_kind)`` of the first row the store holds for each uid of
+    ``wanted`` (``display_kind`` empty when it has none); a uid it does not hold is not
+    in the answer."""
+    out: dict[str, tuple[str, str]] = {}
+    ids = [one for one in dict.fromkeys(wanted) if isinstance(one, str) and one]
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        marks = ",".join("?" for _ in chunk)
+        query = (
+            "SELECT message_uid, role, display_kind FROM messages WHERE message_uid IN ("
+            + marks
+            + ") ORDER BY id"
+        )
+        for uid, role, kind in conn.execute(query, chunk):
+            out.setdefault(uid, (str(role or ""), str(kind or "")))
+    return out
 
 
 def principals(conn: sqlite3.Connection, session_id: str) -> set[str]:

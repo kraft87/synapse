@@ -201,19 +201,6 @@ def selected_in(config: Path) -> bool:
     return provider_in(config) == PLUGIN
 
 
-def _fallback_note(home: Path) -> str:
-    """What ``synapse status`` adds when the last upload read Hermes's live list, not its
-    session store (provider.py ``_fell_back``). Never raises."""
-    try:
-        data = json.loads((home / "synapse" / "store_fallback.json").read_text("utf-8"))
-    except (OSError, ValueError):
-        return ""
-    reason = data.get("reason") if isinstance(data, dict) else None
-    if not isinstance(reason, str) or not reason:
-        return ""
-    return f"; uploads read the live list, not state.db ({reason})"
-
-
 class HermesHarness:
     """The Hermes harness. ``runner`` (subprocess.run's shape), ``which`` and ``env``
     are seams for tests."""
@@ -273,9 +260,7 @@ class HermesHarness:
             selected = self._selected(self._home())
         except Exception:
             return "installed; whether Hermes runs it could not be read"
-        if selected != _SELECTED:
-            return f"installed, {selected}"
-        return "wired" + _fallback_note(self._home())
+        return "wired" if selected == _SELECTED else f"installed, {selected}"
 
     def _selected(self, home: Path) -> str:
         """Whether ``home`` selects this provider: _SELECTED, else what it selects and

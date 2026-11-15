@@ -140,7 +140,7 @@ _message = store.message
 
 def _rows(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     """A session's messages in order, each uid once (store.rows)."""
-    return store.rows(conn, session_id).messages
+    return store.rows(conn, session_id)
 
 
 def records(conn: sqlite3.Connection, session_id: str) -> list[messages.Record]:

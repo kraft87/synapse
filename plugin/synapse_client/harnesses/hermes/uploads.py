@@ -1,11 +1,13 @@
-"""The upload half of the Hermes provider: whose turns a hook's upload is for, where its
-rows come from, and the send.
+"""The upload half of the Hermes provider: whose turns a hook's upload is for, and the
+send.
 
 ``Uploads`` is a mixin of provider.SynapseMemoryProvider and reads its state (the bound
-session, the turn uploader, the home, the gateway identity). An upload reads the
-session's rows from Hermes's store up to the row the hook named (source.py) and hands
-them to the core (turn_upload.TurnUploader); the list Hermes handed over stands in when
-the store cannot serve, and the reason is logged once.
+session, the turn uploader, the home, the gateway identity). An upload converts the
+list Hermes handed over (a copy taken as the hook ran), with each row's
+``display_kind`` from the session store where the list lost it, and hands the records
+to the core (turn_upload.TurnUploader), which sends each row once (shipped.Ledger).
+The store is also read for who started each gateway turn (source.py). A store that
+cannot be read costs only the kinds the list lost; the reason is logged once.
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ import logging
 import threading
 from typing import Any
 
-from ...messages import Record
 from ...turn_upload import TurnUploader
 from ...upload import Uploader
 from . import carried, source
+from . import messages as hm
 from . import sessions as hs
 from .live import Live
 
@@ -77,64 +79,52 @@ class Uploads:
     def _send(
         self,
         sid: str,
-        end: str | None,
-        listed: list[Record],
+        listed: list[dict[str, Any]],
         timeout: float,
         model: str,
         finished: bool = False,
     ) -> bool:
-        """Send the complete turns of session ``sid`` not shipped yet, up to the row
-        ``end``: read from the store (``_stored``), or ``listed`` when it cannot be
-        (turn_upload.TurnUploader). True when at least one batch reached the server.
-        ``finished``: a turn has just ended. The session's row is read as this runs: is
-        it still the owner's, and what does it continue (carried.Followed)."""
+        """Send the complete turns of session ``sid`` in ``listed`` (the rows Hermes
+        handed over) not shipped yet (turn_upload.TurnUploader). True when at least one
+        batch reached the server. ``finished``: a turn has just ended. The session's row
+        is read as this runs: is it still the owner's, and what does it continue
+        (carried.Followed)."""
         turns, uploader = self._turns, self._uploader
         verdict = self._verdict(sid) if turns is not None and uploader is not None else None
         if turns is None or uploader is None or verdict is None:
             return False
         self._followed.follow(uploader, turns, self._home, sid, verdict.continues, LOOKBACK)
-        records = self._stored(sid, end, verdict.continues, bool(listed))
-        if records is None:
-            return False
-        if isinstance(records, str):
-            records = listed
-        about = {"project": self._project, "cwd": self._cwd, "model": model or None}
-        return turns.upload(records, sid, timeout=timeout, finished=finished, **about)
-
-    def _stored(
-        self, sid: str, end: str | None, continues: tuple[str, ...], listed: bool = True
-    ) -> Any:
-        """The records of ``sid`` from the store up to the row ``end`` (source.read): a
-        list; a string saying why the store could not serve them (said and kept for
-        ``synapse status`` when a ``listed`` list stands in); None for a turn someone
-        else started, which turns this instance INERT."""
         got = source.read(
             self._home,
             sid,
-            end,
-            continues,
+            listed,
             gateway=self._gateway,
             owner=self._owner_id,
             route=self._route,
         )
         if got.foreign:
             self._authored()
-            return None
-        if got.records is None and not listed:
-            return got.reason
-        if got.records is None:
-            line = f"synapse: uploads read Hermes's live list, not its store: {got.reason}"
+            return False
+        if got.reason and listed:
+            line = f"synapse: display kinds were not read from Hermes's store: {got.reason}"
             with self._lock:
                 first = line not in self._said
                 self._said.add(line)
             if first:
                 _warn(line)
-            source.fell_back(self._home, got.reason)
-            return got.reason
-        if self._turns is not None:
-            self._turns.note_copies(sid, got.copied)
-        source.fell_back(self._home, None)
-        return got.records
+        if got.mismatched:
+            line = (
+                f"synapse: Hermes's list and its store disagree on {len(got.mismatched)} row(s) "
+                f"of session {sid}; they are sent as the list has them"
+            )
+            with self._lock:
+                first = line not in self._said
+                self._said.add(line)
+            if first:
+                _warn(line)
+        records = hm.to_records(listed, got.kinds)
+        about = {"project": self._project, "cwd": self._cwd, "model": model or None}
+        return turns.upload(records, sid, timeout=timeout, finished=finished, **about)
 
     def _drain(self, timeout: float) -> None:
         uploader = self._uploader

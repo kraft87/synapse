@@ -9,8 +9,12 @@ not to look back at the first time it met the session (``passed``): not shipped,
 an agent rebuilt mid-session (Hermes does on a model switch) and an import all see what
 was shipped before.
 
-One small JSON file per session, ``<directory>/<sha256 of the session id>.json``: the
-id may hold characters no file name can. A change is a read, a merge and a write, under
+One small JSON file per session, ``<directory>/<sha256 of the session id>.json`` (the
+Hermes provider's directory is ``<synapse home>/shipped/hermes``): the id may hold
+characters no file name can. A record a newer client wrote (a higher ``version``) is
+read as far as this one understands it and never rewritten; a damaged one is moved
+aside (``.damaged``) and counts as nothing shipped. ``forget`` removes a session's
+record: ``synapse private off --forget`` does, for every ledger under the Synapse home. A change is a read, a merge and a write, under
 an exclusive lock on ``<name>.lock`` (``fcntl`` on POSIX, ``msvcrt`` on Windows) and
 through a dot-prefixed temp file renamed into place, so two processes never lose each
 other's additions and a reader never sees half a file. Nothing is ever taken out: a
@@ -125,27 +129,44 @@ class Ledger:
         finally:
             handle.close()
 
-    def _read(self, file: Path, session_id: str) -> Shipped:
+    def _read(self, file: Path, session_id: str) -> tuple[Shipped, bool]:
+        """The record in ``file`` and whether this client may write over it: not one a
+        newer client wrote (it is read as far as this client understands it, and left
+        as it is). A damaged record is moved aside (``<name>.damaged``) and counts as
+        nothing shipped."""
         try:
             raw = file.read_bytes()
         except FileNotFoundError:
-            return nothing()
+            return nothing(), True
         except OSError as err:
             self._say(f"synapse: the shipped record of {session_id} could not be read ({err})")
-            return nothing()
+            return nothing(), False
         try:
             data = json.loads(raw.decode("utf-8"))
         except ValueError:
-            self._say(f"synapse: the shipped record of {session_id} is damaged; starting over")
-            return nothing()
-        if not isinstance(data, dict) or data.get("session_id") != session_id:
-            return nothing()
-        return Shipped(
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("version"), int):
+            self._say(f"synapse: the shipped record of {session_id} is damaged; it was moved aside")
+            try:
+                os.replace(file, file.with_name(file.name + ".damaged"))
+            except OSError:
+                return nothing(), False
+            return nothing(), True
+        if data.get("session_id") != session_id:
+            return nothing(), False
+        record = Shipped(
             _strings(data.get("uids")),
             _strings(data.get("keys")),
             True,
             _strings(data.get("passed")),
         )
+        if data["version"] > _VERSION:
+            self._say(
+                f"synapse: the shipped record of {session_id} was written by a newer client; "
+                "it is read, not changed"
+            )
+            return record, False
+        return record, True
 
     def load(self, session_id: str) -> Shipped:
         """What was shipped for ``session_id``. Never raises."""
@@ -155,7 +176,7 @@ class Ledger:
         try:
             handle = self._open_lock(file)
             try:
-                return self._read(file, session_id)
+                return self._read(file, session_id)[0]
             finally:
                 self._close_lock(handle)
         except OSError as err:
@@ -176,15 +197,15 @@ class Ledger:
         file = self._file(session_id)
         handle = self._open_lock(file)
         try:
-            now = self._read(file, session_id)
+            now, writable = self._read(file, session_id)
             merged = Shipped(
                 now.uids | _strings(uids),
                 now.keys | _strings(keys),
                 True,
                 now.passed | _strings(passed),
             )
-            if now.known and merged == now:
-                return now
+            if (now.known and merged == now) or not writable:
+                return merged
             body = {
                 "version": _VERSION,
                 "session_id": session_id,
@@ -194,6 +215,22 @@ class Ledger:
             }
             self._write(file, json.dumps(body, ensure_ascii=False).encode("utf-8"))
             return merged
+        finally:
+            self._close_lock(handle)
+
+    def forget(self, session_id: str) -> None:
+        """Forget what was shipped for ``session_id``: ``synapse private off --forget``
+        put it back on the record, and the turns the server dropped while it was private
+        must go again. RAISES OSError when the record exists and cannot be removed."""
+        if not session_id or not self.directory.is_dir():
+            return
+        file = self._file(session_id)
+        handle = self._open_lock(file)
+        try:
+            try:
+                os.remove(file)
+            except FileNotFoundError:
+                pass
         finally:
             self._close_lock(handle)
 
@@ -220,3 +257,18 @@ class Ledger:
             except OSError:
                 pass
             raise
+
+
+def directories(settings: Any) -> list[Path]:
+    """Where harnesses keep their ledgers under the Synapse home of ``settings``."""
+    root = Path(settings.home) / "shipped"
+    try:
+        return [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
+def forget_everywhere(settings: Any, session_id: str) -> None:
+    """``Ledger.forget`` in every ledger under the Synapse home. RAISES OSError."""
+    for directory in directories(settings):
+        Ledger(directory).forget(session_id)

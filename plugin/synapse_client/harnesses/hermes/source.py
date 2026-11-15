@@ -1,150 +1,99 @@
-"""Where a Hermes upload's rows come from.
+"""What a Hermes upload takes from the session store besides the list Hermes hands over.
 
-Hermes writes a turn's rows to its session store before it calls ``sync_turn``
-(agent/turn_finalizer.py persists, then mirrors the turn to memory providers), so an
-upload reads them there (``read``): the session's rows up to the last row of the list
-Hermes handed over (``end_uid``), and no further, since the next run's rows are written
-as it goes (its user row as it is submitted, its tool rows as they come). The store
-keeps what the list does not always hold: each row's ``display_kind`` after Hermes
-rebuilt the agent, the marker and the message after it as two rows, and the rows a
-compaction archived.
+The rows an upload sends come from the list Hermes hands a memory provider: it is the
+run as Hermes ran it (a prompt queued during a run sits where it was answered, not where
+it was accepted), it holds the rows Hermes could not write, and Hermes scrubbed every
+string in it of secrets before the hand-off (agent/memory_manager.py
+``_redact_for_provider``), which the store's rows are not. The store gives two things
+the list does not always hold, and neither is text:
 
-The list stands in when the store cannot serve: there is no home or no ``state.db``, it
-cannot be opened or read, its schema is not one store.py knows (a newer Hermes), or the
-row the hook names is not in it (Hermes failed to write the turn, or the list holds no
-stored row). ``fell_back`` keeps the reason in ``<hermes_home>/synapse/store_fallback.json``
-for ``synapse status``, and clears it when the store serves again.
+- each row's ``display_kind``, by ``message_uid``: the list loses it after Hermes
+  rebuilds the agent (a model switch) and when it folds a marker into the next message;
+- who started each turn the gateway ran (``session_admissions``): for a gateway session,
+  a turn admitted from anyone but the owner and the session's own automation means
+  nothing more is uploaded (``foreign``).
 
-The store is the better witness of who started a turn, too: for a session the gateway
-runs, a turn admitted from anyone but the owner and the session's own automation
-(``foreign``) means nothing is uploaded and the provider turns INERT. And the rows a
-session holds of the sessions it goes on from (a branch, a compressed continuation) are
-known by uid (``copied``), so they are never uploaded under the new id.
+It is also a check: a list row whose uid the store holds under another role is named
+(``mismatched``), and the caller logs it once; the row goes as the list has it, as in
+the released client. When the store cannot be read (no home, no ``state.db``, an error,
+a schema store.py does not know), or does not hold a row (Hermes could not write it),
+the list goes up as it is, with the kinds it holds, as in the released client; the
+reason is logged once by the caller.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, NamedTuple
 
-from ...messages import Record
-from . import messages as hm
 from . import store
 
-#: Where the reason the last upload read the live list, not the store, is kept.
-FALLBACK_FILE = "store_fallback.json"
 
+class Attributes(NamedTuple):
+    """What ``read`` found: the stored ``display_kind`` by uid, the uids whose stored
+    role is not the list's (``mismatched``), whether a turn of the session was admitted
+    from someone else, and why the store was not read (empty when it was)."""
 
-class Got(NamedTuple):
-    """What ``read`` found: the records (None when the list must stand in, with
-    ``reason``), the row uids the session holds of earlier sessions, and whether a
-    turn of the session was admitted from someone else."""
-
-    records: list[Record] | None
-    reason: str = ""
-    copied: frozenset[str] = frozenset()
+    kinds: dict[str, str]
     foreign: bool = False
+    reason: str = ""
+    mismatched: tuple[str, ...] = ()
 
 
-def end_uid(messages: Any) -> str | None:
-    """The ``message_uid`` of the last row of ``messages`` that has one: the last row
-    Hermes wrote of the run a hook reports."""
-    for message in reversed(messages or ()):
+def uids(messages: Iterable[Any]) -> list[str]:
+    """The ``message_uid`` of every row of ``messages`` that has one."""
+    out = []
+    for message in messages or ():
         uid = message.get("message_uid") if isinstance(message, Mapping) else None
         if isinstance(uid, str) and uid:
-            return uid
-    return None
+            out.append(uid)
+    return out
 
 
 def read(
     home: Any,
     session_id: str,
-    end: str | None,
-    continues: Iterable[str] = (),
+    wanted: Iterable[Any],
     *,
     gateway: bool = False,
     owner: str | None = None,
     route: str | None = None,
-) -> Got:
-    """The records of ``session_id`` read from ``<home>/state.db``, up to the row
-    ``end``. Never raises."""
+) -> Attributes:
+    """The stored kinds of the rows ``wanted`` (the list's rows, or their uids), the
+    rows whose stored role differs from the list's, and the admissions check. A row the
+    store does not hold (Hermes could not write it) is not a mismatch: it goes as the
+    list has it. Never raises."""
+    given = list(wanted)
+    rows = [w for w in given if isinstance(w, Mapping)]
+    wanted = uids(rows) if rows else [w for w in given if isinstance(w, str)]
     if not home:
-        return Got(None, "no Hermes home was named")
-    if end is None:
-        return Got(None, "Hermes named no stored row for the turn")
+        return Attributes({}, reason="no Hermes home was named")
     try:
         conn = store.connect(home)
     except FileNotFoundError:
-        return Got(None, "there is no state.db")
+        return Attributes({}, reason="there is no state.db")
     except (sqlite3.Error, OSError, ValueError) as err:
-        return Got(None, f"state.db could not be opened ({type(err).__name__})")
+        return Attributes({}, reason=f"state.db could not be opened ({type(err).__name__})")
     try:
-        conn.execute("BEGIN")  # one snapshot of a store Hermes may be writing
+        conn.execute("BEGIN")
         store.check_schema(conn)
         if gateway and store.admitted_others(conn, session_id, owner, route):
-            return Got(None, "", foreign=True)
-        got = store.rows(conn, session_id, until=end)
-        copied = store.uids(conn, [one for one in continues if one and one != session_id])
+            return Attributes({}, foreign=True)
+        stored = store.kinds(conn, wanted)
     except store.SchemaError as err:
-        return Got(None, str(err))
+        return Attributes({}, reason=str(err))
     except (sqlite3.Error, OSError, ValueError) as err:
-        return Got(None, f"state.db could not be read ({type(err).__name__})")
+        return Attributes({}, reason=f"state.db could not be read ({type(err).__name__})")
     finally:
         conn.close()
-    if not got.reached:
-        return Got(None, "the turn's last row is not in state.db")
-    return Got(hm.to_records(got.messages), copied=frozenset(copied))
-
-
-def last_uid(home: Any, session_id: str) -> str | None:
-    """The ``message_uid`` of the newest row of ``session_id`` in the store, or None
-    when there is none or the store cannot be read. Never raises."""
-    if not home or not session_id:
-        return None
-    try:
-        conn = store.connect(home)
-    except (FileNotFoundError, sqlite3.Error, OSError, ValueError):
-        return None
-    try:
-        row = conn.execute(
-            "SELECT message_uid FROM messages WHERE session_id=? AND message_uid IS NOT NULL "
-            "AND (active=1 OR compacted=1) ORDER BY id DESC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
-    return row[0] if row and isinstance(row[0], str) and row[0] else None
-
-
-def fell_back(home: Any, reason: str | None) -> None:
-    """Keep ``reason`` (the list stood in) for ``synapse status``; with None, the store
-    served and the reason is cleared. Never raises."""
-    if not home:
-        return
-    file = Path(str(home)) / "synapse" / FALLBACK_FILE
-    try:
-        if reason is None:
-            if file.exists():
-                os.remove(file)
-            return
-        file.parent.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(UTC).isoformat()
-        file.write_text(json.dumps({"reason": reason, "at": now}), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def fallback_reason(home: Any) -> dict[str, Any] | None:
-    """Why the last upload of ``home`` read the live list, or None. Never raises."""
-    try:
-        data = json.loads((Path(str(home)) / "synapse" / FALLBACK_FILE).read_text("utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    kinds = {uid: kind for uid, (_, kind) in stored.items() if kind}
+    # A compaction's summary takes the uid of a row it replaces, whatever that row's role.
+    mismatched = tuple(
+        uid
+        for row in rows
+        if not row.get("_compressed_summary")
+        and (uid := row.get("message_uid")) in stored
+        and stored[uid][0] != row.get("role")
+    )
+    return Attributes(kinds, mismatched=mismatched)

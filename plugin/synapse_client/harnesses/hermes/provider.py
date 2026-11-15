@@ -41,16 +41,18 @@ daemon, those it was started with.
 
 Uploads
 -------
-Hermes calls ``sync_turn`` after each turn that ended with a reply, once it has written
-the turn's rows to its session store (agent/turn_finalizer.py persists before it mirrors
-the turn to memory providers). The hook is only a signal: it notes the session and the
-``message_uid`` of the last row Hermes handed over, and hands the upload to a thread of
-the provider's own (background.py), which runs one at a time, in the order the turns
-ended. That thread reads the session's rows from ``state.db`` up to that row
-(source.py, store.py), and the core uploads the complete turns not shipped yet
-(turn_upload.TurnUploader, with the ledger under ``<hermes_home>/synapse/shipped`` it
-shares with ``synapse import hermes``); the list Hermes handed over is used when the
-store cannot serve (source.py says when). ``on_session_end`` and ``on_pre_compress``
+Hermes calls ``sync_turn`` after each turn that ended with a reply, with the whole
+conversation, which it scrubbed of secrets for providers (agent/memory_manager.py
+``_redact_for_provider``). The hook makes no request: it copies the list and hands the
+upload to a thread of the provider's own (background.py), which runs one at a time, in
+the order the turns ended. That thread converts the list into records (messages.py),
+with each row's ``display_kind`` from the session store where the list lost it
+(source.py), and the core uploads every complete turn not shipped yet
+(turn_upload.TurnUploader). What was shipped is kept per session, by row, on disk
+(shipped.Ledger, under the Synapse home, shared with ``synapse import hermes``), so a
+turn that grows after it was sent (a background report, the reply to it) sends only
+its new rows, and an agent Hermes rebuilt sends nothing again; a session the record
+does not know looks back at most ten turns. ``on_session_end`` and ``on_pre_compress``
 name no session: they upload under the id Hermes named last (live.py) when that is the
 bound one or goes on from it, and nothing otherwise. Each batch is written to the
 outbox under ``<hermes_home>/synapse/outbox`` before its request and removed once
@@ -109,14 +111,12 @@ from agent.memory_provider import MemoryProvider, spawn_context_thread
 
 from ... import __version__, context, project, tools
 from ...api import Client
-from ...messages import Record
 from ...outbox import Outbox, failure_warning
 from ...settings import Settings
 from ...shipped import Ledger
 from ...turn_upload import TurnUploader
 from ...upload import Uploader
-from . import carried, source, uploads
-from . import messages as hm
+from . import carried, uploads
 from . import sessions as hs
 from .background import Background
 from .live import Live
@@ -158,6 +158,12 @@ def _warn(line: str) -> None:
 def _clock() -> str:
     """Now on the client's wall clock (time.time, as Hermes stamps a message), ISO-8601."""
     return datetime.fromtimestamp(time.time(), tz=UTC).isoformat()
+
+
+def snapshot(messages: Any) -> list[dict[str, Any]]:
+    """A shallow copy of each row of ``messages``: Hermes hands over its own dicts (or
+    scrubbed copies of them) and goes on changing them after the hook returns."""
+    return [dict(m) for m in messages or () if isinstance(m, Mapping)]
 
 
 def scope(kwargs: Mapping[str, Any]) -> str:
@@ -248,7 +254,7 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
-        ledger = Ledger(Path(str(home)) / "synapse" / "shipped", log=_warn) if home else None
+        ledger = Ledger(settings.home / "shipped" / "hermes", log=_warn)
         # Only an active session's verdict names the sessions it goes on from.
         earlier = carried.to_ask(home, verdict.continues)
         private_too = carried.carry(uploader, home, earlier, session_id, None)
@@ -418,12 +424,6 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
             # Outside the lock: telling the server is a request.
             uploader = self._uploader if self._mode == ACTIVE else None
             carries = goes_on and kwargs.get("reason") != "resume" and uploader is not None
-            left = source.last_uid(self._home, old) if goes_on and uploader is not None else None
-            if left is not None:
-                # The session left: what it holds that was not shipped goes up under its
-                # own id first (a run that ended while no upload ran), before the new id
-                # notes its copies of those rows. Read up to its newest row now.
-                self._later.put(self._sync, old, left, [], self._model)
             try:
                 # The id left is the bound one and, after a move Hermes did not announce,
                 # the one its hooks named since.
@@ -479,17 +479,17 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
             sid = self._whose(session_id) if self._mode == ACTIVE else None
             if sid is None:
                 return
-            # The list is converted now, for the fallback: Hermes goes on changing it.
-            end, listed = source.end_uid(messages), hm.to_records(messages)
-            if not self._later.put(self._sync, sid, end, listed, self._model):
+            # A copy now: Hermes goes on changing the dicts it handed over.
+            listed = snapshot(messages)
+            if not self._later.put(self._sync, sid, listed, self._model):
                 self._say_once("synapse: uploads are behind; a turn goes up with a later one")
         except Exception:
             _log().warning("synapse: sync_turn failed", exc_info=True)
 
-    def _sync(self, sid: str, end: str | None, listed: list[Record], model: str) -> None:
+    def _sync(self, sid: str, listed: list[dict[str, Any]], model: str) -> None:
         """One turn's upload, then the outbox: on the provider's thread (background.py),
         which logs what this raises."""
-        if self._send(sid, end, listed, SYNC_TIMEOUT, model, finished=True):
+        if self._send(sid, listed, SYNC_TIMEOUT, model, finished=True):
             self._drain(SYNC_TIMEOUT)
 
     def shutdown(self) -> None:
@@ -528,8 +528,7 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
         sid = self._whose("")
         if sid is None:
             return False
-        listed = hm.to_records(messages)
-        return self._send(sid, source.end_uid(messages), listed, FLUSH_TIMEOUT, self._model)
+        return self._send(sid, snapshot(messages), FLUSH_TIMEOUT, self._model)
 
     # -- tools ---------------------------------------------------------------------
 

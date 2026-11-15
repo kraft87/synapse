@@ -183,19 +183,33 @@ def pending(
     before it (its context, or None). A turn is sent when its key is in ``sent``, or
     when its rows are in ``shipped`` (row ids): of a turn shipped in part, what is left
     (``unshipped``) is the turn here. A part that ``continues`` has no context. With
+    ``shipped``, a turn before is context only when it went whole (its key is in
+    ``sent``, or it goes whole here): a turn that went in parts may have its last part
+    still waiting in an outbox, and as context the server would store it whole. With
     ``lookback``, only the last ``lookback`` complete turns are considered."""
     done = [turn for turn in all_turns if complete(turn)]
     start = max(0, len(done) - lookback) if lookback is not None else 0
     out: list[tuple[Turn | None, Turn]] = []
+    whole_here: set[int] = set()
     for i in range(start, len(done)):
         if turn_key(done[i]) in sent:
             continue
         part = unshipped(done[i], shipped) if shipped else done[i]
         if part is None:
             continue
+        if part is done[i]:
+            whole_here.add(i)
         before = done[i - 1] if i > 0 and not continues(part) else None
+        if before is not None and shipped and turn_key(before) not in sent:
+            before = before if i - 1 in whole_here else None
         out.append((before, part))
     return out
+
+
+def whole(part: Sequence[Record]) -> bool:
+    """Whether ``part`` is a turn as it was cut (it opens at a real user row or at a row
+    that ``begins`` a run), not the rest of a turn shipped in part."""
+    return bool(part) and (_opens_turn(part[0]) or _begins(part[0]))
 
 
 def batches(
