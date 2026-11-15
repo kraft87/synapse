@@ -79,13 +79,29 @@ def default_home(env: Mapping[str, str] | None = None) -> Path:
     return Path.home() / (".hermes" + suffix)
 
 
+def _windows(windows: bool | None) -> bool:
+    return sys.platform == "win32" if windows is None else windows
+
+
+def _quoted(home: Path, windows: bool | None) -> str:
+    """``home`` as one word for the user's shell: PowerShell on Windows, else POSIX."""
+    if _windows(windows):
+        return "'" + str(home).replace("'", "''") + "'"
+    return shlex.quote(str(home))
+
+
 def home_prefix(home: Path, windows: bool | None = None) -> str:
     """What sets ``HERMES_HOME`` for the one command after it: a POSIX shell's
     ``VAR=value``, or PowerShell's ``$env:`` on Windows."""
-    if sys.platform == "win32" if windows is None else windows:
-        quoted = str(home).replace("'", "''")
-        return f"$env:HERMES_HOME = '{quoted}'; "
-    return f"HERMES_HOME={shlex.quote(str(home))} "
+    if _windows(windows):
+        return f"$env:HERMES_HOME = {_quoted(home, True)}; "
+    return f"HERMES_HOME={_quoted(home, False)} "
+
+
+def home_option(home: Path, windows: bool | None = None) -> str:
+    """`` --hermes-home <home>`` for a ``synapse install hermes`` command, quoted for the
+    user's shell."""
+    return f" --hermes-home {_quoted(home, windows)}"
 
 
 def _render(template: str) -> str:
@@ -266,6 +282,19 @@ class HermesHarness:
         prefix = "" if home == default_home(self._env) else home_prefix(home)
         return f"{prefix}hermes config set memory.provider {PLUGIN}"
 
+    def _install_command(self, home: Path, replace: bool = False) -> str:
+        """``synapse install hermes`` for ``home``: the home is named unless it is the
+        default one, which the command finds by itself."""
+        where = "" if home == default_home(self._env) else home_option(home)
+        return f"synapse install hermes{' --replace' if replace else ''}{where}"
+
+    def _switch(self, home: Path) -> str:
+        return (
+            "Hermes runs one external provider; "
+            f"run `{self._install_command(home, replace=True)}` or `{self._command(home)}` "
+            "to switch"
+        )
+
     def _select(self, home: Path, *, dry_run: bool, replace: bool) -> str:
         config = home / "config.yaml"
         program = self._program()
@@ -328,10 +357,7 @@ class HermesHarness:
         if current == PLUGIN:
             return "already selected"
         if current.lower() not in _BUILT_IN and not replace:
-            return (
-                f"left memory.provider at {current!r}, Hermes runs one external provider; "
-                f"run `synapse install hermes --replace` or `{command}` to switch"
-            )
+            return f"left memory.provider at {current!r}, {self._switch(home)}"
         was = f" (was {current!r})" if current.lower() not in _BUILT_IN else ""
         if dry_run:
             return f"would select it{was}"

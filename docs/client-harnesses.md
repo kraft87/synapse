@@ -325,7 +325,9 @@ provider:
 - With the `hermes` program on PATH and a `config.yaml` already in the home, through
   `hermes config get --json` / `hermes config set memory.provider synapse`. An empty
   value or one of Hermes's built-in names is replaced; another external provider is left
-  alone and the report says how to switch, unless `--replace` is given.
+  alone and the report says how to switch, unless `--replace` is given. For a home named
+  with `--hermes-home` the commands it names carry that home: `--hermes-home <path>`, and
+  `HERMES_HOME=<path>` (PowerShell: `$env:HERMES_HOME = '<path>';`).
 - A home with no `config.yaml` gets one with the two lines `memory:` / `provider:
   synapse`. The program is never run there: a first launch sets up the home, which
   downloads Hermes's toolchain.

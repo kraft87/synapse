@@ -302,6 +302,33 @@ def test_the_home_is_set_the_way_the_users_shell_reads_it():
     )
 
 
+def test_the_replace_hint_names_the_home_it_was_given(tmp_path):
+    """``--hermes-home PATH`` without ``--replace``, another provider selected: the
+    command the report names acts on PATH, not on the default home."""
+    home = tmp_path / "other home"
+    _with_config(home, "memory:\n  provider: honcho\n")
+    elsewhere = hi.HermesHarness(
+        runner=_Hermes("honcho"), which=lambda name: "/bin/hermes", env={"HERMES_HOME": "/x"}
+    )
+    report = elsewhere.install("http://unused", hermes_home=home)
+    assert f"`synapse install hermes --replace{hi.home_option(home)}`" in report
+    assert f"`{hi.home_prefix(home)}hermes config set memory.provider synapse`" in report
+    # In the default home neither command names it.
+    report = _harness(home, _Hermes("honcho"), "/bin/hermes").install(
+        "http://unused", hermes_home=home
+    )
+    assert "`synapse install hermes --replace` or `hermes config set" in report
+
+
+def test_the_home_option_is_quoted_for_the_users_shell():
+    home = Path("/srv/hermes homes/it's")
+    assert hi.home_option(home, windows=False) == f" --hermes-home {shlex.quote(str(home))}"
+    windows = Path("C:/Users/O'Neil/AppData/Local/hermes-work")
+    assert hi.home_option(windows, windows=True) == (
+        f" --hermes-home '{str(windows).replace(chr(39), chr(39) * 2)}'"
+    )
+
+
 def test_dry_run_changes_nothing(tmp_path):
     home = tmp_path / "hermes"
     report = _harness(home).install("http://unused", dry_run=True, hermes_home=home)
