@@ -531,11 +531,11 @@ def test_act_gates_on_the_expected_status(scratch, monkeypatch, server, capsys):
 
 def test_hooks_json_is_unchanged():
     """A change to the core changes no hook registration: the file is byte-identical to
-    the one last changed on purpose (the preferences hook went when board_block.py began
-    to print both blocks from one request)."""
+    the one last changed on purpose (each command finds a Python 3.11 or newer on
+    Windows through bin/synapse-python)."""
     raw = (PLUGIN / "hooks" / "hooks.json").read_bytes()
     assert hashlib.sha256(raw).hexdigest() == (
-        "542bd1149033d81d9e83ac3804d6c64fac4f17fef5a42f6642765186f811f06b"
+        "9de0e27136ef4d74dee47938a5d4cc6ca3b29d73aaae9dca865a436b5663722b"
     )
 
 

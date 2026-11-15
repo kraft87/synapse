@@ -29,8 +29,11 @@ with `/synapse:skill-review`.
 ## Setup
 
 Prerequisites: a running Synapse server, Claude Code, Codex or Hermes, and Python 3.11 or
-newer as `python3` on PATH (the hooks run `python3`; check with `python3 --version`).
-Everything is stdlib, no `pip install`.
+newer. On Linux and macOS that is `python3` on PATH (the hooks run `python3`; check with
+`python3 --version`). On Windows the hooks run in Git Bash, so Git for Windows is needed
+too, and they find Python as `python3`, `python` or `py -3`: the first that is 3.11 or
+newer, never the Microsoft Store stand-in. Everything is stdlib, no `pip install`. On
+Windows, `~` in this file is your user folder (`%USERPROFILE%`).
 
 ### 1. Stand up the server
 
@@ -257,10 +260,13 @@ python3 <plugin>/scripts/remember_spool.py list      # what's queued
 python3 <plugin>/scripts/remember_spool.py flush     # replay now
 ```
 
+On Windows use `py -3` in place of `python3`.
+
 `add` also accepts the same fields as JSON on stdin, and tries an immediate write-through
 before queueing. Nothing leaves the spool until the server confirms, and each intent carries
 a client-generated id the server dedups on — so a flush interrupted mid-way neither loses an
-intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log` (`SYNAPSE_SPOOL_LOG`).
+intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log`, on Windows `%TEMP%\synapse-remember-spool.log`
+(`SYNAPSE_SPOOL_LOG`).
 
 Server requirement: schema 052 (`remember_intents`) and the `/remember/spool` route. Against
 an older server the flush fails loudly into the log and the spool simply keeps its intents.

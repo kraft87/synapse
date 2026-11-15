@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -471,7 +472,8 @@ def test_session_start_routes_writes_to_the_cli_while_the_server_is_down(
     assert offline.main(["session-start"]) == 0
     out = capsys.readouterr().out
     assert "memory server is NOT reachable" in out
-    assert "remember_spool.py add" in out and "--hook" in out
+    # POSIX prints `python3 <script> add`; Windows quotes the interpreter and the script.
+    assert "remember_spool.py" in out and " add --hook" in out
     assert "QUEUED" in out
 
 
@@ -523,3 +525,38 @@ def test_hook_paths_never_fail_the_turn(tmp_path):
             env=env,
         )
         assert p.returncode == 0, p.stderr
+
+
+def test_hook_logs_stay_in_tmp_off_windows_and_go_to_the_temp_dir_on_windows(
+    monkeypatch, tmp_path, stub_server
+):
+    """Windows has no /tmp: there "/tmp/x.log" names a folder that is not there, so a
+    hook's log went nowhere. The ingest, spool and Codex Stop hooks share one rule."""
+    import types
+
+    spool = _load(monkeypatch, tmp_path, stub_server.url)
+    name = "synapse-remember-spool.log"
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        (root / rel).read_text(encoding="utf-8")
+        for rel in (
+            "plugin/scripts/ingest_hook.py",
+            "plugin/scripts/remember_spool.py",
+            "plugin-codex/hooks/synapse_stop_hook.py",
+        )
+    ]
+    rule = sources[1][sources[1].index("def _default_log") : sources[1].index("LOG_PATH =")]
+    assert all(rule in text for text in sources)
+    # The folder comes from the environment (TEMP, then TMP): these hooks are ones the user
+    # waits for, and tests/test_hook_imports.py holds them to no extra import.
+    fake = types.SimpleNamespace(
+        name="nt", path=os.path, environ={"TEMP": str(tmp_path / "t"), "TMP": "unused"}
+    )
+    on_windows: dict = {"os": fake}
+    exec(rule, on_windows)  # the repository own source, run as on Windows
+    assert on_windows["_default_log"](name) == os.path.join(str(tmp_path / "t"), name)
+    fake.environ = {"TMP": str(tmp_path / "m")}
+    assert on_windows["_default_log"](name) == os.path.join(str(tmp_path / "m"), name)
+    if os.name != "nt":
+        assert spool._default_log(name) == "/tmp/" + name
+        assert spool.LOG_PATH == str(tmp_path / "spool.log")  # the variable still wins

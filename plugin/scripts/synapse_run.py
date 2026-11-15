@@ -62,7 +62,8 @@ def main(argv: list[str]) -> int:
     if root is None:
         print(
             f"Synapse client not installed under {HOME / 'lib'}: run "
-            "`curl -sSL https://<your-synapse>/install | python3 -`",
+            "`curl -sSL https://<your-synapse>/install | python3 -` (Windows PowerShell: "
+            "`irm https://<your-synapse>/install | python -`)",
             file=sys.stderr,
         )
         return 1

@@ -1,0 +1,55 @@
+#!/usr/bin/env sh
+# synapse-python: run a Synapse client script under Python 3.11 or newer, exactly once.
+#
+#   synapse-python [--quiet] SCRIPT [ARG...]
+#   synapse-python --check          print the interpreter it would use (exit 1 if none)
+#
+# Linux and macOS: python3 (python when there is no python3), as the hooks always ran.
+# Windows (Git Bash, which is where Claude Code runs a plugin's hooks): `python3` and
+# `python` are often the Microsoft Store stand-in, which only prints "Python was not
+# found", and a python.org install puts neither on PATH unless asked to. So the first of
+# `python3`, `python` and `py -3` that runs Python 3.11 or newer is used, and remembered
+# in the temp directory so later calls start it directly. The interpreter is exec'd and
+# never retried: stdin, stdout, stderr and the exit status are the script's own.
+#
+# With no usable Python it prints one line naming the fix and exits 1. --quiet exits 0
+# instead, with nothing printed: the Claude Code hooks pass it, all but the session's
+# board hook, so a session shows that line once, not once per hook.
+#
+# The hooks source this file from Git Bash (`. synapse-python ...`) to save starting a
+# second shell, so it ends in exec or exit and keeps its names short-lived.
+quiet=
+if [ "${1-}" = --quiet ]; then
+  quiet=1
+  shift
+fi
+if [ "${OS-}" != Windows_NT ] && [ "${1-}" != --check ]; then
+  command -v python3 >/dev/null 2>&1 && exec python3 "$@"
+  exec python "$@"
+fi
+# The interpreter's own path when it is Python 3.11 or newer; nothing otherwise (the
+# Store stand-in and a missing command fail, an older Python prints nothing).
+synapse_probe() {
+  "$@" -c 'import sys; sys.version_info >= (3, 11) and sys.stdout.write(sys.executable)' \
+    </dev/null 2>/dev/null
+}
+synapse_cache=${TMP:-/tmp}/synapse-python
+synapse_py=
+if [ -r "$synapse_cache" ]; then
+  IFS= read -r synapse_py <"$synapse_cache" || :
+fi
+if [ -z "$synapse_py" ] || [ ! -f "$synapse_py" ]; then
+  synapse_py=$(synapse_probe python3) || synapse_py=
+  [ -n "$synapse_py" ] || synapse_py=$(synapse_probe python) || synapse_py=
+  [ -n "$synapse_py" ] || synapse_py=$(synapse_probe py -3) || synapse_py=
+  [ -n "$synapse_py" ] && printf '%s\n' "$synapse_py" >"$synapse_cache" 2>/dev/null
+fi
+if [ "${1-}" = --check ]; then
+  [ -n "$synapse_py" ] && printf '%s\n' "$synapse_py" && exit 0
+elif [ -n "$synapse_py" ]; then
+  exec "$synapse_py" "$@"
+elif [ -n "$quiet" ]; then
+  exit 0
+fi
+echo "Synapse: no Python 3.11 or newer found (tried python3, python and py -3). Install Python from python.org, then start a new session." >&2
+exit 1

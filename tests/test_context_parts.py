@@ -156,7 +156,7 @@ def test_no_part_is_served_without_the_token(built):
 
 def test_a_reply_is_recorded_with_its_ids_in_shown_order(built):
     url = "/context?project=alpha&parts=board,preferences&session=sess-1"
-    headers = {**_AUTH, "User-Agent": "synapse-client/0.24.20 claude-code"}
+    headers = {**_AUTH, "User-Agent": "synapse-client/0.24.21 claude-code"}
     with _client(lambda _request: FULL_TRUST) as client:
         body = client.get(url, headers=headers).json()
     # The reply is what it was: no id list reaches the client.
@@ -166,7 +166,7 @@ def test_a_reply_is_recorded_with_its_ids_in_shown_order(built):
     assert serve.parts == ["board", "preferences"]
     assert (serve.note_ids, serve.event_ids, serve.pref_ids) == ([1, 2], [9, 8], [5])
     assert (serve.board_text, serve.prefs_text, serve.notes_dropped) == (_BOARD, _PREFS, 0)
-    assert serve.client == "synapse-client/0.24.20 claude-code"
+    assert serve.client == "synapse-client/0.24.21 claude-code"
     assert serve.ms_build is not None and serve.ms_build >= 0
 
 

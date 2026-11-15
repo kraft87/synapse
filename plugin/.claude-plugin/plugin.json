@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.24.20",
+  "version": "0.24.21",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Set up with `synapse login`, which keeps this machine's settings in ~/.synapse/config.json.",
   "author": {
     "name": "kraft87"
@@ -26,7 +26,7 @@
       "headers": {
         "Authorization": "Bearer ${user_config.SYNAPSE_INGEST_TOKEN}"
       },
-      "headersHelper": "python3 scripts/mcp_headers.py || python scripts/mcp_headers.py || py -3 scripts/mcp_headers.py"
+      "headersHelper": "\"bin/synapse-python\" scripts/mcp_headers.py"
     }
   }
 }

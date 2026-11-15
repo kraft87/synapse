@@ -535,7 +535,7 @@ The core ports the hooks' behaviour and wording, with these differences:
   the hook payload's `session_id`, Hermes from the id `initialize` gets, the id each
   uploads the session's turns under), so the server can record which lines it served
   to it (schema 071). A session whose private-mode marker is set, or cannot be read,
-  is not named. A server from before 0.24.20 ignores the parameter.
+  is not named. A server from before 0.24.21 ignores the parameter.
 - **Enrollment notices** take the login hint as an argument, and the restricted-device
   notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
   one, the other harnesses none.

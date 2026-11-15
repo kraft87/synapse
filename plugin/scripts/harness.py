@@ -366,7 +366,8 @@ def install_codex(url: str, dry_run: bool = False) -> str:
     if installer is None:
         raise RuntimeError(
             "no Codex client files here: install the client with "
-            f"`curl -sSL {url}/install | python3 -`"
+            f"`curl -sSL {url}/install | python3 -` (Windows PowerShell: "
+            f"`irm {url}/install | python -`)"
         )
     changed = installer.install(url, dry_run=dry_run)
     if not changed:

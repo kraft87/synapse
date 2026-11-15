@@ -16,7 +16,7 @@
 -- outlives the note, event or preference it names.
 --
 -- session_id is the harness's own session id, the value episodes.session_id holds for
--- that session's turns, sent by clients from plugin 0.24.20 as ?session=. NULL for an
+-- that session's turns, sent by clients from plugin 0.24.21 as ?session=. NULL for an
 -- older client. A session that is private (private_sessions, schema 050) when its board
 -- is served gets no row. Claude Code serves again on resume, clear and compaction, so a
 -- session can have several rows.

@@ -1,4 +1,5 @@
-"""Codex plugin hooks must remain executable from PowerShell on Windows."""
+"""Limits the Claude hook file and the Codex hooks share. How each hook starts Python on
+Windows is pinned in test_hook_python_launcher.py."""
 
 import json
 from pathlib import Path
@@ -13,16 +14,6 @@ def _command_hooks():
             for hook in group["hooks"]:
                 if hook["type"] == "command":
                     yield event, hook
-
-
-def test_every_command_hook_has_a_powershell_override():
-    hooks = list(_command_hooks())
-    assert len(hooks) == 12
-    for event, hook in hooks:
-        command = hook.get("commandWindows", "")
-        assert command, f"{event} hook is missing commandWindows"
-        assert "$env:CLAUDE_PLUGIN_ROOT/scripts/" in command
-        assert 'python3 "' in command
 
 
 def test_session_end_timeout_respects_codex_maximum():

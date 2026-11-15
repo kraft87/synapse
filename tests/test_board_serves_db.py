@@ -117,7 +117,7 @@ def _ids(text: str, prefix: str) -> list[int]:
 def test_a_session_start_records_what_it_showed_in_order(conn, db_url):
     _fixture(db_url, conn)
     url = f"/context?parts=board,preferences&session={_SID}"
-    headers = {**_AUTH, "User-Agent": "synapse-client/0.24.20 hermes"}
+    headers = {**_AUTH, "User-Agent": "synapse-client/0.24.21 hermes"}
     with _client(db_url, resolve_trust=lambda _r: FULL_TRUST) as client:
         body = client.get(url, headers=headers).json()
     text, prefs = body["text"], body["preferences"]
@@ -128,7 +128,7 @@ def test_a_session_start_records_what_it_showed_in_order(conn, db_url):
 
     (row,) = _rows(conn)
     assert row["session_id"] == _SID and row["project"] is None
-    assert row["trust"] == "full" and row["client"] == "synapse-client/0.24.20 hermes"
+    assert row["trust"] == "full" and row["client"] == "synapse-client/0.24.21 hermes"
     assert row["parts"] == ["board", "preferences"]
     # In the order the board shows them, which is section order, not list order.
     assert row["note_ids"] == _ids(text, "n") and len(row["note_ids"]) == 5
