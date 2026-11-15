@@ -60,12 +60,15 @@ SKILL = (
 # -- what the server keeps -----------------------------------------------------------
 
 
-def stored(server: Any) -> list[Any]:
-    """The episodes the ingest route would keep from every body posted, in order."""
+def stored(server: Any, refused: Any = ()) -> list[Any]:
+    """The episodes the ingest route would keep from every body posted, in order, but
+    the posts it answered with an error (``refused``: their indexes)."""
     kept: list[Any] = []
     spans: set[str] = set()
     contents: set[tuple[Any, str]] = set()
-    for body in server.posts():
+    for i, body in enumerate(server.posts()):
+        if i in refused:
+            continue
         for ep in MessagesParser().parse_records(
             body["records"],
             body.get("source") or "t",
@@ -135,6 +138,9 @@ def _import(home: Path) -> int:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Hermes's own scrub stands in as the identity (test_hermes_scrub.py runs the real one).
+    module.scrub.interpreter = lambda: "hermes-python"
+    module.scrub.rows = lambda sessions, python, home=None: sessions
     return module.main(["--hermes-home", str(home), "--yes"])
 
 
@@ -323,6 +329,9 @@ def test_a_marker_or_note_and_the_next_message_are_two_rows(chat, server, kind, 
     message = s.add(sid, "user", "USERTOKEN-second real message")
     reply = s.add(sid, "assistant", "FINALTOKEN-second reply")
     chat.sync([*chat.live, _merged(marker, message), reply])
+    posted = len(server.posts())
+    assert _import(chat.home) == 0  # the store's two rows are the same turn: nothing added
+    assert len(server.posts()) == posted
     episodes = stored(server)
     assert count(episodes, "USERTOKEN-second real message") == 1
     assert count(episodes, "FINALTOKEN-second reply") == 1
@@ -549,26 +558,6 @@ def test_a_branch_ships_none_of_its_parents_rows(plugin, server, tmp_path):
     assert all("USERTOKEN-parent" not in json.dumps(b["records"]) for b in child_posts[:-1])
 
 
-def test_a_turn_no_upload_ran_for_goes_up_before_a_branch_copies_it(plugin, server, tmp_path):
-    """A run ended while no upload ran (the agent was gone), then ``/branch``. The child
-    holds a copy of that turn, which never goes up under the child's id; the session
-    left ships it under its own id as the switch happens. A run the child goes on with
-    after copied rows sends only what follows them."""
-    chat = Session(plugin, tmp_path / "hermes-a")
-    chat.turn("USERTOKEN-shipped", "FINALTOKEN-shipped")
-    chat.live += chat.store.turn(chat.sid, "USERTOKEN-unsent", "FINALTOKEN-unsent")
-    child = "20261115_111111_ee44ff"
-    copied = chat.store.branch(chat.sid, child)
-    chat.provider.on_session_switch(child, parent_session_id=chat.sid, reason="branch")
-    own = chat.store.turn(child, "USERTOKEN-child", "FINALTOKEN-child")
-    chat.provider.sync_turn("q", "a", session_id=child, messages=[*copied, *own])
-    episodes = stored(server)
-    for token in ("USERTOKEN-shipped", "USERTOKEN-unsent", "USERTOKEN-child"):
-        assert count(episodes, token) == 1, token
-    unsent = [b for b in server.posts() if "USERTOKEN-unsent" in json.dumps(b["records"])]
-    assert unsent and all(b["session_id"] == chat.sid for b in unsent)
-
-
 def test_on_session_end_twice_sends_nothing_again(chat, server):
     chat.turn("USERTOKEN-one", "FINALTOKEN-one")
     chat.provider.on_session_end(list(chat.live))
@@ -581,9 +570,10 @@ def test_a_failed_upload_waits_in_the_outbox_and_goes_once(chat, server):
     once it is there. The next upload drains it, and nothing goes twice."""
     server.ingest_status = 503
     chat.turn("USERTOKEN-one", "FINALTOKEN-one")
+    refused = set(range(len(server.posts())))
     server.ingest_status = 200
     chat.turn("USERTOKEN-two", "FINALTOKEN-two")
-    episodes = stored(server)
+    episodes = stored(server, refused)
     assert count(episodes, "USERTOKEN-one") == 1 and count(episodes, "USERTOKEN-two") == 1
 
 
@@ -619,9 +609,9 @@ def test_live_then_import_and_import_then_live_add_nothing(plugin, server, tmp_p
 # -- the fallback ------------------------------------------------------------------------
 
 
-def test_a_store_of_an_unknown_schema_falls_back_to_the_list(plugin, server, tmp_path, caplog):
-    """A newer Hermes: the list Hermes hands over is uploaded instead, the reason is
-    logged once, and ``synapse status`` can say so."""
+def test_a_store_of_an_unknown_schema_costs_only_the_kinds(plugin, server, tmp_path, caplog):
+    """A newer Hermes: the list Hermes hands over is uploaded all the same; the kinds the
+    store would add are not read, and that is logged once."""
     home = tmp_path / "hermes-a"
     store = HermesStore(home, version=34)
     store.session(SID)
@@ -633,23 +623,32 @@ def test_a_store_of_an_unknown_schema_falls_back_to_the_list(plugin, server, tmp
         provider.sync_turn("q", "a", session_id=SID, messages=live)
     episodes = stored(server)
     assert count(episodes, "USERTOKEN-one") == 1 and count(episodes, "USERTOKEN-two") == 1
-    said = [r.getMessage() for r in caplog.records if "live list" in r.getMessage()]
+    said = [r.getMessage() for r in caplog.records if "display kinds" in r.getMessage()]
     assert len(said) == 1 and "schema version 34" in said[0]
-    status = json.loads((home / "synapse" / "store_fallback.json").read_text("utf-8"))
-    assert "schema version 34" in status["reason"]
 
 
-def test_a_turn_missing_from_the_store_falls_back_to_the_list(chat, server):
-    """Hermes failed to write the turn: the row the hook names is not in the store."""
+def test_rows_hermes_could_not_write_go_up_from_the_list(chat, server):
+    """review-round3 probe2 ``test_rows_hermes_could_not_write``: the final flush
+    failed, so the run's rows are in the list with no ``message_uid`` (Hermes mints it
+    at insert) and not in the store. They go up, keyed by their text, once."""
+    chat.turn("USERTOKEN-stored", "FINALTOKEN-stored")
     unstored = [
-        {"role": "user", "content": "USERTOKEN-lost write", "message_uid": "not-stored-1"},
-        {"role": "assistant", "content": "FINALTOKEN-lost write", "message_uid": "not-stored-2"},
+        {"role": "user", "content": "USERTOKEN-lost write"},
+        {"role": "assistant", "content": "FINALTOKEN-lost write"},
     ]
     chat.sync([*chat.live, *unstored])
-    assert count(stored(server), "USERTOKEN-lost write") == 1
-    assert (chat.home / "synapse" / "store_fallback.json").exists()
-    chat.turn("USERTOKEN-stored", "FINALTOKEN-stored")
-    assert not (chat.home / "synapse" / "store_fallback.json").exists()
+    more = [
+        {"role": "user", "content": "USERTOKEN-lost again"},
+        {"role": "assistant", "content": "FINALTOKEN-again"},
+    ]
+    chat.sync([*chat.live, *unstored, *more])
+    chat.sync([*chat.live, *unstored, *more])
+    episodes = stored(server)
+    assert (
+        count(episodes, "USERTOKEN-lost write") == 1
+        and count(episodes, "USERTOKEN-lost again") == 1
+    )
+    assert len(server.posts()) == 3
 
 
 # -- privacy -----------------------------------------------------------------------------
@@ -735,3 +734,237 @@ def test_a_gateway_turn_admitted_from_someone_else_turns_the_session_off(plugin,
     assert len(server.posts()) == 2
     assert provider._mode == "inert"
     assert count(stored(server), "USERTOKEN-someone else") == 0
+
+
+# -- review round 3 -------------------------------------------------------------------------
+
+
+def _queued(chat: Session, *, read_after_drain: bool, compacted: bool = False) -> None:
+    """A prompt queued in the TUI while a tool-calling run is going, as the stdio TUI of
+    Hermes v0.23.1 did it (probe session ``20261115_050146_dfd17b``, rows 114-120): the
+    prompt is written as it is accepted (``display_metadata._queued_prompt``), before the
+    run's assistant rows; the list of that run never holds it; when its own run starts the
+    early row is deactivated and the prompt written again, with a new uid. At the first
+    ``sync_turn`` the early row was still active."""
+    sid, s = chat.sid, chat.store
+    chat.turn("USERTOKEN-zero", "FINALTOKEN-zero")
+    one = call()
+    run_a = [s.add(sid, "user", "USERTOKEN-A first request")]
+    early = s.add(
+        sid, "user", "USERTOKEN-B queued follow-up", display_metadata={"_queued_prompt": True}
+    )
+    if compacted:  # a compaction in place during the run archives the early row and clones it
+        s.conn.execute(
+            "UPDATE messages SET active=0, compacted=1 WHERE message_uid=?", (early["message_uid"],)
+        )
+        s.add(
+            sid,
+            "user",
+            "USERTOKEN-B queued follow-up",
+            uid=early["message_uid"],
+            display_metadata={"_queued_prompt": True},
+        )
+    run_a += [
+        s.add(sid, "assistant", "", tool_calls=[one]),
+        s.add(
+            sid,
+            "tool",
+            "RESULT-A tool output of the first request",
+            tool_name="terminal",
+            tool_call_id=one["id"],
+        ),
+        s.add(sid, "assistant", "FINALTOKEN-A answer to the first request"),
+    ]
+    list_a = [*chat.live, *run_a]
+
+    def drain() -> dict[str, Any]:
+        s.conn.execute(
+            "UPDATE messages SET active=0 WHERE message_uid=? AND active=1", (early["message_uid"],)
+        )
+        s.conn.commit()
+        return s.add(sid, "user", "USERTOKEN-B queued follow-up")
+
+    if read_after_drain:
+        late = drain()
+        chat.sync(list_a)
+    else:
+        chat.sync(list_a)
+        late = drain()
+    chat.sync([*list_a, late, s.add(sid, "assistant", "FINALTOKEN-B answer to the follow-up")])
+
+
+@pytest.mark.parametrize(
+    ("after", "compacted"),
+    [(False, False), (True, False), (True, True)],
+    ids=["read before the drain", "read after the drain", "compacted during the run"],
+)
+def test_a_prompt_queued_during_a_run_keeps_its_place(chat, server, after, compacted):
+    """review-round3 finding 3 (probe1 ``test_queued_prompt``): the store branch read the
+    accept-time row inside run A, so A's request and tool work were never stored and B
+    twice. The rows now come from the list, which is the run as Hermes ran it; the
+    importer, which reads the store, leaves the accept-time row out."""
+    _queued(chat, read_after_drain=after, compacted=compacted)
+    episodes = stored(server)
+    for token in ("USERTOKEN-A", "RESULT-A", "FINALTOKEN-A", "USERTOKEN-B", "FINALTOKEN-B"):
+        assert count(episodes, token) == 1, token
+    posted = len(server.posts())
+    assert _import(chat.home) == 0
+    assert len(server.posts()) == posted
+
+
+def test_the_importer_reads_a_queued_prompt_where_it_was_answered(plugin, server, tmp_path):
+    """The same store, imported with no live upload before: one turn per request."""
+    chat = Session(plugin, tmp_path / "hermes-a")
+    chat.provider.shutdown()
+    chat.provider._mode = "inert"  # nothing goes up live: the import alone reads the store
+    _queued(chat, read_after_drain=True, compacted=True)
+    assert server.posts() == []
+    assert _import(chat.home) == 0
+    episodes = stored(server)
+    for token in ("USERTOKEN-A", "RESULT-A", "FINALTOKEN-A", "USERTOKEN-B", "FINALTOKEN-B"):
+        assert count(episodes, token) == 1, token
+    a = next(ep for ep in episodes if "FINALTOKEN-A" in ep.content)
+    assert a.human_turn == "USERTOKEN-A first request"
+
+
+def test_a_rotation_inside_a_run_stores_the_whole_turn(chat, server):
+    """review-round3 finding 4 (probe1 ``test_rotation_mid_run``): a compaction that moves
+    to a new session id inside a run (``compression.in_place`` off). The child's list
+    holds the run's rows under their uids and the reply; the turn goes up whole under the
+    child, as the released client sent it."""
+    sid, s = chat.sid, chat.store
+    chat.turn("USERTOKEN-one", "FINALTOKEN-one")
+    one = call()
+    run = [
+        s.add(sid, "user", "USERTOKEN-two long task"),
+        s.add(sid, "assistant", "", tool_calls=[one]),
+        s.add(
+            sid,
+            "tool",
+            "RESULT-two tool output before the compaction",
+            tool_name="terminal",
+            tool_call_id=one["id"],
+        ),
+    ]
+    child = "20261115_111111_cc22dd"
+    s.session(child, parent=sid, model_config={"_compressed_from": sid})
+    summary = s.add(
+        child, "user", "[CONTEXT COMPACTION] summary", summary=True, display_kind="hidden"
+    )
+    clones = [
+        s.add(
+            child,
+            r["role"],
+            r["content"],
+            uid=r["message_uid"],
+            tool_calls=r.get("tool_calls"),
+            tool_name=r.get("tool_name"),
+            tool_call_id=r.get("tool_call_id"),
+        )
+        for r in run
+    ]
+    chat.provider.on_session_switch(child, parent_session_id=sid, reason="compression")
+    final = s.add(child, "assistant", "FINALTOKEN-two done")
+    chat.provider.sync_turn("q", "a", session_id=child, messages=[summary, *clones, final])
+    more = s.turn(child, "USERTOKEN-three", "FINALTOKEN-three")
+    chat.provider.sync_turn("q", "a", session_id=child, messages=[summary, *clones, final, *more])
+    episodes = stored(server)
+    for token in (
+        "USERTOKEN-one",
+        "USERTOKEN-two",
+        "RESULT-two",
+        "FINALTOKEN-two",
+        "USERTOKEN-three",
+    ):
+        assert count(episodes, token) == 1, token
+
+
+def test_turns_the_server_dropped_as_private_go_again_after_forget(chat, server, tmp_path):
+    """review-round3 finding 5 (probe1 ``test_private_off_then_forget``): the marker went
+    (plain ``off``, or its twelve hours) while the server row stayed, so a turn went and
+    the server dropped it with a 200; it was recorded as shipped. ``synapse private off
+    --forget`` clears that record (private_toggle.py, shipped.forget_everywhere), so after
+    a restart the look-back sends it, as the released client did."""
+    from synapse_client.settings import Settings
+    from synapse_client.shipped import forget_everywhere
+
+    marker = tmp_path / "private" / chat.sid
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    server.private_rows.add(chat.sid)
+    chat.turn("USERTOKEN-2 said in private", "FINALTOKEN-2")
+    before = len(server.posts())
+    marker.unlink()
+    chat.turn("USERTOKEN-3 after the marker went", "FINALTOKEN-3")
+    dropped = set(range(before, len(server.posts())))  # the server's row drops these
+    server.private_rows.discard(chat.sid)
+    forget_everywhere(Settings.load(), chat.sid)  # what `off --forget` does on this machine
+    chat.turn("USERTOKEN-4 back on the record", "FINALTOKEN-4")
+    rebuilt = chat.agent()  # a restart
+    chat.live += chat.store.turn(chat.sid, "USERTOKEN-5", "FINALTOKEN-5")
+    chat.sync(provider=rebuilt)
+    kept = [b for i, b in enumerate(server.posts()) if i not in dropped]
+    episodes = stored(type("S", (), {"posts": lambda self: kept})())
+    for n in range(1, 6):
+        assert count(episodes, f"USERTOKEN-{n}") == 1, n
+
+
+@pytest.mark.parametrize("reason", ["resume", "branch"])
+def test_a_recorded_copy_left_by_a_switch_posts_nothing(plugin, server, tmp_path, reason):
+    """review-round3 finding 2 (probe3): a home a client 0.24.10 to 0.24.15 recorded as
+    holding copies, a new agent for that session, then a switch away before any turn
+    ended there. Nothing is posted for the session left (no upload is queued for it)."""
+    home = tmp_path / "hermes-a"
+    chat = Session(plugin, home)
+    copied = chat.store.turn(chat.sid, "USERTOKEN-copied one", "FINALTOKEN-copied one")
+    copied += chat.store.turn(chat.sid, "USERTOKEN-copied two", "FINALTOKEN-copied two")
+    (home / "synapse" / "copied").mkdir(parents=True, exist_ok=True)
+    from synapse_client.harnesses.hermes import carried
+
+    carried.note_copied(home, chat.sid)
+    agent = chat.agent()
+    agent.on_session_switch("20261115_222222_ff00ff", parent_session_id=chat.sid, reason=reason)
+    agent.shutdown()
+    assert server.posts() == []
+
+
+def test_a_part_waiting_in_the_outbox_is_not_sent_again_as_context(chat, server):
+    """review-round3 probe2 ``test_part_in_the_outbox_then_the_whole_turn_as_context``: a
+    flush inside a run sent the first part; the rest failed and waits in the outbox; the
+    next turn led with the whole turn as context, which the server stored whole. A turn
+    that went in parts is not used as context."""
+    sid, s = chat.sid, chat.store
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    chat.live += [
+        s.add(sid, "user", "USERTOKEN-2 long plan"),
+        s.add(sid, "assistant", "INTERIM-2 I will start"),
+        s.add(sid, "user", "[System: Continue now.]"),
+    ]
+    chat.provider.on_pre_compress(list(chat.live))
+    server.ingest_status = 503
+    chat.live.append(s.add(sid, "assistant", "FINALTOKEN-2 done"))
+    n = len(server.posts())
+    chat.sync()
+    refused = set(range(n, len(server.posts())))
+    server.ingest_status = 200
+    chat.turn("USERTOKEN-3", "FINALTOKEN-3")
+    episodes = stored(server, refused)
+    for token in ("USERTOKEN-2", "INTERIM-2", "FINALTOKEN-2", "USERTOKEN-3"):
+        assert count(episodes, token) == 1, token
+
+
+def test_a_list_row_the_store_holds_otherwise_goes_as_the_list_has_it(chat, server, caplog):
+    """The store is a check too: a list row whose uid the store holds under another
+    role is said once in the log and sent as the list has it (the released client's
+    behaviour); a row the store does not hold is no mismatch."""
+    sid, s = chat.sid, chat.store
+    row = s.add(sid, "assistant", "stored as the assistant's")
+    odd = {**row, "role": "user", "content": "USERTOKEN-as the list has it"}
+    reply = s.add(sid, "assistant", "FINALTOKEN-odd")
+    with caplog.at_level(logging.WARNING):
+        chat.sync([*chat.live, odd, reply])
+        chat.sync([*chat.live, odd, reply])
+    assert count(stored(server), "USERTOKEN-as the list has it") == 1
+    said = [r.getMessage() for r in caplog.records if "disagree" in r.getMessage()]
+    assert len(said) == 1

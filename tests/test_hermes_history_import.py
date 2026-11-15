@@ -44,7 +44,7 @@ CREATE TABLE messages (
     content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
     _compressed_summary INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0, api_content TEXT, display_kind TEXT,
-    message_uid TEXT, absorbed_message_uids TEXT);
+    message_uid TEXT, absorbed_message_uids TEXT, display_metadata TEXT);
 CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE session_admissions (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
@@ -574,7 +574,20 @@ def command(store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     server = FakeServer(settings)
     monkeypatch.setattr(module.Settings, "load", classmethod(lambda cls: settings))
     monkeypatch.setattr(module, "Client", lambda _settings, _agent: server)
+    # Hermes's own scrub stands in as a marker: every string it sees gets a suffix, so a
+    # test can tell that what was sent went through it (test_hermes_scrub.py runs the real one).
+    monkeypatch.setattr(module.scrub, "interpreter", lambda: "hermes-python")
+    monkeypatch.setattr(module.scrub, "rows", _marked)
     return module, server
+
+
+def _marked(sessions: dict[str, Any], python: Any, home: Any = None) -> dict[str, Any]:
+    return {
+        sid: [
+            {**r, "content": r["content"] + " [scrubbed]"} if r.get("content") else r for r in rows
+        ]
+        for sid, rows in sessions.items()
+    }
 
 
 def test_the_command_imports_and_a_rerun_adds_nothing(store, command, capsys) -> None:
@@ -595,6 +608,8 @@ def test_the_command_imports_and_a_rerun_adds_nothing(store, command, capsys) ->
     assert "2 session(s), 3 finished turn(s)" in out
     assert "Done: 3 new turn(s)" in out
     assert {body["session_id"] for body in server.bodies} == {a, b}
+    sent = [r for body in server.bodies for r in body["records"] if r.get("content")]
+    assert sent and all(r["content"].endswith(" [scrubbed]") for r in sent)
     # The rerun finds every turn in the ledger the provider shares: nothing is sent.
     posted = len(server.bodies)
     assert module.main(["--hermes-home", home, "--yes"]) == 0
@@ -668,3 +683,18 @@ def test_import_hermes_is_a_subcommand_of_import(monkeypatch, tmp_path) -> None:
     spec.loader.exec_module(module)
     assert module.main(["hermes", "--hermes-home", "/x", "--dry-run"]) == 0
     assert called == [["--hermes-home", "/x", "--dry-run"]]
+
+
+def test_with_no_hermes_scrub_nothing_is_sent_unless_asked(store, command, monkeypatch, capsys):
+    """The store holds rows unscrubbed. When Hermes's own scrub cannot be run, nothing is
+    sent; ``--no-hermes-scrub`` sends the stored text as clients up to 0.24.22 did."""
+    module, server = command
+    monkeypatch.setattr(module.scrub, "interpreter", lambda: None)
+    monkeypatch.setattr(module.scrub, "rows", lambda *a, **k: None)
+    sid = store.chat("raw")
+    store.turn(sid, "q1", "a1")
+    home = str(store.home)
+    assert module.main(["--hermes-home", home, "--yes"]) == 1
+    assert server.bodies == [] and "Nothing was sent" in capsys.readouterr().err
+    assert module.main(["--hermes-home", home, "--yes", "--no-hermes-scrub"]) == 0
+    assert [r["content"] for r in server.bodies[0]["records"]][:2] == ["q1", "a1"]

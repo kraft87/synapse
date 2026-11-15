@@ -249,3 +249,20 @@ def test_a_session_end_removes_the_marker_and_never_fails(tmp_path):
     for payload in ("not json", "[]", json.dumps({"session_id": "../x"}), json.dumps({})):
         assert toggle.session_end(io.StringIO(payload)) == 0
     assert err.getvalue() == ""
+
+
+def test_forget_clears_what_a_harness_recorded_as_shipped(tmp_path):
+    """review-round3 finding 5: turns sent while only the server row kept a session
+    private were dropped by the server (HTTP 200) and recorded as shipped. ``--forget``
+    puts the session back whole: what was recorded for it goes, and only for it."""
+    from synapse_client.shipped import Ledger
+
+    toggle, _, _, _ = _toggle(tmp_path)
+    ledger = Ledger(toggle.client.settings.home / "shipped" / "hermes")
+    ledger.add("s-1", ["u1", "u2"])
+    ledger.add("s-2", ["u9"])
+    assert toggle.main(["on", "s-1"]) == 0
+    assert toggle.main(["off", "s-1"]) == 0 and ledger.load("s-1").known  # plain off keeps it
+    assert toggle.main(["on", "s-1"]) == 0
+    assert toggle.main(["off", "--forget", "s-1"]) == 0
+    assert not ledger.load("s-1").known and ledger.load("s-2").uids == {"u9"}

@@ -171,8 +171,8 @@ class HermesStore:
         ``keep`` rows with the same uids. Returns the live list Hermes holds after it."""
         rows = self.conn.execute(
             "SELECT role, content, tool_call_id, tool_calls, tool_name, display_kind, "
-            "display_metadata, message_uid FROM messages WHERE session_id=? AND active=1 "
-            "ORDER BY id",
+            "display_metadata, message_uid, _compressed_summary FROM messages "
+            "WHERE session_id=? AND active=1 ORDER BY id",
             (sid,),
         ).fetchall()
         self.conn.execute(
@@ -191,7 +191,7 @@ class HermesStore:
                     uid=replaced[-1][7],
                 )
             )
-        for role, content, cid, calls, name, kind, meta, uid in rows[len(rows) - keep :]:
+        for role, content, cid, calls, name, kind, meta, uid, summ in rows[len(rows) - keep :]:
             live.append(
                 self.add(
                     sid,
@@ -203,6 +203,7 @@ class HermesStore:
                     display_kind=kind,
                     display_metadata=json.loads(meta) if meta else None,
                     uid=uid,
+                    summary=bool(summ),
                 )
             )
         return live
