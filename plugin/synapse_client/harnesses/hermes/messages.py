@@ -49,10 +49,13 @@ actually sent, with the memory context it injected, our own nudge included), not
   ``_merge_consecutive_users``: a marker, a note or a message that got no reply, then
   the next message, joined by a blank line, the first one's text kept as
   ``_merged_turn_prefix``) is sent as the two rows it was (``_split``) when the first
-  is one Hermes wrote (synthetic by its text or by the ``display_kind`` the store holds
-  for the row's uid): that one under the row's own uid, the user's message under the
-  uid Hermes noted it absorbed. A first part the user wrote (a message that got no
-  reply) keeps the row whole, as one ask.
+  holds something Hermes wrote (synthetic by its text, or a ``display_kind`` the store
+  holds for the row's uid or a row it absorbed before the message): the first part is
+  sent as an empty synthetic row under the row's own uid, its text left out (a marker,
+  a note, and a message that got no reply, which the importer does not store either),
+  and the user's message under the last uid Hermes noted it absorbed. A first part the
+  user wrote alone (a message that got no reply, then the message) keeps the row whole,
+  as one ask.
   Any other row that holds more than one message (rows a compression merged, which
   leave only ``_absorbed_message_uids``) is sent as it is, followed by a ``synthetic``
   row with no text, which says so to the core: ``messages.joined`` cannot read it off
@@ -307,6 +310,22 @@ def _kind(message: Any, kinds: Mapping[str, str] | None) -> Any:
     return {**message, "display_kind": kind} if kind else message
 
 
+def _hermes_wrote(head: Mapping[str, Any], row: Mapping[str, Any], kinds: Any) -> bool:
+    """Whether the part of a folded row in front of the message holds something Hermes
+    wrote: its text reads as Hermes's own, or the store holds a ``display_kind`` for the
+    row's uid or for a row it absorbed before the message (a marker or a note folded in
+    after a message that got no reply). The importer reads such rows as their own rows,
+    and a message that got no reply as a turn that never completed: neither is stored as
+    the user's words, and the live path agrees."""
+    record = _record(_kind(head, kinds))
+    if record is not None and record.get("synthetic"):
+        return True
+    absorbed = row.get("_absorbed_message_uids")
+    earlier = absorbed[:-1] if isinstance(absorbed, list) else []
+    uids = [row.get("message_uid"), *earlier]
+    return bool(kinds) and any(isinstance(u, str) and kinds.get(u) for u in uids)
+
+
 def _split(message: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
     """A user row Hermes folded the next message into, as the two rows it was: the text
     that got no reply (``_merged_turn_prefix``, under the row's own uid) and the message
@@ -326,8 +345,8 @@ def _split(message: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
     rest = {k: v for k, v in head.items() if k not in ("message_uid", "display_kind")}
     rest["content"] = content[len(prefix) + 2 :]
     absorbed = message.get("_absorbed_message_uids")
-    if isinstance(absorbed, list) and len(absorbed) == 1 and isinstance(absorbed[0], str):
-        rest["message_uid"] = absorbed[0]
+    if isinstance(absorbed, list) and absorbed and isinstance(absorbed[-1], str):
+        rest["message_uid"] = absorbed[-1]
     return [head, rest]
 
 
@@ -341,15 +360,19 @@ def to_records(
     records: list[Record] = []
     for message in messages or ():
         parts = _split(message) if isinstance(message, Mapping) else None
-        if parts is not None:
-            head = _record(_kind(parts[0], kinds))
-            if head is None or not head.get("synthetic"):
-                parts = None  # a message that got no reply: the two stay one turn's ask
-        for one in parts or (message,):
+        if parts is not None and not _hermes_wrote(parts[0], message, kinds):
+            parts = None  # a message that got no reply: the two stay one turn's ask
+        for index, one in enumerate(parts or (message,)):
             one = _kind(one, kinds)
             record = _record(one)
             if record is None:
                 continue
+            if parts is not None and index == 0:
+                # What Hermes folded in front of the message (a marker, a note, and any
+                # message that got no reply before them) is not sent: the row stays,
+                # empty, to say a message landed here.
+                record = {k: v for k, v in record.items() if k not in ("begins", "kind")}
+                record.update(content="", synthetic=True)
             records.append(record)
             if (
                 parts is None

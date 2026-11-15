@@ -42,12 +42,18 @@ class Attributes(NamedTuple):
 
 
 def uids(messages: Iterable[Any]) -> list[str]:
-    """The ``message_uid`` of every row of ``messages`` that has one."""
+    """The ``message_uid`` of every row of ``messages`` that has one, and the uids of the
+    rows a folded row absorbed (their kinds say what was folded in)."""
     out = []
     for message in messages or ():
-        uid = message.get("message_uid") if isinstance(message, Mapping) else None
+        if not isinstance(message, Mapping):
+            continue
+        uid = message.get("message_uid")
         if isinstance(uid, str) and uid:
             out.append(uid)
+        absorbed = message.get("_absorbed_message_uids")
+        if isinstance(absorbed, list):
+            out += [one for one in absorbed if isinstance(one, str) and one]
     return out
 
 
@@ -80,7 +86,7 @@ def read(
         store.check_schema(conn)
         if gateway and store.admitted_others(conn, session_id, owner, route):
             return Attributes({}, foreign=True)
-        stored = store.kinds(conn, wanted)
+        stored = store.kinds(conn, session_id, wanted)
     except store.SchemaError as err:
         return Attributes({}, reason=str(err))
     except (sqlite3.Error, OSError, ValueError) as err:

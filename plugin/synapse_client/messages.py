@@ -153,6 +153,14 @@ def _hash(records: Sequence[Record]) -> str:
     return "sha256:" + hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
+def content_key(turn: Sequence[Record]) -> str:
+    """A key for what ``turn`` says, without its ids and times: the same turn sent before
+    its rows had ids (Hermes could not write them yet) and read again once they have
+    them keys the same."""
+    real = [{k: v for k, v in r.items() if k not in ("id", "ts")} for r in _real(turn)]
+    return "text:" + _hash(real)
+
+
 def ids(records: Sequence[Record]) -> list[str]:
     """The ``id`` of every record that has one, in order."""
     return [r["id"] for r in records if isinstance(r.get("id"), str) and r["id"]]

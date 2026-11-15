@@ -105,6 +105,17 @@ class Uploads:
         if got.foreign:
             self._authored()
             return False
+        if got.reason and listed and self._gateway:
+            line = (
+                f"synapse: the admission check could not run for gateway session {sid} "
+                f"({got.reason}); uploads go on with the turn_author check alone, as in the "
+                "released client"
+            )
+            with self._lock:
+                first = line not in self._said
+                self._said.add(line)
+            if first:
+                _warn(line)
         if got.reason and listed:
             line = f"synapse: display kinds were not read from Hermes's store: {got.reason}"
             with self._lock:

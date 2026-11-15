@@ -10,7 +10,8 @@ an agent rebuilt mid-session (Hermes does on a model switch) and an import all s
 was shipped before.
 
 One small JSON file per session, ``<directory>/<sha256 of the session id>.json`` (the
-Hermes provider's directory is ``<synapse home>/shipped/hermes``): the id may hold
+Hermes provider's directory is ``<synapse home>/shipped/hermes/<server key>``: one
+ledger per server, ``server_key``): the id may hold
 characters no file name can. A record a newer client wrote (a higher ``version``) is
 read as far as this one understands it and never rewritten; a damaged one is moved
 aside (``.damaged``) and counts as nothing shipped. ``forget`` removes a session's
@@ -78,6 +79,21 @@ class Shipped(NamedTuple):
     keys: frozenset[str]
     known: bool
     passed: frozenset[str] = frozenset()
+    #: How many times the record was cleared (``forget``): a process that read it before
+    #: knows what it remembers is gone.
+    cleared: int = 0
+
+
+def _body(session_id: str, record: Shipped) -> bytes:
+    body = {
+        "version": _VERSION,
+        "session_id": session_id,
+        "uids": sorted(record.uids),
+        "keys": sorted(record.keys),
+        "passed": sorted(record.passed),
+        "cleared": record.cleared,
+    }
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
 def nothing() -> Shipped:
@@ -154,11 +170,13 @@ class Ledger:
             return nothing(), True
         if data.get("session_id") != session_id:
             return nothing(), False
+        cleared = data.get("cleared")
         record = Shipped(
             _strings(data.get("uids")),
             _strings(data.get("keys")),
             True,
             _strings(data.get("passed")),
+            cleared if isinstance(cleared, int) and not isinstance(cleared, bool) else 0,
         )
         if data["version"] > _VERSION:
             self._say(
@@ -203,17 +221,11 @@ class Ledger:
                 now.keys | _strings(keys),
                 True,
                 now.passed | _strings(passed),
+                now.cleared,
             )
             if (now.known and merged == now) or not writable:
                 return merged
-            body = {
-                "version": _VERSION,
-                "session_id": session_id,
-                "uids": sorted(merged.uids),
-                "keys": sorted(merged.keys),
-                "passed": sorted(merged.passed),
-            }
-            self._write(file, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+            self._write(file, _body(session_id, merged))
             return merged
         finally:
             self._close_lock(handle)
@@ -221,16 +233,25 @@ class Ledger:
     def forget(self, session_id: str) -> None:
         """Forget what was shipped for ``session_id``: ``synapse private off --forget``
         put it back on the record, and the turns the server dropped while it was private
-        must go again. RAISES OSError when the record exists and cannot be removed."""
+        must go again. Kept: the keys of turns sent by their text before Hermes could
+        write their rows (``messages.content_key``), so they are not sent once more under
+        the ids they got since. The record notes that it was cleared (``cleared``). RAISES
+        OSError when the record exists and cannot be written."""
         if not session_id or not self.directory.is_dir():
             return
         file = self._file(session_id)
+        if not file.exists():
+            return
         handle = self._open_lock(file)
         try:
-            try:
-                os.remove(file)
-            except FileNotFoundError:
-                pass
+            now, writable = self._read(file, session_id)
+            if not writable:
+                return
+            kept = frozenset(k for k in now.keys if k.startswith("text:"))
+            self._write(
+                file,
+                _body(session_id, Shipped(frozenset(), kept, True, frozenset(), now.cleared + 1)),
+            )
         finally:
             self._close_lock(handle)
 
@@ -259,11 +280,27 @@ class Ledger:
             raise
 
 
+def server_key(settings: Any) -> str:
+    """Which server a ledger belongs to: the configured URL and this machine's token.
+    A new or rebuilt server needs a new token (the old one is not in its database), so
+    it gets a ledger of its own, and what was shipped to the old one is sent again
+    (within the look-back, as the released client did). A server restored from a backup
+    at the same address keeps the old token: no route of the server says which episodes
+    it holds or which database it is, so that case is not told apart (DESIGN.md)."""
+    seed = f"{getattr(settings, 'base_url', '') or ''}\n{getattr(settings, 'token', '') or ''}"
+    return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:20]
+
+
+def for_server(settings: Any, harness: str, *, log: Log | None = None) -> Ledger:
+    """The ledger of ``harness`` for the server ``settings`` name, under the Synapse home."""
+    return Ledger(Path(settings.home) / "shipped" / harness / server_key(settings), log=log)
+
+
 def directories(settings: Any) -> list[Path]:
-    """Where harnesses keep their ledgers under the Synapse home of ``settings``."""
+    """Every ledger directory under the Synapse home of ``settings``."""
     root = Path(settings.home) / "shipped"
     try:
-        return [p for p in root.iterdir() if p.is_dir()]
+        return sorted({p.parent for p in root.rglob("*.json*")})
     except OSError:
         return []
 

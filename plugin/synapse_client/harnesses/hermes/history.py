@@ -244,7 +244,13 @@ def select(
     pairs: list[Pair] = []
     copies = 0
     shipped = shipped or nothing()
-    for before, turn in messages.pending(all_turns, shipped.keys, shipped=shipped.uids):
+    # A turn the provider sent by its text before Hermes could write its rows is the
+    # same turn here, now that its rows have ids (messages.content_key).
+    done = set(shipped.uids)
+    for turn in all_turns:
+        if messages.complete(turn) and messages.content_key(turn) in shipped.keys:
+            done |= set(messages.ids(turn))
+    for before, turn in messages.pending(all_turns, shipped.keys, shipped=done):
         if messages.opening_key(turn) in copied:
             copies += 1
             continue

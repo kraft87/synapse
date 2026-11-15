@@ -232,22 +232,21 @@ def rows(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def kinds(conn: sqlite3.Connection, wanted: Iterable[str]) -> dict[str, tuple[str, str]]:
-    """``(role, display_kind)`` of the first row the store holds for each uid of
-    ``wanted`` (``display_kind`` empty when it has none); a uid it does not hold is not
-    in the answer."""
+def kinds(
+    conn: sqlite3.Connection, session_id: str, wanted: Iterable[str]
+) -> dict[str, tuple[str, str]]:
+    """``(role, display_kind)`` of the first row of ``session_id`` the store holds for
+    each uid of ``wanted`` (``display_kind`` empty when it has none); a uid the session
+    does not hold is not in the answer. One indexed read of the session's rows
+    (``idx_messages_session_id``), never a scan of the table."""
+    ids = {one for one in wanted if isinstance(one, str) and one}
     out: dict[str, tuple[str, str]] = {}
-    ids = [one for one in dict.fromkeys(wanted) if isinstance(one, str) and one]
-    for start in range(0, len(ids), 500):
-        chunk = ids[start : start + 500]
-        marks = ",".join("?" for _ in chunk)
-        query = (
-            "SELECT message_uid, role, display_kind FROM messages WHERE message_uid IN ("
-            + marks
-            + ") ORDER BY id"
-        )
-        for uid, role, kind in conn.execute(query, chunk):
-            out.setdefault(uid, (str(role or ""), str(kind or "")))
+    if not ids:
+        return out
+    query = "SELECT message_uid, role, display_kind FROM messages WHERE session_id=? ORDER BY id"
+    for uid, role, kind in conn.execute(query, (session_id,)):
+        if uid in ids and uid not in out:
+            out[uid] = (str(role or ""), str(kind or ""))
     return out
 
 

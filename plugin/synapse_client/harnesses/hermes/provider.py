@@ -109,11 +109,10 @@ from typing import Any
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 
-from ... import __version__, context, project, tools
+from ... import __version__, context, project, shipped, tools
 from ...api import Client
 from ...outbox import Outbox, failure_warning
 from ...settings import Settings
-from ...shipped import Ledger
 from ...turn_upload import TurnUploader
 from ...upload import Uploader
 from . import carried, uploads
@@ -254,7 +253,7 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
-        ledger = Ledger(settings.home / "shipped" / "hermes", log=_warn)
+        ledger = shipped.for_server(settings, "hermes", log=_warn)
         # Only an active session's verdict names the sessions it goes on from.
         earlier = carried.to_ask(home, verdict.continues)
         private_too = carried.carry(uploader, home, earlier, session_id, None)
@@ -439,6 +438,10 @@ class SynapseMemoryProvider(Uploads, MemoryProvider):
                     if self._turns is not None:
                         lookback = 0 if copies else LOOKBACK  # copies: no look-back
                         self._turns.start(new or old, lookback, continues=earlier)
+                        if reset and self._turns.ledger is not None:
+                            # A reset starts the conversation afresh: as in the released
+                            # client, its turns go again (the server's span dedup keeps one).
+                            self._turns.ledger.forget(new or old)
                     self._cut = None
                 elif kwargs.get("reason") == "compression":
                     self._cut = _clock()
