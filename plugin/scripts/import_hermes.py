@@ -9,10 +9,12 @@
 
 Reads ``<hermes_home>/state.db`` read-only and sends the finished turns of the sessions
 the live memory provider would have uploaded, to the same ``/ingest`` route in the same
-``messages`` format (synapse_client/harnesses/hermes/history.py has the rules). A turn
-the provider already uploaded maps to the same span id, so the server keeps one copy:
-importing after live use adds nothing for those turns, and interrupting and re-running
-is safe. Private sessions, and sessions holding turns of a private one, are skipped:
+``messages`` format (synapse_client/harnesses/hermes/history.py has the rules). It reads
+through the provider's own reader and records what it sends in the provider's ledger
+(``<hermes_home>/synapse/shipped``): a row the provider or an earlier import shipped is
+not sent again, and the provider does not send again what the import sent. A turn sent
+twice anyway maps to the same span id, so the server keeps one copy: interrupting and
+re-running is safe. Private sessions, and sessions holding turns of a private one, are skipped:
 by the marker in the private folder and by the server's row.
 
 Each imported turn runs KG extraction on the server's LLM, so the interactive run asks
@@ -36,6 +38,7 @@ from synapse_client.api import Client
 from synapse_client.harnesses.hermes import history
 from synapse_client.harnesses.hermes.install import default_home
 from synapse_client.settings import Settings
+from synapse_client.shipped import Ledger
 
 #: Seconds per ingest request, and per private-mode lookup.
 TIMEOUT = 60.0
@@ -121,13 +124,28 @@ def _short(session_id: str) -> str:
     return session_id if len(session_id) <= 24 else session_id[:22] + ".."
 
 
-def send(client: Client, session) -> int:
-    """POST one session's turns; returns how many the server took as new. RAISES
-    private.PrivateSession, before any request of that batch, for a session gone
-    private since, and what a failed request raises."""
+def ledger_of(home: str) -> Ledger:
+    """The ledger the live provider keeps under ``home``."""
+    return Ledger(os.path.join(home, "synapse", "shipped"))
+
+
+def send(client: Client, session, ledger: Ledger | None = None) -> int:
+    """POST one session's turns; returns how many the server took as new. Each body the
+    server took is recorded in ``ledger``. RAISES private.PrivateSession, before any
+    request of that batch, for a session gone private since, and what a failed request
+    raises."""
     ingested = 0
-    for payload in history.payloads(session):
+    for payload, new_turns in history.batches(session):
         reply = client.ingest(payload, timeout=TIMEOUT)
+        if ledger is not None:
+            try:
+                history.record(ledger, session.id, new_turns)
+            except OSError as err:
+                print(
+                    f"  could not record what was sent ({type(err).__name__}); the provider "
+                    "may send it again, which the server drops",
+                    file=sys.stderr,
+                )
         try:
             ingested += int(reply.get("ingested", 0))
         except (AttributeError, TypeError, ValueError):
@@ -154,7 +172,8 @@ def main(argv: list[str] | None = None) -> int:
 
     home = os.path.expanduser(args.hermes_home) if args.hermes_home else str(default_home())
     try:
-        sessions = history.read(home)
+        ledger = ledger_of(home)
+        sessions = history.read(home, ledger=ledger)
     except FileNotFoundError:
         print(f"{PROGRAM}: no session store at {os.path.join(home, 'state.db')}", file=sys.stderr)
         return 1
@@ -232,18 +251,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        return _ship(client, chosen)
+        return _ship(client, chosen, ledger)
     except KeyboardInterrupt:
         print("\nInterrupted. Turns already sent are kept (dedup by span_id): re-run to resume.")
         return 130
 
 
-def _ship(client: Client, chosen) -> int:
+def _ship(client: Client, chosen, ledger: Ledger | None = None) -> int:
     ok = failed = refused = ingested_total = 0
     for i, s in enumerate(chosen, 1):
         label = f"[{i}/{len(chosen)}] {_short(s.id)}"
         try:
-            n = send(client, s)
+            n = send(client, s, ledger)
         except private.PrivateSession:
             refused += 1
             print(f"{label} -> skipped (private mode)", flush=True)

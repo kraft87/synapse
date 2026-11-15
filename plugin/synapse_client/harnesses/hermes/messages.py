@@ -5,8 +5,13 @@ message dicts of its own transcript (OpenAI-style, plus Hermes's bookkeeping key
 :func:`to_records` keeps only what the server's ``messages`` parser reads and builds new
 dicts; the input is never modified, since those dicts are Hermes's own.
 
+The same conversion serves the dicts Hermes rebuilds from its session store
+(store.py), which is what the provider normally reads, and the live list, which it
+reads when the store cannot be (provider.py).
+
 What a record keeps: ``role`` (user, assistant and tool only), the text content (a
-string, or the text parts of a list joined by newlines), an assistant row's tool calls
+string, or the text parts of a list joined by newlines; on a user row each image is a
+``[screenshot]`` too, as Hermes stores the row), an assistant row's tool calls
 as ``{"name", "arguments"}``, a tool row's tool ``name``, ``ts`` from ``timestamp`` and
 ``id`` from ``message_uid``. Nothing else leaves: not ``api_content`` (the text Hermes
 actually sent, with the memory context it injected, our own nudge included), not
@@ -26,10 +31,20 @@ actually sent, with the memory context it injected, our own nudge included), not
   ``agent/context_compressor._SYNTHETIC_USER_ROW_PREFIXES``,
   ``agent/conversation_compression_scaffolding._SYNTHETIC_USER_PREFIXES``). The flags are
   not persisted, so a resumed session's rows are recognised by their text.
-- A user row with no text (a picture alone) is sent as a ``synthetic`` row as well. It
-  opens no turn, so its reply lands on the turn before; the row stays in the records to
-  show that this reply answers something later than that turn (the core's
-  ``messages.joined``). No user row is left out, whatever it holds.
+- A user row with no text (nothing once the memory block is gone) is sent as a
+  ``synthetic`` row as well. It opens no turn, so its reply lands on the turn before;
+  the row stays in the records to show that this reply answers something later than
+  that turn (the core's ``messages.joined``). No user row is left out, whatever it
+  holds. A picture is not such a row: it reads ``[screenshot]``, as in the store
+  (agent/session_persistence.py ``_durable_content``).
+- A user row whose ``display_kind`` is one Hermes stamps on the row that opens a run it
+  starts itself (_RUN_KINDS: a background task's report, a gateway event, an
+  auto-continue, a hidden Desktop send, a skill run) is ``synthetic`` and ``begins``,
+  with its ``kind``: the core makes it and its reply a turn of its own, so the turn
+  before is not sent again. Its text is not sent: a report holds the task's output,
+  which can quote files, web pages or other people. Every other kind is written inside
+  a run (``steer``) or between runs and answered by none (``model_switch``,
+  ``personality_switch``): synthetic, in the turn it lands in.
 - A user row Hermes folded another message into holds messages typed at different
   times: one typed after a message that got no reply (agent/agent_runtime_helpers.py
   ``_merge_consecutive_users``, which leaves ``_merged_turn_prefix`` on the row, and
@@ -50,6 +65,10 @@ actually sent, with the memory context it injected, our own nudge included), not
   as Hermes recognises it (``untyped_failed_turn_display_kind``), by text that is
   exactly one of the three notices; a reply that quotes one stays a reply. Every other
   ``display_kind`` Hermes writes is on a user row (above).
+- A row Hermes never stores (an ephemeral scaffolding flag: the re-prompt pair after a
+  dropped tool call, a recovery nudge; agent/session_persistence.py
+  ``_EPHEMERAL_SCAFFOLDING_FLAGS``) is not sent either, so the live list and the store
+  give the same records.
 - Tool results are capped at 2000 characters and tool-call arguments at 1000; the
   server renders less of either. User and assistant text are sent whole.
 
@@ -78,6 +97,26 @@ TOOL_ARGUMENTS_CAP = 1000
 
 _ROLES = ("user", "assistant", "tool")
 _TEXT_PARTS = ("text", "input_text", "output_text")
+#: The image parts Hermes stores as ``[screenshot]`` (agent/session_persistence.py
+#: ``_IMAGE_PART_TYPES``, ``_image_marker``).
+_IMAGE_PARTS = ("image", "image_url", "input_image")
+_IMAGE_DETAILS = ("low", "high", "auto")
+#: The user-row kinds Hermes stamps on the row that opens a run it starts itself
+#: (``persist_user_display_kind``, agent/turn_context.py ``_stage_turn_user_message``):
+#: a background task's report (tools/process_registry_notifications.py), a gateway event
+#: or heartbeat (gateway/response_filters.py ``display_kind_for_event``), an auto-continue
+#: (tui_gateway/session_auto_continue.py), a hidden Desktop send (gateway/session_display.py),
+#: a skill run.
+_RUN_KINDS = frozenset(
+    {
+        "async_delegation_complete",
+        "process_complete",
+        "internal_notification",
+        "auto_continue",
+        "hidden",
+        "skill_invocation",
+    }
+)
 _MEMORY_CONTEXT = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL)
 _SUMMARY_KEY = "_compressed_summary"
 _MERGED_KEYS = ("_merged_turn_prefix", "_absorbed_message_uids")
@@ -90,6 +129,17 @@ _SYNTHETIC_FLAGS = (
 )
 #: Hermes's failed-turn boundary (agent/turn_failure_copy.py ``FAILED_TURN_DISPLAY_KIND``)
 #: and the three notices it writes as its text.
+#: Hermes never stores a row carrying one of these (agent/session_persistence.py
+#: ``_EPHEMERAL_SCAFFOLDING_FLAGS``), so neither is it sent.
+_EPHEMERAL_FLAGS = (
+    "_empty_recovery_synthetic",
+    "_empty_terminal_sentinel",
+    "_thinking_prefill",
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+    "_kanban_stop_synthetic",
+    "_dropped_toolcall_nudge",
+)
 _FAILED_TURN_KIND = "failed_turn"
 _FAILED_TURN_NOTICES = (
     "Your request was not processed. Send it again if you still want me to carry it out.",
@@ -113,6 +163,26 @@ _SYNTHETIC_PREFIXES = (
     "[/OUT-OF-BAND",
     "Cronjob Response:",
 )
+
+
+def _image_marker(part: Mapping[str, Any]) -> str:
+    url = part.get("image_url")
+    detail = part.get("detail") or (url.get("detail") if isinstance(url, Mapping) else None)
+    return f"[screenshot detail={detail}]" if detail in _IMAGE_DETAILS else "[screenshot]"
+
+
+def _user_text(content: Any) -> str:
+    """A user message's text as Hermes stores it (agent/session_persistence.py
+    ``_durable_content``): a list's text parts and a ``[screenshot]`` for each image,
+    joined by newlines, so the live list and the store read the same row."""
+    if isinstance(content, list):
+        content = "\n".join(
+            str(part.get("text", "")) if part.get("type") == "text" else _image_marker(part)
+            for part in content
+            if isinstance(part, Mapping)
+            and (part.get("type") == "text" or part.get("type") in _IMAGE_PARTS)
+        )
+    return _text(content)
 
 
 def _text(content: Any) -> str:
@@ -180,11 +250,24 @@ def _record(message: Any) -> Record | None:
     summary = bool(message.get(_SUMMARY_KEY))
     if role not in _ROLES or (summary and role != "user"):
         return None
-    text = "" if summary else _text(message.get("content"))
+    if any(message.get(flag) for flag in _EPHEMERAL_FLAGS):
+        return None
+    if summary:
+        text = ""
+    elif role == "user":
+        text = _user_text(message.get("content"))
+    else:
+        text = _text(message.get("content"))
     record: Record = {"role": role, "content": text}
     if role == "user":
+        kind = message.get("display_kind")
         if not text or _synthetic(message, text):
             record["synthetic"] = True
+        if kind in _RUN_KINDS and not summary:
+            record["synthetic"] = True
+            record["begins"] = True
+            record["kind"] = kind
+            record["content"] = ""
     elif role == "assistant":
         calls = _tool_calls(message.get("tool_calls"))
         kind = message.get("display_kind")

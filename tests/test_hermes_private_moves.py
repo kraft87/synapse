@@ -402,8 +402,8 @@ def test_what_goes_on_from_a_session_put_back_is_on_the_record(plugin, server, t
     assert not (tmp_path / "private" / _THIRD).exists()
     later = _open(plugin, home, _THIRD, resumed=True, message_count=10)
     _say(later, [*said, *_conversation(6)[-2:]], _THIRD)
-    # A new agent sends what its look-back reaches again; the server keeps one of each.
-    assert _posted(server)[1:] == [(_THIRD, [*held, "question 6"])]
+    # A new agent sends only what was not shipped: turn 6, with turn 5 as context.
+    assert _posted(server)[1:] == [(_THIRD, ["question 5", "question 6"])]
     assert server.puts() == [f"/private-sessions/{_CHILD}"] and server.asked() == [_CHILD]
 
 

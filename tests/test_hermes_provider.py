@@ -652,9 +652,11 @@ def test_a_session_switch_rebinds(plugin, server, tmp_path):
     assert second["session_id"] == "20261112_120000_ffffff"
     assert _users(second["records"]) == ["question 1", "question 2"]
 
+    # A reset forgets what this agent sent, not what was shipped: the same rows do not
+    # go again (shipped.Ledger).
     provider.on_session_switch("20261112_120000_ffffff", reset=True)
     provider.sync_turn("q", "a", messages=_conversation(2))
-    assert len(server.posts()) == 3
+    assert len(server.posts()) == 2
 
 
 _NEXT = "20261112_120000_ffffff"
