@@ -137,7 +137,9 @@ def test_every_sample_pins_the_recall_floor_for_its_reranker(sample: Path):
     if _assigned(sample).get("SYNAPSE_RERANK_MODEL", "").startswith("BAAI/"):
         assert floor == 0.0, "no calibrated floor exists for the bundled local reranker"
     else:
-        assert 0.0 < floor < 1.0
+        # Voyage's rerankers. Above this, questions memory can answer lose their episodes:
+        # 22 of 150 answerable LongMemEval-S questions at 0.50, 60 at 0.60, against 2 at 0.40.
+        assert 0.0 < floor <= 0.45
 
 
 @pytest.mark.parametrize("sample", [*_samples(), ENV_EXAMPLE], ids=lambda p: p.name)

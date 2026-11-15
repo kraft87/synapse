@@ -11,6 +11,40 @@ change; the minor (`0.24.x` to `0.25.0`) when the client gains something a user 
 has to do differently, such as a new command, harness, platform or setting, or a changed
 default.
 
+## 2026-11-14 — client: Hermes and Codex setup says what is true; presets lower the episode floor (plugin 0.24.22)
+
+**What changed**
+
+- `synapse status` says when Hermes has Synapse installed but runs another memory
+  provider, and names the command that switches. It said "wired". `synapse update` says
+  the same.
+- The hint to switch providers keeps `--hermes-home` when a home was given.
+- The Codex trust step is printed only when Codex would ask: a new, changed or never
+  trusted Synapse hook. Otherwise login says Codex already trusts the hooks.
+- `synapse login` on a machine set up with `--token` says the stored token is in use.
+- In a Hermes session where Synapse is off (a chat platform, the API server), the model is
+  no longer shown the memory tools. Calls were already refused.
+- **Presets:** `voyage.env` and `openrouter.env` set `SYNAPSE_RECALL_FLOOR=0.40`, down from
+  0.60. At 0.60 recall served no episodes for questions memory could answer.
+
+**What to do on each machine**
+
+- `synapse update`. With Hermes, then `hermes gateway stop`.
+- A server set up from a preset with `SYNAPSE_RECALL_FLOOR=0.60` in its `.env`: change it
+  to `0.40` and `docker compose up -d`. A server that sets its own value is not touched.
+
+**What was proven**
+
+- Each client fix on a real Hermes v0.23.1 and Codex setup, before and after. The tool
+  change against Hermes's own memory manager on v0.23.1 and main.
+- The floor on 150 answerable LongMemEval-S questions: 2 lose their episodes at 0.40, 22
+  at 0.50, 60 at 0.60. Of 752 real recalls, 0.7% fall under 0.40 and 13.6% under 0.60.
+
+**Still open**
+
+- A Hermes background task's report still makes the client upload the turn that started
+  it a second time. A first fix cut ordinary turns in two and was held back.
+
 ## 2026-11-14 — board: the server records what each session start was served (plugin 0.24.21)
 
 **What changed**
