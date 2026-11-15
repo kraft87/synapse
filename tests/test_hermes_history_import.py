@@ -698,3 +698,24 @@ def test_with_no_hermes_scrub_nothing_is_sent_unless_asked(store, command, monke
     assert server.bodies == [] and "Nothing was sent" in capsys.readouterr().err
     assert module.main(["--hermes-home", home, "--yes", "--no-hermes-scrub"]) == 0
     assert [r["content"] for r in server.bodies[0]["records"]][:2] == ["q1", "a1"]
+
+
+def test_the_import_says_whether_secrets_were_masked(store, command, monkeypatch, capsys):
+    """review-round4 item 3: ``--no-hermes-scrub`` sent raw text with no line saying so.
+    The summary before the confirmation and the last line both say it."""
+    module, _server = command
+    sid = store.chat("said")
+    store.turn(sid, "q1", "a1")
+    assert module.main(["--hermes-home", str(store.home), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "masked by Hermes's own scrub" in out
+    assert out.rstrip().endswith(
+        "Secrets were masked by Hermes's own scrub before anything was sent."
+    )
+    monkeypatch.setattr(module.scrub, "rows", lambda *a, **k: None)
+    other = store.chat("raw2")
+    store.turn(other, "q2", "a2")
+    assert module.main(["--hermes-home", str(store.home), "--yes", "--no-hermes-scrub"]) == 0
+    out = capsys.readouterr().out
+    assert "NOT masked" in out
+    assert out.rstrip().endswith("secrets were NOT masked by Hermes.")

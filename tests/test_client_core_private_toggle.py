@@ -265,4 +265,7 @@ def test_forget_clears_what_a_harness_recorded_as_shipped(tmp_path):
     assert toggle.main(["off", "s-1"]) == 0 and ledger.load("s-1").known  # plain off keeps it
     assert toggle.main(["on", "s-1"]) == 0
     assert toggle.main(["off", "--forget", "s-1"]) == 0
-    assert not ledger.load("s-1").known and ledger.load("s-2").uids == {"u9"}
+    cleared = ledger.load("s-1")
+    assert (
+        cleared.uids == frozenset() and cleared.cleared == 1 and ledger.load("s-2").uids == {"u9"}
+    )

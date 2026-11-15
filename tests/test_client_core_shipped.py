@@ -65,4 +65,13 @@ def test_forget_removes_one_session(tmp_path: Path) -> None:
     led.add("b", ["2"])
     led.forget("a")
     led.forget("missing")
-    assert not led.load("a").known and led.load("b").uids == {"2"}
+    assert led.load("a").uids == frozenset() and led.load("a").cleared == 1
+    assert led.load("b").uids == {"2"} and not led.load("missing").known
+
+
+def test_forget_keeps_text_keys_and_counts(tmp_path: Path) -> None:
+    led = Ledger(tmp_path)
+    led.add("a", ["u1"], ["k1", "text:abc"])
+    led.forget("a")
+    got = led.load("a")
+    assert got.uids == frozenset() and got.keys == {"text:abc"} and got.cleared == 1

@@ -12,7 +12,11 @@ to a new session id inside a run, an agent rebuilt mid-session (its list loses e
 ``display_kind``), runs no upload ran for, flushes inside a run, uploads that fail and
 wait in the outbox, a prompt queued during a run, rows Hermes could not write (no uid,
 not in the store), a window where only the server's row keeps the session private
-followed by ``off --forget`` and a restart, and secrets in the user's text.
+followed by ``off --forget`` and a restart, and secrets in the user's text. The events
+review round 4 added (followups/hermes-turn-cut/review-round4/fuzz4.py): rows written
+by a later flush, a store gone for a while, ``off --forget`` with no restart, a marker
+and a note folded with the message, two prompts queued in one run, a compaction that
+leaves a report first.
 
 The upload is the provider's: the list converted with the store's kinds (source.py,
 messages.py), the ledger (shipped.py), TurnUploader, Uploader and Outbox; the server is
@@ -56,7 +60,8 @@ FAILED = (
 EVENTS = [
     "turn", "tools", "report", "alike", "nudged", "marker", "note", "picture", "failed",
     "steer", "compact", "rebuild", "skip", "down", "flush", "queued", "rotate", "unwritten",
-    "private", "secret",
+    "private", "secret", "written_later", "store_gone", "forget_live", "fold2", "queued2",
+    "report_first",
 ]  # fmt: skip
 
 
@@ -341,6 +346,107 @@ class Run:
         self.scrubbed[row["message_uid"]] = f"{user} my key is [redacted]"
         self.live.append(self.handed(row))
         self.both("assistant", final)
+
+    # -- review round 4 (followups/hermes-turn-cut/review-round4/fuzz4.py) -----------
+
+    def written_later(self) -> None:
+        """Rows Hermes could not write at one hook get their uids by the next."""
+        user, final = self.tok("USER"), self.tok("FINAL")
+        self.must += [user, final]
+        rows = [
+            {"role": "user", "content": user, "timestamp": 1e9 + self.n},
+            {"role": "assistant", "content": final, "timestamp": 1e9 + self.n + 1},
+        ]
+        self.live += rows
+        self.sync()
+        for row in rows:
+            stored = self.store.add(self.sid, row["role"], row["content"])
+            row["message_uid"], row["timestamp"] = stored["message_uid"], stored["timestamp"]
+        self.turn()
+
+    def store_gone(self) -> None:
+        """The store cannot be read for a while, and the agent is rebuilt meanwhile."""
+
+        def version(n: int) -> None:
+            self.store.conn.execute("UPDATE schema_version SET version=?", (n,))
+            self.store.conn.commit()
+
+        self.report()
+        self.sync()
+        version(99)
+        self.rebuild()
+        self.report()
+        self.sync()
+        self.turn()
+        self.sync()
+        version(33)
+        self.turn()
+
+    def forget_live(self) -> None:
+        """``off --forget`` while the same provider goes on (no restart)."""
+        marker = Path(self.server.settings.private_dir) / self.sid
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
+        self.server.rows.add(self.sid)
+        self.turn()
+        self.sync()
+        marker.unlink()
+        self.turn()
+        self.sync()
+        self.server.rows.discard(self.sid)
+        self.ledger.forget(self.sid)
+        self.turn()
+
+    def fold2(self) -> None:
+        """A marker, a note, then the message, folded into one list row."""
+        user, final, note = self.tok("USER"), self.tok("FINAL"), self.tok("NOTE")
+        self.must += [user, final]
+        self.never.append(note)
+        text = f"[IMPORTANT: Background process exited.]\n{note}"
+        marker = self.store.add(self.sid, "user", MODEL, display_kind="model_switch")
+        noted = self.store.add(self.sid, "user", text, display_kind="process_complete")
+        message = self.store.add(self.sid, "user", user)
+        merged = {k: v for k, v in marker.items() if k != "display_kind"}
+        merged["content"] = MODEL + "\n\n" + text + "\n\n" + user
+        merged["_merged_turn_prefix"] = MODEL + "\n\n" + text
+        merged["_absorbed_message_uids"] = [noted["message_uid"], message["message_uid"]]
+        self.live.append(merged)
+        self.both("assistant", final)
+
+    def queued2(self) -> None:
+        """Two prompts queued during one run."""
+        a, fa, b, fb, c, fc = (
+            self.tok(k) for k in ("USER", "FINAL", "USER", "FINAL", "USER", "FINAL")
+        )
+        self.must += [a, fa, b, fb, c, fc]
+        self.both("user", a)
+        eb = self.store.add(self.sid, "user", b, display_metadata={"_queued_prompt": True})
+        ec = self.store.add(self.sid, "user", c, display_metadata={"_queued_prompt": True})
+        self.both("assistant", fa)
+        self.sync()
+        self.store.conn.execute(
+            "UPDATE messages SET active=0 WHERE message_uid IN (?,?)",
+            (eb["message_uid"], ec["message_uid"]),
+        )
+        self.store.conn.commit()
+        self.both("user", b)
+        ec2 = self.store.add(self.sid, "user", c, display_metadata={"_queued_prompt": True})
+        self.both("assistant", fb)
+        self.sync()
+        self.store.conn.execute(
+            "UPDATE messages SET active=0 WHERE message_uid=?", (ec2["message_uid"],)
+        )
+        self.store.conn.commit()
+        self.both("user", c)
+        self.both("assistant", fc)
+
+    def report_first(self) -> None:
+        """A compaction leaves a list that starts with a report."""
+        self.report()
+        self.sync()
+        self.sync(finished=False)
+        self.live = [self.handed(m) for m in self.store.compact(self.sid, keep=2)]
+        self.turn()
 
     def play(self) -> None:
         self.turn()

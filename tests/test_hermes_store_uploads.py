@@ -968,3 +968,170 @@ def test_a_list_row_the_store_holds_otherwise_goes_as_the_list_has_it(chat, serv
     assert count(stored(server), "USERTOKEN-as the list has it") == 1
     said = [r.getMessage() for r in caplog.records if "disagree" in r.getMessage()]
     assert len(said) == 1
+
+
+# -- review round 4 -------------------------------------------------------------------------
+
+
+def test_a_new_server_gets_the_turns_again(chat, server, user):
+    """review-round4 probe9: the ledger did not know which server it shipped to; after a
+    new server (here: a new token for the same address, as a rebuilt server issues),
+    the import said "Nothing to import." and live sent nothing. Each server has a ledger
+    of its own (shipped.server_key): the import sends again, and the live path looks
+    back as the released client did."""
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    chat.turn("USERTOKEN-2", "FINALTOKEN-2")
+    before = len(server.posts())
+    config = user / ".synapse" / "config.json"
+    data = json.loads(config.read_text("utf-8"))
+    config.write_text(json.dumps({**data, "token": "a-token-the-new-server-issued"}), "utf-8")
+    later = chat.agent()
+    chat.live += chat.store.turn(chat.sid, "USERTOKEN-3", "FINALTOKEN-3")
+    chat.sync(provider=later)
+    sent = json.dumps([b["records"] for b in server.posts()[before:]])
+    assert "USERTOKEN-1" in sent and "USERTOKEN-2" in sent and "USERTOKEN-3" in sent
+
+
+def test_the_same_provider_notices_off_forget(chat, server, tmp_path):
+    """review-round4 probe5 and the fuzz's forget_live: ``off --forget`` cleared the
+    ledger, but the running provider kept its own memory of what it sent, so the turns
+    the server dropped while private went again only after a restart. It notices the
+    cleared record at its next upload and sends them."""
+    from synapse_client.settings import Settings
+    from synapse_client.shipped import forget_everywhere
+
+    marker = tmp_path / "private" / chat.sid
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    server.private_rows.add(chat.sid)
+    chat.turn("USERTOKEN-2 said in private", "FINALTOKEN-2")
+    before = len(server.posts())
+    marker.unlink()
+    chat.turn("USERTOKEN-3 after the marker went", "FINALTOKEN-3")
+    dropped = set(range(before, len(server.posts())))
+    server.private_rows.discard(chat.sid)
+    forget_everywhere(Settings.load(), chat.sid)  # what `off --forget` does
+    chat.turn("USERTOKEN-4 back on the record", "FINALTOKEN-4")
+    episodes = stored(server, dropped)
+    for n in range(1, 5):
+        assert count(episodes, f"USERTOKEN-{n}") == 1, n
+
+
+def test_rows_written_after_one_hook_are_not_sent_again(chat, server):
+    """review-round4 fuzz ``written_later``: rows Hermes could not write at one hook go up
+    keyed by their text; written by the next flush they carry uids. After a cleared
+    record (``off --forget``) the same turn was sent again under its uids (two
+    episodes). The same turn read with ids counts as shipped (messages.content_key),
+    and ``forget`` keeps those text keys."""
+    from synapse_client.settings import Settings
+    from synapse_client.shipped import forget_everywhere
+
+    chat.turn("USERTOKEN-1", "FINALTOKEN-1")
+    rows = [
+        {"role": "user", "content": "USERTOKEN-2 written later", "timestamp": 1.0},
+        {"role": "assistant", "content": "FINALTOKEN-2 written later", "timestamp": 2.0},
+    ]
+    chat.sync([*chat.live, *rows])
+    for row in rows:
+        done = chat.store.add(chat.sid, row["role"], row["content"])
+        row["message_uid"], row["timestamp"] = done["message_uid"], done["timestamp"]
+    chat.live += rows
+    chat.turn("USERTOKEN-3", "FINALTOKEN-3")
+    forget_everywhere(Settings.load(), chat.sid)
+    chat.turn("USERTOKEN-4", "FINALTOKEN-4")
+    rebuilt = chat.agent()
+    chat.live += chat.store.turn(chat.sid, "USERTOKEN-5", "FINALTOKEN-5")
+    chat.sync(provider=rebuilt)
+    episodes = stored(server)
+    for token in ("USERTOKEN-2", "FINALTOKEN-2", "USERTOKEN-3", "USERTOKEN-4", "USERTOKEN-5"):
+        assert count(episodes, token) == 1, token
+
+
+def test_an_unanswered_message_then_a_marker_then_a_message(chat, server):
+    """review-round4 probe7 ``unanswered then marker then message``: live stored the marker
+    text and the unanswered message as the user's words; the import stores only the
+    answered message. Live now agrees, and no marker text is stored."""
+    chat.turn("USERTOKEN-first", "FINALTOKEN-first")
+    sid, s = chat.sid, chat.store
+    unanswered = s.add(sid, "user", "USERTOKEN-unanswered earlier message")
+    marker = s.add(sid, "user", MODEL, display_kind="model_switch")
+    message = s.add(sid, "user", "USERTOKEN-after switch")
+    reply = s.add(sid, "assistant", "FINALTOKEN-after switch")
+    merged = {
+        **unanswered,
+        "content": unanswered["content"] + "\n\n" + MODEL + "\n\n" + message["content"],
+    }
+    merged["_merged_turn_prefix"] = unanswered["content"] + "\n\n" + MODEL
+    merged["_absorbed_message_uids"] = [marker["message_uid"], message["message_uid"]]
+    chat.sync([*chat.live, merged, reply])
+    live = stored(server)
+    assert count(live, "USERTOKEN-after switch") == 1
+    assert count(live, "USERTOKEN-unanswered") == 0
+    assert all("active model" not in ep.content for ep in live)
+    posted = len(server.posts())
+    assert _import(chat.home) == 0
+    assert len(server.posts()) == posted
+
+
+def test_a_note_folded_with_a_marker_never_goes_on_the_wire(chat, server):
+    """review-round4 fuzz ``fold2``: a marker, a note, then the message, folded into one
+    list row. The note travelled inside a skipped synthetic row. The folded part is now
+    sent empty."""
+    chat.turn("USERTOKEN-first", "FINALTOKEN-first")
+    sid, s = chat.sid, chat.store
+    text = "[IMPORTANT: Background process exited.]\nNOTE-SECRET-OUTPUT"
+    marker = s.add(sid, "user", MODEL, display_kind="model_switch")
+    noted = s.add(sid, "user", text, display_kind="process_complete")
+    message = s.add(sid, "user", "USERTOKEN-after")
+    reply = s.add(sid, "assistant", "FINALTOKEN-after")
+    merged = {k: v for k, v in marker.items() if k != "display_kind"}
+    merged["content"] = MODEL + "\n\n" + text + "\n\n" + message["content"]
+    merged["_merged_turn_prefix"] = MODEL + "\n\n" + text
+    merged["_absorbed_message_uids"] = [noted["message_uid"], message["message_uid"]]
+    chat.sync([*chat.live, merged, reply])
+    wire = json.dumps([b["records"] for b in server.posts()])
+    assert "NOTE-SECRET-OUTPUT" not in wire and "active model" not in wire
+    assert count(stored(server), "USERTOKEN-after") == 1
+
+
+def test_the_store_read_uses_the_session_index():
+    """review-round4 kinds_time.py: the kinds read scanned the whole table (0.75 s for a
+    200-row list on a 1M-row store). It reads one session's rows by index."""
+    import sqlite3
+
+    from synapse_client.harnesses.hermes import store as st
+
+    from tests.helpers.hermes_store import DDL
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DDL.read_text("utf-8"))
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT message_uid, role, display_kind FROM messages "
+        "WHERE session_id=? ORDER BY id",
+        ("s",),
+    ).fetchall()
+    assert any("USING INDEX" in str(row[-1]) for row in plan)
+    assert st.kinds(conn, "s", ["a"]) == {}
+
+
+@pytest.mark.skipif(_owner() is None, reason="this machine's owner subject cannot be read")
+def test_an_unreadable_store_says_the_admission_check_did_not_run(plugin, server, tmp_path, caplog):
+    """review-round4 probe8: with a store this client cannot read, a gateway turn admitted
+    from someone else is uploaded on the turn_author check alone, as in the released
+    client (which has no admission check). The log says so plainly (DESIGN.md I10)."""
+    home = tmp_path / "hermes-a"
+    store = HermesStore(home, version=99)
+    sid = "local-" + "cd" * 32
+    keywords = _gateway_chat(store, home, sid)
+    provider = _new(plugin)
+    provider.initialize(sid, hermes_home=str(home), **keywords)
+    owner = keywords["user_id"]
+    store.admit(sid, "api-peer")
+    live = store.turn(sid, "USERTOKEN-x", "FINALTOKEN-x")
+    with caplog.at_level(logging.WARNING):
+        provider.sync_turn("q", "a", session_id=sid, messages=live, turn_author={"id": owner})
+    said = [
+        r.getMessage() for r in caplog.records if "admission check could not run" in r.getMessage()
+    ]
+    assert len(said) == 1 and "turn_author check alone" in said[0]

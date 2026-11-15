@@ -85,15 +85,57 @@ def test_a_scrub_that_cannot_run_answers_none(tmp_path):
     assert scrub.rows({"s": [{"role": "user", "content": "x"}]}, sys.executable) is None
 
 
-@pytest.mark.skipif(
-    not (os.environ.get("SYNAPSE_HERMES_PYTHON") and os.environ.get("SYNAPSE_HERMES_SOURCE")),
-    reason="needs a Hermes interpreter and checkout (SYNAPSE_HERMES_PYTHON, SYNAPSE_HERMES_SOURCE)",
-)
+def _evil(root: Path) -> Path:
+    """A directory whose own ``agent/memory_manager.py`` hands back the text as it is."""
+    pkg = root / "agent"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "memory_manager.py").write_text(
+        "def _redact_messages_for_egress(rows):\n    return list(rows)\n", encoding="utf-8"
+    )
+    return root
+
+
+def test_code_in_the_working_directory_or_pythonpath_is_never_the_scrub(tmp_path, monkeypatch):
+    """review-round4 s1_scrub.py: the child ran with the caller's working directory and
+    environment, so a directory's own ``agent/memory_manager.py`` (or one on PYTHONPATH)
+    was taken for Hermes's scrub and the key went on the wire. The child now runs
+    isolated in an empty directory with no PYTHONPATH, and an answer whose scrub file is
+    not under the interpreter's own install is refused."""
+    rows = {
+        "s": [{"role": "user", "content": "key sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]
+    }
+    evil = _evil(tmp_path / "evil")
+    monkeypatch.chdir(evil)
+    assert scrub.rows(rows, sys.executable) is None
+    monkeypatch.setenv("PYTHONPATH", str(evil))
+    assert scrub.rows(rows, sys.executable) is None
+
+
+def test_an_answer_from_outside_the_install_is_refused(tmp_path):
+    roots = [tmp_path / "venv"]
+    (tmp_path / "venv" / "lib").mkdir(parents=True)
+    inside = tmp_path / "venv" / "lib" / "agent.py"
+    inside.write_text("", encoding="utf-8")
+    assert scrub._within(inside, roots)
+    assert not scrub._within(tmp_path / "elsewhere" / "agent.py", roots)
+
+
+HERMES = [p for p in os.environ.get("SYNAPSE_HERMES_PYTHONS", "").split(os.pathsep) if p]
+
+
+@pytest.mark.skipif(not HERMES, reason="needs Hermes interpreters (SYNAPSE_HERMES_PYTHONS)")
+@pytest.mark.parametrize("python", HERMES)
 @pytest.mark.parametrize("name", VERSIONS)
-def test_the_import_has_hermes_scrub_the_stored_rows(monkeypatch, name):
+def test_the_import_has_hermes_scrub_the_stored_rows(tmp_path, monkeypatch, python, name):
+    """Against a real Hermes install (v0.23.1 and main were run): the scrub is found with
+    the child isolated, masks the secrets, and a PYTHONPATH or working directory holding
+    another ``agent`` package changes nothing."""
     data = json.loads((FIXTURES / name).read_text("utf-8"))
-    monkeypatch.setenv("PYTHONPATH", os.environ["SYNAPSE_HERMES_SOURCE"])
-    done = scrub.rows({"s": data["raw"]}, os.environ["SYNAPSE_HERMES_PYTHON"])
+    evil = _evil(tmp_path / "evil")
+    monkeypatch.chdir(evil)
+    monkeypatch.setenv("PYTHONPATH", str(evil))
+    done = scrub.rows({"s": data["raw"]}, python)
     assert done is not None
     wire = json.dumps(done)
     assert "SECRETTEST" in wire and not [s for s in _secrets(data) if s in wire]

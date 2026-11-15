@@ -293,7 +293,8 @@ again, and the provider does not send again what the import sent. Hermes's store
 your messages unscrubbed, so the import has Hermes mask secrets with its own code first;
 it finds Hermes from the `hermes` program on your PATH. If it cannot, nothing is sent
 and the command says so; `--no-hermes-scrub` sends the stored text anyway, and the
-server still redacts the credentials it recognises.
+server still redacts the credentials it recognises. The summary before you confirm, and
+the last line, say which of the two happened.
 
 Past Codex sessions go through a server-side backfill. On the server box, from the repo
 directory (`--dry-run` first shows the count; `--since-days N` bounds the spend):
