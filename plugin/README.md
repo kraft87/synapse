@@ -178,6 +178,7 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
   this plugin and every other harness already wired. The harnesses are updated by the
   client just installed, in a process of its own.
 - **`synapse status`** — one line per harness: wired, found and not wired, or not found.
+  For Hermes, also installed but not selected, with the provider Hermes runs instead.
 - **`synapse skill retire <name>`** — retire a skill everywhere (below).
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
@@ -287,9 +288,12 @@ and sets `memory.provider: synapse` in that home's `config.yaml`: through `herme
 set` when Hermes already has a config there, by writing a new two-line file when there is
 none. Hermes runs one external memory provider at a time, so a different one already
 selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
-either way. `synapse update` rebuilds the folder for a new client version, and `synapse
-status` says whether the provider is installed; `hermes memory status` says whether it is
-the active one (`synapse ← active`). Start a new `hermes` session to use it; a session
+either way. `synapse update` rebuilds the folder for a new client version. `synapse status`
+says `Hermes: wired` when the provider is installed and selected. When it is installed and
+another provider is selected, it names that provider and the command that switches; `synapse
+login`, `synapse install hermes` and `synapse update` say the same. With `--hermes-home`, the
+command it names carries that home. `hermes memory status` shows the active one
+(`synapse ← active`). Start a new `hermes` session to use it; a session
 already open stays without it. After `synapse update`, run `hermes gateway stop` first, so
 the gateway loads the new code (the next `hermes` starts it again).
 

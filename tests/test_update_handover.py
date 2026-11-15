@@ -126,6 +126,7 @@ def _update(tmp_path: Path, server: ThreadingHTTPServer, version: str, **client:
     (folder / "synapse_client" / "harnesses" / "hermes").mkdir(parents=True)
     (folder / "plugin.yaml").write_text("name: synapse\nversion: 0.0.1\n", encoding="utf-8")
     (folder / "synapse_client" / "harnesses" / "hermes" / "provider.py").write_text("")
+    (hermes / "config.yaml").write_text("memory:\n  provider: synapse\n", encoding="utf-8")
 
     empty = tmp_path / "no-programs"  # no claude, codex or hermes to find
     empty.mkdir()

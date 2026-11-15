@@ -329,6 +329,46 @@ def test_the_home_option_is_quoted_for_the_users_shell():
     )
 
 
+_SWITCH = (
+    "Hermes runs one external provider; run `synapse install hermes --replace` or "
+    "`hermes config set memory.provider synapse` to switch"
+)
+
+
+def test_status_says_whether_hermes_runs_the_provider(tmp_path):
+    """Installed is not enough: Hermes runs the one provider config.yaml selects. The
+    status, the install and the update say the same of another provider."""
+    home = tmp_path / "hermes"
+    hermes = _Hermes("honcho")
+    harness = _harness(home, hermes, "/bin/hermes")
+    assert harness.status() == "found, not wired"
+    assert _harness(home).status() == "not found"
+    config = _with_config(home, "model: x\nmemory:\n  provider: honcho\n")
+    report = harness.install("http://unused", hermes_home=home)
+    assert report.endswith(f"; left memory.provider at 'honcho', {_SWITCH}")
+    calls = len(hermes.calls)
+    assert harness.status() == f"installed, not selected: memory.provider is 'honcho', {_SWITCH}"
+    assert harness.update() == (
+        f"Hermes: memory provider already at {__version__}; "
+        f"not selected: memory.provider is 'honcho', {_SWITCH}"
+    )
+    assert len(hermes.calls) == calls  # config.yaml said it: the program was not started
+    # Without the program only Hermes's own command can switch.
+    assert _harness(home).status() == (
+        "installed, not selected: memory.provider is 'honcho'; "
+        "select it with `hermes config set memory.provider synapse`"
+    )
+    config.write_text("model: x\n", encoding="utf-8")
+    assert harness.status() == "installed, not selected; run `synapse install hermes`"
+    config.write_text("memory:\n  provider: 'synapse'\n", encoding="utf-8")
+    assert harness.status() == "wired"
+    assert harness.update() == f"Hermes: memory provider already at {__version__}"
+    # A layout the file read does not know: the program is asked.
+    config.write_text("memory: {provider: honcho}\n", encoding="utf-8")
+    assert harness.status().startswith("installed, not selected: memory.provider is 'honcho'")
+    assert len(hermes.calls) == calls + 1
+
+
 def test_dry_run_changes_nothing(tmp_path):
     home = tmp_path / "hermes"
     report = _harness(home).install("http://unused", dry_run=True, hermes_home=home)

@@ -745,9 +745,13 @@ def cmd_update(args) -> int:
 
 
 def cmd_status(_args) -> int:
-    """One line per harness: wired, found but not wired, or not found."""
+    """One line per harness: wired, found but not wired, or not found. A harness that
+    can be installed and still not run Synapse (Hermes runs one memory provider) says
+    so itself (``status()``)."""
     for target in harness.harnesses():
-        if target.wired():
+        if hasattr(target, "status"):
+            state = target.status()
+        elif target.wired():
             state = "wired"
         elif target.detect():
             state = "found, not wired"

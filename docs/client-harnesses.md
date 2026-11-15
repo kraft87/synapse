@@ -317,8 +317,12 @@ synapse install hermes [--hermes-home PATH] [--replace] [--dry-run]
 
 `synapse login` does the same when it finds Hermes (a `hermes` program on PATH, or a
 Hermes home on disk), and `synapse update` rebuilds the folder when it was built by
-another client version. `synapse status` (new in 0.24.0) prints a line per harness:
-wired, found and not wired, or not found. The Hermes home is
+another client version. `synapse status` prints a line per harness: wired, found and not
+wired, or not found. For Hermes, wired means installed and selected: when the folder is
+there and `memory.provider` names another provider, or none, the line says `installed, not
+selected`, names the provider, and gives the command that switches (`HermesHarness.status`).
+It reads `config.yaml` and starts the program only when the file does not say. `synapse
+update` adds the same words to its line. The Hermes home is
 `--hermes-home`, else `$HERMES_HOME`, else Hermes's default (`~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows). Selecting the
 provider:
 
