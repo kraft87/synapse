@@ -7,10 +7,13 @@ Synapse and which ones; ``plugin/scripts/import_hermes.py`` asks and sends.
 
 What it reads
 -------------
-The store is opened read-only (``mode=ro``) and read in one transaction, so a running
-Hermes (WAL mode) is neither blocked nor seen half-way. Nothing under the Hermes home is
-written. A ``schema_version`` other than SCHEMA_VERSIONS, or a table or column this
-module reads that is not there, raises SchemaError before anything is read.
+The store is read through store.py, the provider's own reader: read-only (``mode=ro``)
+and in one transaction, so a running Hermes is neither blocked for long nor seen
+half-way. A ``schema_version`` other than SCHEMA_VERSIONS, or a table or column this
+module reads that is not there, raises SchemaError before anything is read. The only
+thing written under the Hermes home is the ledger the provider keeps of what was
+shipped (``<hermes_home>/synapse/shipped``, shipped.py), by the caller, once a body is
+delivered (``record``).
 
 - ``sessions``: one row per session. ``source`` (the surface, "local" for the gateway's
   local chats, or "subagent", "api_server", "tool", "cron", a platform), ``user_id``,
@@ -60,7 +63,9 @@ uid is read once. A branch or compressed continuation clones its parent's rows i
 new session with their uids: a turn whose opening row is one of the sessions it holds
 turns of (``lineage.chain``) is a copy and is not imported under the new id, nor sent as
 the context of a later turn. Only complete turns are imported, each with the complete
-turn before it as context, in the live path's batches.
+turn before it as context, in the live path's batches. Rows the provider's ledger holds
+as shipped are not imported again: of a turn shipped in part, the rest goes, as the
+live path sends it.
 """
 
 from __future__ import annotations

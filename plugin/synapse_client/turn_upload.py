@@ -75,9 +75,9 @@ class TurnUploader:
     """Finished turns, uploaded once each in the ``messages`` format.
 
     ``client`` and ``source`` go in every body: the harness's name, and which of its
-    hooks sends. Turns are remembered by ``messages.turn_key``, per session id and in
-    memory only: the server dedups on span id, so a restart that re-sends a turn costs a
-    request, not a duplicate. With a look-back, a session's first upload considers only
+    hooks sends. Turns are remembered by ``messages.turn_key`` and their rows' ids, per
+    session id, in memory and, with a ``ledger``, on disk; without one, a restart that
+    re-sends a turn costs a request, not a duplicate (the server dedups on span id). With a look-back, a session's first upload considers only
     its last so many complete turns and counts the ones before as sent: a resumed
     conversation's older turns were sent, or not, before this process. ``lookback`` is
     the look-back of a session first met at an upload; ``start`` gives
@@ -252,8 +252,8 @@ class TurnUploader:
                 windowed = older
                 state.lookback = None
             selected: list[_Pair] = []
-            done = state.shipped | state.copied
-            for before, turn in messages.pending(all_turns, state.sent, shipped=done):
+            gone = state.shipped | state.copied  # rows not to send again under this id
+            for before, turn in messages.pending(all_turns, state.sent, shipped=gone):
                 if opening(turn) in state.copies or opening(turn) == held:
                     continue
                 if before is not None and (
