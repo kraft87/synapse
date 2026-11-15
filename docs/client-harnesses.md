@@ -530,7 +530,12 @@ The core ports the hooks' behaviour and wording, with these differences:
   `GET /context?parts=board,preferences`) and both are rendered by the server. A piece
   switched off is not asked for. A server from before the `parts` parameter answers
   with the board alone; its preferences are then read from `/preferences/top` and
-  rendered by the client, in what is left of the same timeout.
+  rendered by the client, in what is left of the same timeout. The request names the
+  session as `session=<id>` (`server_parts(session_id=...)`: Claude Code and Codex from
+  the hook payload's `session_id`, Hermes from the id `initialize` gets, the id each
+  uploads the session's turns under), so the server can record which lines it served
+  to it (schema 071). A session whose private-mode marker is set, or cannot be read,
+  is not named. A server from before 0.24.21 ignores the parameter.
 - **Enrollment notices** take the login hint as an argument, and the restricted-device
   notice an optional aside after "here"; Claude Code passes its "paste it into /plugin"
   one, the other harnesses none.

@@ -75,6 +75,7 @@ _DB_FILES = {
     "test_remember_notes.py",
     "test_remember_routes.py",
     "test_board.py",
+    "test_board_serves_db.py",
     "test_dashboard_routes.py",
     "test_telemetry_kinds.py",
     "test_import_notes.py",

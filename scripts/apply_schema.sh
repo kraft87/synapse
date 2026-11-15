@@ -173,6 +173,7 @@ FILES=(
   068_span_id_prefix_is_platform.sql
   069_one_memory_cleanup.sql
   070_note_history.sql
+  071_board_serves.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

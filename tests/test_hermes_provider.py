@@ -445,7 +445,10 @@ def test_the_session_start_block_and_the_nudge(plugin, server, tmp_path, hermes_
     )
     # One request for the board and the preferences, on one thread.
     (ctx_request,) = [r for r in server.seen if r["method"] == "GET"]
-    assert ctx_request["path"] == "/context?project=my-project&parts=board%2Cpreferences"
+    # With the session's id, so the server records what this session was served.
+    assert ctx_request["path"] == (
+        f"/context?project=my-project&parts=board%2Cpreferences&session={_SID}"
+    )
     headers = {k.lower(): v for k, v in ctx_request["headers"].items()}
     assert headers["user-agent"] == f"synapse-client/{__version__} hermes"
     assert headers["authorization"] == f"Bearer {_TOKEN}"

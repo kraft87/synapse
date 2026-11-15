@@ -73,32 +73,42 @@ def _emit_context(text: str, user_notice: str = "") -> None:
     print(json.dumps(out))
 
 
-def _project_label() -> str | None:
+def _payload() -> dict:
+    """The hook's stdin payload ({session_id, cwd, source, ...}); {} when unreadable."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _project_label(payload: dict) -> str | None:
     """Project label for the hook payload's cwd; falls back to the process cwd. The same
     resolver labels the episodes the ingest hook sends, so the board's project section
     reads exactly the project its sessions are filed under."""
-    try:
-        cwd = json.loads(sys.stdin.read() or "{}").get("cwd")
-    except Exception:
-        cwd = None
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) else None
     return synapse_project.project_label(cwd) or synapse_project.project_label(os.getcwd())
 
 
-def _served(settings) -> tuple[str, str]:
+def _served(settings, payload: dict) -> tuple[str, str]:
     """The server-rendered board and preferences block. The board comes with the
     enrollment explainer when one applies: a 401 to a machine with no device credential,
     or a 200 that serves it as ``restricted`` (the silent version of the same thing).
-    "" for both when the server is down."""
-    # The project matters to the board alone, so a disabled board does not read the
-    # payload (or ask git where the folder's repository starts).
+    "" for both when the server is down. The payload's ``session_id`` goes with the
+    request, so the server records what this session was served."""
+    # The project matters to the board alone, so a disabled board does not ask git
+    # where the folder's repository starts.
     board_on = settings.flag("SYNAPSE_BOARD", "1") != "0"
+    session_id = payload.get("session_id")
     return context.server_parts(
         Client(settings, config.USER_AGENT),
-        _project_label() if board_on else None,
+        _project_label(payload) if board_on else None,
         settings,
         timeout=10,
         not_enrolled=enroll.not_enrolled_block(),
         restricted=enroll.restricted_block(),
+        session_id=session_id if isinstance(session_id, str) else None,
     )
 
 
@@ -109,7 +119,7 @@ def main() -> None:
         notice = ""
     board = prefs = ""
     try:
-        board, prefs = _served(config.live_settings())
+        board, prefs = _served(config.live_settings(), _payload())
     except Exception:
         pass  # fail-open: no board, no noise
     try:

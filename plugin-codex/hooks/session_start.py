@@ -77,12 +77,18 @@ def _left() -> float:
     return _STARTED + _DEADLINE_S - time.monotonic()
 
 
-def _served(project: str | None) -> tuple[str, str]:
+def _served(project: str | None, session_id: str | None = None) -> tuple[str, str]:
     # The board and the preferences block, from one request. No `surface` param since
     # schema 054: the bearer identifies the caller. Each is "" when it is switched off
     # (SYNAPSE_BOARD=0, SYNAPSE_PREFS_BLOCK=0) or anything fails (context.server_parts).
+    # The session id lets the server record what this session was served (schema 071).
     return context.server_parts(
-        client(), project, live_settings(), timeout=_FETCH_TIMEOUT, login_hint=_LOGIN_HINT
+        client(),
+        project,
+        live_settings(),
+        timeout=_FETCH_TIMEOUT,
+        login_hint=_LOGIN_HINT,
+        session_id=session_id,
     )
 
 
@@ -139,7 +145,9 @@ def _sync_skills(cwd: str | None = None) -> None:
         pass
 
 
-def _fetch(project: str | None) -> tuple[threading.Thread, list[tuple[str, str]]]:
+def _fetch(
+    project: str | None, session_id: str | None = None
+) -> tuple[threading.Thread, list[tuple[str, str]]]:
     """Start the request for the board and the preferences; the pair lands in the
     returned list when it is back. A daemon thread: the hook prints and exits at its
     deadline without waiting for a request that is still out."""
@@ -147,7 +155,7 @@ def _fetch(project: str | None) -> tuple[threading.Thread, list[tuple[str, str]]
 
     def run() -> None:
         try:
-            ready.append(_served(project))
+            ready.append(_served(project, session_id))
         except Exception:
             pass
 
@@ -168,7 +176,8 @@ def main() -> None:
     project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
         os.getcwd()
     )
-    thread, ready = _fetch(project)
+    session_id = payload.get("session_id")
+    thread, ready = _fetch(project, session_id if isinstance(session_id, str) else None)
     _sync_skills(str(payload.get("cwd") or os.getcwd()))
     thread.join(max(0.0, _left()))
     # What arrived by the deadline; a late reply is dropped.

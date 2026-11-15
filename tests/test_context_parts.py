@@ -17,7 +17,7 @@ from fastmcp import FastMCP
 from starlette.testclient import TestClient
 
 from ingestion.surfaces import FULL_TRUST, UNKNOWN_SURFACE
-from mcp_server import board
+from mcp_server import board, board_serves
 
 _TOKEN = "test-parts-token"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
@@ -50,20 +50,33 @@ class _Built:
         self.prefs: list[Any] = []
         self.board_error: Exception | None = None
         self.prefs_error: Exception | None = None
+        self.served: list[board_serves.Serve] = []
         monkeypatch.setattr(board, "build_board", self._board)
-        monkeypatch.setattr(board, "top_block", self._prefs)
+        monkeypatch.setattr(board, "top_served", self._prefs)
+        monkeypatch.setattr(board_serves, "record", self._record)
 
     def _board(self, db_url, project, surface, trust, notice) -> dict[str, Any]:
         self.boards.append((project, trust))
         if self.board_error is not None:
             raise self.board_error
-        return {"status": "ok", "trust": trust.trust, "text": _BOARD, "note_ids": [1, 2]}
+        # The three id lists are the server's own (popped before the reply).
+        return {
+            "status": "ok",
+            "trust": trust.trust,
+            "text": _BOARD,
+            "note_ids": [2, 1],
+            "shown_note_ids": [1, 2],
+            "event_ids": [9, 8],
+        }
 
-    def _prefs(self, db_url, trust) -> str:
+    def _prefs(self, db_url, trust) -> tuple[str, list[int]]:
         self.prefs.append(trust)
         if self.prefs_error is not None:
             raise self.prefs_error
-        return _PREFS
+        return _PREFS, [5]
+
+    def _record(self, db_url, serve) -> None:
+        self.served.append(serve)
 
 
 @pytest.fixture()
@@ -133,3 +146,65 @@ def test_no_part_is_served_without_the_token(built):
     with _client() as client:
         assert client.get("/context?parts=preferences").status_code == 401
     assert built.boards == [] and built.prefs == []
+    assert built.served == []
+
+
+# ---------------------------------------------------------------------------
+# What each reply showed is recorded (schema 071, mcp_server/board_serves.py)
+# ---------------------------------------------------------------------------
+
+
+def test_a_reply_is_recorded_with_its_ids_in_shown_order(built):
+    url = "/context?project=alpha&parts=board,preferences&session=sess-1"
+    headers = {**_AUTH, "User-Agent": "synapse-client/0.24.21 claude-code"}
+    with _client(lambda _request: FULL_TRUST) as client:
+        body = client.get(url, headers=headers).json()
+    # The reply is what it was: no id list reaches the client.
+    assert body == {"status": "ok", "trust": "full", "text": _BOARD, "preferences": _PREFS}
+    (serve,) = built.served
+    assert (serve.session_id, serve.project, serve.trust) == ("sess-1", "alpha", FULL_TRUST)
+    assert serve.parts == ["board", "preferences"]
+    assert (serve.note_ids, serve.event_ids, serve.pref_ids) == ([1, 2], [9, 8], [5])
+    assert (serve.board_text, serve.prefs_text, serve.notes_dropped) == (_BOARD, _PREFS, 0)
+    assert serve.client == "synapse-client/0.24.21 claude-code"
+    assert serve.ms_build is not None and serve.ms_build >= 0
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["", "&session=", "&session=" + "x" * 201, "&session=a%0Ab"],
+    ids=["absent", "empty", "too-long", "control-char"],
+)
+def test_a_serve_without_a_usable_session_id_is_recorded_without_one(built, query):
+    with _client() as client:
+        assert client.get(f"/context?project=alpha{query}", headers=_AUTH).status_code == 200
+    (serve,) = built.served
+    assert serve.session_id is None and serve.parts == ["board"]
+
+
+def test_the_preferences_alone_are_recorded_with_no_board(built):
+    with _client() as client:
+        client.get("/context?parts=preferences&session=s", headers=_AUTH)
+    (serve,) = built.served
+    assert serve.parts == ["preferences"] and serve.board_text is None
+    assert serve.note_ids == [] and serve.event_ids == [] and serve.pref_ids == [5]
+
+
+def test_preferences_that_cannot_be_built_are_recorded_as_empty(built):
+    built.prefs_error = RuntimeError("no such table")
+    with _client() as client:
+        client.get("/context?parts=board,preferences", headers=_AUTH)
+    (serve,) = built.served
+    assert (serve.prefs_text, serve.pref_ids) == ("", [])
+
+
+@pytest.mark.parametrize(
+    ("query", "error"),
+    [("?parts=later", None), ("?parts=board", RuntimeError("no such table"))],
+    ids=["nothing-built", "board-failed"],
+)
+def test_no_reply_that_served_nothing_is_recorded(built, query, error):
+    built.board_error = error
+    with _client() as client:
+        client.get(f"/context{query}", headers=_AUTH)
+    assert built.served == []

@@ -183,6 +183,20 @@ def test_schema_070_does_not_block_boot():
     assert is_optional_migration(path)
 
 
+def test_schema_071_does_not_block_boot():
+    """The /context route records nothing until board_serves exists (a cached probe),
+    so the boot guard must start this build on a database still at 070."""
+    from ingestion.schema_check import is_optional_migration
+
+    path = Path(__file__).resolve().parent.parent / "schema" / "071_board_serves.sql"
+    assert is_optional_migration(path)
+
+
+def test_board_serves_exists(conn):
+    row = conn.execute("SELECT to_regclass('public.board_serves')").fetchone()
+    assert row[0] is not None, "board_serves should be created by schema/071"
+
+
 # ---------------------------------------------------------------------------
 # search_cache
 # ---------------------------------------------------------------------------

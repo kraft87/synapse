@@ -65,10 +65,12 @@ class _FakeClient:
     def __init__(self, board: Any = None, prefs: Any = None) -> None:
         self.board, self.prefs = board, prefs
         self.calls: list[tuple[Any, ...]] = []
+        self.sessions: list[str | None] = []
         self.timeouts: list[float] = []
 
-    def context(self, project=None, timeout=10, *, parts=()):
+    def context(self, project=None, timeout=10, *, parts=(), **more):
         self.calls.append(("context", project, tuple(parts)))
+        self.sessions.append(more.get("session"))
         if isinstance(self.board, BaseException):
             raise self.board
         return self.board
@@ -272,7 +274,7 @@ def test_the_board_part_matches_the_hook(scratch, monkeypatch, capsys, tmp_path,
 
     hook = load_script("board_block")
     seen = fake_urlopen(monkeypatch, answer)
-    monkeypatch.setattr(hook, "_project_label", lambda: "proj")
+    monkeypatch.setattr(hook, "_project_label", lambda payload: "proj")
     hook.main()
     assert [requested(req) for req in seen] == [("/context", {"project": "proj", "parts": "board"})]
     # The hook prints the parts joined by blank lines (no credential notice applies here).
@@ -305,6 +307,23 @@ def test_the_board_and_the_preferences_are_one_request(tmp_path):
     client = _FakeClient(board=_reply(preferences=_PREFS_TEXT))
     assert context.server_parts(client, "p", _settings(tmp_path)) == ("BOARD", _PREFS_TEXT)
     assert client.calls == [("context", "p", _BOTH)]
+
+
+def test_the_session_id_goes_with_the_request_unless_the_session_is_private(tmp_path):
+    """The server records which lines it served to the session it is named (schema
+    071). A session in private mode is not named; its blocks are served all the same."""
+    from synapse_client import private
+
+    settings = _settings(tmp_path)
+    client = _FakeClient(board=_reply(preferences=_PREFS_TEXT))
+    for sid in ("s-open", None, ""):
+        assert context.server_parts(client, "p", settings, session_id=sid)[0] == "BOARD"
+    private.mark(settings, "s-private")
+    assert context.server_parts(client, "p", settings, session_id="s-private") == (
+        "BOARD",
+        _PREFS_TEXT,
+    )
+    assert client.sessions == ["s-open", None, None, None]
 
 
 def test_the_servers_block_is_shown_as_it_came(tmp_path):

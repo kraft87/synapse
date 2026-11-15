@@ -53,8 +53,10 @@ _MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
 
 @dataclass(frozen=True, slots=True)
 class _PreferenceRow:
-    """One standing preference, as the route serves it."""
+    """One standing preference, as the route serves it, and its id (kept off the
+    route's reply: ``_top_preferences``)."""
 
+    id: int
     pref: str
     polarity: str
     assert_count: int
@@ -62,6 +64,14 @@ class _PreferenceRow:
 
 
 def _top_preferences(
+    db_url: str, limit: int, allowed_projects: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """``_top_rows`` without the ids: what ``/preferences/top`` serves."""
+    rows = _top_rows(db_url, limit, allowed_projects)
+    return [{k: v for k, v in row.items() if k != "id"} for row in rows]
+
+
+def _top_rows(
     db_url: str, limit: int, allowed_projects: list[str] | None = None
 ) -> list[dict[str, Any]]:
     """Live preferences for the session-start block, strongest first. Degrades to []
@@ -75,7 +85,7 @@ def _top_preferences(
     recording where it came from, so that ref cannot prove which device the text is
     from."""
     sql = (
-        "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "
+        "SELECT id, pref, polarity, assert_count, left(first_seen::text, 10) AS since "
         "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL"
     )
     params: list[Any] = [_OWNER]
@@ -92,6 +102,12 @@ def _top_preferences(
             return []
 
 
+def _shown(items: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The items ``render_block`` gives a line: of the first ``BLOCK_LINES``, those with
+    a ``pref``."""
+    return [item for item in list(items)[:BLOCK_LINES] if item.get("pref")]
+
+
 def render_block(items: Iterable[Mapping[str, Any]]) -> str:
     """The session-start block for ``items`` (``_top_preferences`` rows): the header and
     one ``  - (<likes|dislikes|rule>) <pref>`` line each, at most ``BLOCK_LINES``; ""
@@ -99,20 +115,23 @@ def render_block(items: Iterable[Mapping[str, Any]]) -> str:
     from ``/preferences/top`` (synapse_client.context.preferences_block), line for
     line."""
     lines = [_HEADER]
-    for item in list(items)[:BLOCK_LINES]:
-        pref = item.get("pref")
-        if not pref:
-            continue
+    for item in _shown(items):
         polarity = item.get("polarity")
-        lines.append(f"  - ({_MARK.get(polarity, polarity or '')}) {pref}")
+        lines.append(f"  - ({_MARK.get(polarity, polarity or '')}) {item['pref']}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def top_served(db_url: str, trust: SurfaceTrust) -> tuple[str, list[int]]:
+    """``render_block`` for the top preferences a caller with ``trust`` is served (the
+    same scoping as ``/preferences/top``: ``_top_rows``), and the ids of the rows it
+    shows, in its order. Raises what the query raises."""
+    rows = _top_rows(db_url, BLOCK_LINES, trust.project_filter)
+    return render_block(rows), [int(row["id"]) for row in _shown(rows)]
+
+
 def top_block(db_url: str, trust: SurfaceTrust) -> str:
-    """``render_block`` for the top preferences a caller with ``trust`` is served: the
-    same scoping as ``/preferences/top`` (``_top_preferences``). Raises what the query
-    raises."""
-    return render_block(_top_preferences(db_url, BLOCK_LINES, trust.project_filter))
+    """``top_served``'s text alone."""
+    return top_served(db_url, trust)[0]
 
 
 def register(

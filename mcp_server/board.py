@@ -35,6 +35,7 @@ from typing import Any
 
 import psycopg
 from psycopg.rows import class_row
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -51,9 +52,10 @@ from ingestion.surfaces import (
     own_surface_if_ready,
     own_surface_served,
 )
+from mcp_server import board_serves
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
-from mcp_server.preferences_routes import top_block
+from mcp_server.preferences_routes import top_served
 from mcp_server.recall_query import owner_query_hint
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
@@ -399,9 +401,12 @@ def build_board(
 ) -> dict[str, Any]:
     """Build the rendered board block. Pure SQL, no embedding calls.
 
-    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids", "trust"}`` —
-    ``note_ids`` is the telemetry envelope's serve list; serve paths pop it before
-    returning the block to callers (the ids the caller needs are inline as ``n:ID``).
+    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids",
+    "shown_note_ids", "event_ids", "trust"}``. The three id lists are for the serve
+    record and telemetry, and serve paths pop them before returning the block to callers
+    (the ids the caller needs are inline as ``n:ID`` and ``t:ID``): ``note_ids`` the
+    kept notes in list order (recall_metrics), ``shown_note_ids`` the same in the order
+    the text shows them, ``event_ids`` the "Last 7 days" lines' ids, top first.
 
     ``notice`` is a serve-nothing explanation (recall_warnings.serving_notice) that the
     route computed for an authenticated caller. It renders as a ``WARNING:`` line right
@@ -469,6 +474,8 @@ def build_board(
         "n_notes": len(kept),
         "overflow": dropped,
         "note_ids": [n["id"] for n in kept],
+        "shown_note_ids": board_serves.note_ids_in_board_order(kept, _TYPE_ORDER),
+        "event_ids": [int(e["id"]) for e in events if e.get("id") is not None],
         # Told to the caller so an unexpectedly thin board is diagnosable as "this host
         # isn't registered" instead of "memory is empty". It reveals nothing filtered.
         "trust": st.trust,
@@ -505,6 +512,9 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
         logger.debug("board metrics record failed: %s", e)
 
 
+#: Keys of build_board's result that are for the server only, never the reply.
+_SERVER_ONLY = ("note_ids", "shown_note_ids", "event_ids")
+
 #: What a /context reply can hold: ``text`` (the board) and ``preferences``.
 PARTS = frozenset({"board", "preferences"})
 
@@ -518,14 +528,14 @@ def wanted_parts(raw: str | None) -> frozenset[str]:
     return PARTS & {name.strip() for name in raw.split(",")}
 
 
-def _preferences(db_url: str, trust: SurfaceTrust) -> str:
-    """The reply's preferences block; "" when it cannot be built. The lesser piece
-    never costs the caller its board."""
+def _preferences(db_url: str, trust: SurfaceTrust) -> tuple[str, list[int]]:
+    """The reply's preferences block and the ids of its lines; ("", []) when it cannot
+    be built. The lesser piece never costs the caller its board."""
     try:
-        return top_block(db_url, trust)
+        return top_served(db_url, trust)
     except Exception as e:
         logger.warning("preferences block failed: %s", e)
-        return ""
+        return "", []
 
 
 def register(
@@ -549,6 +559,10 @@ def register(
     checked (http_auth.authenticated). Only then, and only with a resolved verdict, does
     a serve-nothing verdict put its explanation at the top of the board. None (an open
     server, or a caller that does not wire it) keeps the board silent, as before.
+
+    Each reply that built a part is recorded in ``board_serves`` (schema 071) after it
+    is sent: the ids it showed, in order, and the session id the client names in
+    ``?session=`` (mcp_server/board_serves.py). The reply itself is unchanged by it.
     """
     if not db_url:
         logger.info("board routes disabled (no DB_URL)")
@@ -567,6 +581,12 @@ def register(
         note_ignored_surface(request.query_params.get("surface"), "http.context")
         trust = resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE
         reply: dict[str, Any] = {"status": "ok", "trust": trust.trust}
+        serve = board_serves.Serve(
+            trust=trust,
+            project=project,
+            session_id=board_serves.session_param(request.query_params.get("session")),
+            client=request.headers.get("user-agent"),
+        )
         if "board" in want:
             # Explain only a verdict that was actually resolved for an authenticated caller.
             told = (
@@ -582,10 +602,22 @@ def register(
             except Exception as e:
                 logger.warning("board build failed: %s", e)
                 return err(str(e)[:200], 500)
+            ms = (time.perf_counter() - t0) * 1000.0
             if get_recall is not None:
-                ms = (time.perf_counter() - t0) * 1000.0
                 record_board_metrics(get_recall(), "http", ms, reply)
-            reply.pop("note_ids", None)
+            serve.parts.append("board")
+            serve.board_text = str(reply.get("text") or "")
+            serve.note_ids = list(reply.get("shown_note_ids") or [])
+            serve.event_ids = list(reply.get("event_ids") or [])
+            serve.notes_dropped = int(reply.get("overflow") or 0)
+            serve.ms_build = ms
+            for key in _SERVER_ONLY:
+                reply.pop(key, None)
         if "preferences" in want:
-            reply["preferences"] = await run_in_threadpool(_preferences, db_url, trust)
-        return JSONResponse(reply)
+            text, pref_ids = await run_in_threadpool(_preferences, db_url, trust)
+            reply["preferences"] = text
+            serve.parts.append("preferences")
+            serve.prefs_text, serve.pref_ids = text, pref_ids
+        # Written after the reply is sent, so the record never delays a session start.
+        task = BackgroundTask(board_serves.record, db_url, serve) if serve.parts else None
+        return JSONResponse(reply, background=task)
