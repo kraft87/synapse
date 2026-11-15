@@ -134,9 +134,9 @@ def _default_log(name: str) -> str:
     which has no /tmp (a path starting with / there names a folder that is not there)."""
     if os.name != "nt":
         return "/tmp/" + name
-    import tempfile
-
-    return os.path.join(tempfile.gettempdir(), name)
+    # The environment, not tempfile: a hook the user waits for imports as little as it can.
+    folder = os.environ.get("TEMP") or os.environ.get("TMP") or os.path.expanduser("~")
+    return os.path.join(folder, name)
 
 
 LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", _default_log("synapse-ingest-hook.log"))
