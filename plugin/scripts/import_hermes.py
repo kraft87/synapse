@@ -41,7 +41,7 @@ from collections import Counter
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from synapse_client import __version__, private
+from synapse_client import __version__, private, shipped
 from synapse_client.api import Client
 from synapse_client.harnesses.hermes import history, scrub
 from synapse_client.harnesses.hermes.install import default_home
@@ -133,8 +133,8 @@ def _short(session_id: str) -> str:
 
 
 def ledger_of(settings: Settings) -> Ledger:
-    """The ledger the live provider keeps (under the Synapse home)."""
-    return Ledger(os.path.join(str(settings.home), "shipped", "hermes"))
+    """The ledger the live provider keeps for the configured server (shipped.for_server)."""
+    return shipped.for_server(settings, "hermes")
 
 
 def scrubbed(chosen, home: str, python: str | None):
@@ -257,6 +257,16 @@ def main(argv: list[str] | None = None) -> int:
         for reason, n in skipped.most_common():
             print(f"    {n:>4}  {reason}")
     print(f"  target           {settings.ingest_url} (auth token: {token})")
+    plans = None
+    if chosen and not args.dry_run:
+        python = scrub.interpreter()
+        plans = scrubbed(chosen, home, python)
+        if plans is not None:
+            print(f"  secrets          masked by Hermes's own scrub ({python})")
+        elif args.no_hermes_scrub:
+            print("  secrets          NOT masked: Hermes's scrub could not be run, and")
+            print("                   --no-hermes-scrub sends the stored text as it is")
+            print("                   (the server still redacts credentials it recognises)")
     print()
     if args.dry_run:
         for s, reason in verdicts:
@@ -266,6 +276,15 @@ def main(argv: list[str] | None = None) -> int:
     if not chosen:
         print("Nothing to import.")
         return 0
+    if plans is None and not args.no_hermes_scrub:
+        print(
+            f"{PROGRAM}: Hermes's secret scrub could not be run (the hermes program, or "
+            "its agent package, was not found, or the scrub did not come from Hermes's "
+            "own install). Nothing was sent. Re-run with --no-hermes-scrub to send the "
+            "stored text; the server still redacts credentials it recognises.",
+            file=sys.stderr,
+        )
+        return 1
     print("Importing runs KG extraction on the server's configured LLM for every NEW")
     print("turn. That consumes subscription usage or API credits, roughly in proportion")
     print("to the turn count above. Turns already in Synapse (uploaded by the provider or")
@@ -283,16 +302,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        plans = scrubbed(chosen, home, scrub.interpreter())
-        if plans is None and not args.no_hermes_scrub:
-            print(
-                f"{PROGRAM}: Hermes's secret scrub could not be run (the hermes program, or "
-                "its agent package, was not found). Nothing was sent. Re-run with "
-                "--no-hermes-scrub to send the stored text; the server still redacts "
-                "credentials it recognises.",
-                file=sys.stderr,
-            )
-            return 1
         return _ship(client, chosen, ledger, plans)
     except KeyboardInterrupt:
         print("\nInterrupted. Turns already sent are kept (dedup by span_id): re-run to resume.")
@@ -318,6 +327,10 @@ def _ship(client: Client, chosen, ledger: Ledger | None = None, plans=None) -> i
         print(f"{label} -> ingested {n}", flush=True)
     print()
     print(f"Done: {ingested_total} new turn(s) ingested from {ok}/{len(chosen)} session(s).")
+    if plans is None:
+        print("The text was sent as Hermes stored it: secrets were NOT masked by Hermes.")
+    else:
+        print("Secrets were masked by Hermes's own scrub before anything was sent.")
     if refused:
         print(f"{refused} session(s) went private during the import and were not sent.")
     if failed:
