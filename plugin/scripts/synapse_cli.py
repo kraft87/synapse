@@ -28,7 +28,8 @@ That second half is run by the client just installed, as `synapse update --rewir
 process of its own: this one still holds the code of the client it replaced. A client
 whose CLI has no such step (one from before it) is asked for a whole `synapse update`
 instead.
-`synapse status` says, per harness, whether it is here and whether Synapse is wired in.
+`synapse status` says, per harness, whether it is here and whether Synapse is wired in,
+and on Windows whether Claude Code's hooks will find a Python to run on.
 
 The same code runs from the managed client (~/.synapse/bin/synapse, put there by
 `curl <server>/install | python3 -`) and from the Claude plugin's bin/ inside sessions.
@@ -42,6 +43,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -431,7 +433,65 @@ def _wire(
         except (RuntimeError, ValueError, OSError) as e:
             print(f"{target.label}: not wired: {e}")
             failed = True
+            continue
+        if target.name == "claude" and not dry_run and (note := _hook_python_note()):
+            print(note)
     return 1 if failed else 0
+
+
+# ------------------------------------------------------------- Windows hook Python
+
+#: The launcher every Claude Code hook runs on Windows (bin/synapse-python).
+_LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "synapse-python"
+
+
+def _git_bash(env=os.environ, which=shutil.which) -> str:
+    """The Git Bash that Claude Code runs a plugin's hooks with on Windows: the one
+    CLAUDE_CODE_GIT_BASH_PATH names, else the bash.exe of the Git for Windows that `git`
+    on PATH belongs to. "" when there is none."""
+    named = env.get("CLAUDE_CODE_GIT_BASH_PATH", "")
+    if named and os.path.isfile(named):
+        return named
+    git = which("git")
+    if not git:
+        return ""
+    # <Git>\cmd\git.exe, <Git>\bin\git.exe or <Git>\mingw64\bin\git.exe
+    root = Path(git).resolve().parent
+    for base in (root.parent, root.parent.parent):
+        bash = base / "bin" / "bash.exe"
+        if bash.is_file():
+            return str(bash)
+    return ""
+
+
+def _hook_python_note(windows: bool = os.name == "nt", bash=_git_bash, run=subprocess.run) -> str:
+    """On Windows, one line when the Claude Code hooks will not find a Python to run on,
+    found the way the hooks find it (bin/synapse-python under Git Bash); "" when they
+    will, or off Windows."""
+    if not windows:
+        return ""
+    shell = bash()
+    if not shell:
+        return (
+            "Claude Code hooks: Git for Windows not found. Claude Code runs plugin hooks with "
+            "its Git Bash, so without it the Synapse hooks do not run. Install Git for "
+            "Windows, then start a new Claude Code session."
+        )
+    try:
+        done = run(
+            [shell, str(_LAUNCHER), "--check"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if done.returncode == 0:
+        return ""
+    reason = done.stderr.strip().removeprefix("Synapse: ") or "no Python 3.11 or newer found."
+    return f"Claude Code hooks: {reason}"
 
 
 # -------------------------------------------------------------------------- config
@@ -694,6 +754,8 @@ def cmd_status(_args) -> int:
         else:
             state = "not found"
         print(f"{target.label}: {state}")
+        if target.name == "claude" and state != "not found" and (note := _hook_python_note()):
+            print(note)
     return 0
 
 

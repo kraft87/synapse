@@ -9,13 +9,25 @@ install per machine you code on; it wires Claude Code, Codex and Hermes).
 **You need:**
 
 - On the server box: Docker with the Compose v2 plugin (`docker compose version` must work)
-  and git. About 3 minutes for the first build.
-- On each machine you code on: Python 3.11 or newer as `python3` (check with
-  `python3 --version`) and curl (PowerShell on Windows).
+  and git. The first build takes about 3 minutes on Linux.
+- On each machine you code on: Python 3.11 or newer, and curl (PowerShell on Windows). On
+  Linux and macOS it must run as `python3`: check with `python3 --version`.
 - Accounts, depending on the `.env` you pick below: a Voyage AI key, and a Claude
   subscription token (`claude setup-token`) or an Anthropic API key.
 
 One server holds one person's memory. Two people need two servers.
+
+**On Windows** (native, not WSL), the same steps work from PowerShell. You need:
+
+- Docker Desktop with the WSL 2 backend, for the server. Start it once and wait until it
+  says the engine is running. Its sign-in screen can be skipped.
+- Git for Windows. Claude Code runs the Synapse hooks with its Git Bash.
+- Python 3.11 or newer from python.org. Tick "Add python.exe to PATH" in its installer.
+  Without that tick, use `py -3` wherever this guide says `python`.
+
+`python3` in a Windows terminal often prints "Python was not found" and offers the
+Microsoft Store. That is fine: the client never needs it. Each step below gives the
+PowerShell form where it differs.
 
 ## 1. Clone and configure
 
@@ -43,14 +55,18 @@ Whichever you copied, fill in these values in `.env`. Everything else has a work
 
 | Variable | What to put there |
 |----------|-------------------|
-| `SYNAPSE_DB_PASSWORD` | Password for the bundled Postgres. Must match the password inside `SYNAPSE_DB_URL`. Generate it with `openssl rand -hex 24`: characters such as `@`, `:` or `/` break the URL. |
+| `SYNAPSE_DB_PASSWORD` | Password for the bundled Postgres. Must match the password inside `SYNAPSE_DB_URL`. Generate it with `openssl rand -hex 24` (Windows: `python -c "import secrets; print(secrets.token_hex(24))"`): characters such as `@`, `:` or `/` break the URL. |
 | `SYNAPSE_DB_URL` | Postgres DSN. The `.env.example` default just needs the same password filled in. |
-| `SYNAPSE_MACHINE_TOKEN` | The shared root bearer. `.env.example` ships it as `CHANGEME`; generate a real one with `openssl rand -hex 32`. |
+| `SYNAPSE_MACHINE_TOKEN` | The shared root bearer. `.env.example` ships it as `CHANGEME`; generate a real one with `openssl rand -hex 32` (Windows: `python -c "import secrets; print(secrets.token_hex(32))"`). |
 | `VOYAGE_API_KEY` | Voyage AI key, used for embeddings and rerank. Skip it only if you configure an alternative backend (see [local inference](#local-inference-no-external-accounts)). |
 | `CLAUDE_CODE_OAUTH_TOKEN` **or** `ANTHROPIC_API_KEY` | Auth for the extraction LLM. The subscription token wins if both are set. |
 | `SYNAPSE_LLM_API_KEY` | Only with `openrouter.env`: your OpenRouter key, in place of the Claude token. |
 | `SYNAPSE_TIMEZONE` | Your IANA zone, for example `Europe/London`. It decides which day "today" is. The default is `America/Toronto`. |
 | `SYNAPSE_OWNER_NAME` | Your first name, the way memory should refer to you (for example `Sam`). Commented out in the presets; uncomment it. Set it before your first session: facts stored while it is unset say "User" and need `scripts/rename_owner_in_facts.py` to fix later. |
+
+On Windows, edit `.env` in Notepad (`notepad .env`). Do not write it with PowerShell's `>`
+or `Out-File`: Windows PowerShell writes those files as UTF-16, which Docker Compose cannot
+read.
 
 `SYNAPSE_MACHINE_TOKEN` is required: the server refuses to boot while it is blank or still
 the `CHANGEME` placeholder, and prints what to do about it. The one exception is
@@ -73,7 +89,7 @@ docker compose up -d --build
 
 This builds the image from public bases (no registry auth), starts Postgres, the two pollers,
 the MCP server and the `dream` container, and applies the schema automatically on Postgres's
-first boot.
+first boot. On Windows with Docker Desktop the first build takes 10 to 20 minutes.
 
 If the default ports are taken, set `MCP_PORT` and/or `POSTGRES_HOST_PORT` in `.env` before
 starting. See [Ports and a second instance](#ports-and-a-second-instance).
@@ -125,9 +141,13 @@ That unpacks the client into `~/.synapse/lib/<version>/`, puts a `synapse` comma
 then does the least it can: where `~/.local/bin` is already on `PATH` it links `synapse`
 into it (never over a file of that name that is not its own link); otherwise it prints the
 line to add to your shell profile; on Windows it adds `~/.synapse/bin` to your user `PATH`.
-It needs Python 3.11 or newer as `python3` on `PATH`, because the hooks run `python3`, not
-the interpreter you install with. Check with `python3 --version`: macOS's built-in one is 3.9
-and Ubuntu 22.04's is 3.10, and with those the install succeeds but nothing is captured.
+On Linux and macOS it needs Python 3.11 or newer as `python3` on `PATH`, because the hooks
+run `python3`, not the interpreter you install with. Check with `python3 --version`: macOS's
+built-in one is 3.9 and Ubuntu 22.04's is 3.10, and with those the install succeeds but
+nothing is captured. On Windows the Claude Code hooks try `python3`, `python` and `py -3`,
+in that order, and use the first that is Python 3.11 or newer, so the Microsoft Store
+stand-in is skipped. They run in Git Bash, so Git for Windows must be installed. After
+`synapse login`, `synapse status` says on Windows when the hooks will find no Python.
 Then:
 
 ```bash
@@ -212,6 +232,23 @@ curl -sX POST localhost:8765/ingest -H 'Content-Type: application/json' \
 curl -sX POST localhost:8765/recall -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $SYNAPSE_DEVICE_TOKEN" \
   -d '{"query": "what caching layer did we pick for the demo app search service"}'
+```
+
+In Windows PowerShell, use this block instead. `curl` there is a name for `Invoke-WebRequest`,
+not curl, and it rejects curl's flags. `irm` (`Invoke-RestMethod`) does the same job, and
+`curl.exe` is the real curl.
+
+```powershell
+$machine = (Select-String -Path .env -Pattern '^SYNAPSE_MACHINE_TOKEN=(.*)$').Matches[0].Groups[1].Value.Trim()
+$device = (Get-Content $HOME\.synapse\config.json -Raw | ConvertFrom-Json).token
+
+# Server is up:
+irm http://localhost:8765/health
+
+# 1. Ship a test transcript (>= 4 turns) to the server:
+irm -Method Post http://localhost:8765/ingest -ContentType 'application/json' -Headers @{Authorization = "Bearer $machine"} -InFile docs\example-transcript.json
+# 2. Wait one poll cycle (up to ~5 minutes), then ask for it back:
+irm -Method Post http://localhost:8765/recall -ContentType 'application/json' -Headers @{Authorization = "Bearer $device"} -Body '{"query": "what caching layer did we pick for the demo app search service"}'
 ```
 
 Recall is served according to the bearer, so use the device token from step 3 for the recall
@@ -459,13 +496,15 @@ env var says so in its HANDOFF.md entry.
   The line goes away after the first successful upload. The hook log
   (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure. Codex CLI
   sessions show the same line from the Codex hooks, which log to
-  `/tmp/synapse-codex-hook.log` (`SYNAPSE_CODEX_HOOK_LOG`).
+  `/tmp/synapse-codex-hook.log` (`SYNAPSE_CODEX_HOOK_LOG`). On Windows both logs are in
+  your temp folder: `%TEMP%\synapse-ingest-hook.log` and `%TEMP%\synapse-codex-hook.log`.
 - **"SYNAPSE_INGEST_TOKEN from your environment is ignored" at session start.** An old token
   is still exported from your shell profile or from the `env` block of `settings.json`. This
   machine is enrolled, so the hooks already use its device token. Delete the export from the
   place the line names; nothing else needs to change.
 - **Recall returns nothing and the hooks seem dead.** Hooks are fail-soft, so an unreachable
-  server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then `synapse config`:
+  server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health` (PowerShell:
+  `irm <your server>/health`), then `synapse config`:
   the URL should be right and the token set.
 - **Recall answers 401 but the hooks work.** The MCP connection authenticates through a
   headers helper that reads `~/.synapse/config.json`; when it can't run it falls back to the
@@ -478,10 +517,17 @@ env var says so in its HANDOFF.md entry.
   to `PATH` instead: add that line and open a new shell. Inside Claude Code sessions the
   plugin's own `bin/` provides `synapse` and `synapse-login` too.
 - **Codex hooks don't run** (no board, no `hook:` lines, nothing in
-  `/tmp/synapse-codex-hook.log`). Codex skips hooks nobody trusted, silently: run `/hooks` in
+  `/tmp/synapse-codex-hook.log`, on Windows `%TEMP%\synapse-codex-hook.log`). Codex skips
+  hooks nobody trusted, silently: run `/hooks` in
   `codex` and press `t` to trust the Synapse ones. `synapse update` never changes their commands, so trust survives
   updates.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
+- **"Synapse: no Python 3.11 or newer found" at session start (Windows).** The Claude Code
+  hooks tried `python3`, `python` and `py -3` and found no Python 3.11 or newer. Install
+  Python from python.org, then start a new session. `synapse status` runs the same check.
+- **"Git for Windows not found" from `synapse status` (Windows).** Claude Code runs plugin
+  hooks with Git Bash, and runs them in PowerShell without it, where the Synapse hooks do
+  not work. Install Git for Windows, then start a new Claude Code session.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
   Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
 - **A service refuses to start, complaining about the schema version.** Run

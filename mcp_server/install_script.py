@@ -211,26 +211,29 @@ def _write_bin(home, client):
 
 
 def _record_server(client, server):
-    """Store the server URL in config.json unless one is set (then only say so), or an
-    older Claude plugin install has one: `synapse login` copies that one, exactly as the
-    machine enrolled with it, and a second spelling of the same server would read as a
-    switch to another."""
+    """Store the server URL in config.json unless one is set, or an older Claude plugin
+    install has one: `synapse login` copies that one, exactly as the machine enrolled with
+    it, and a second spelling of the same server would read as a switch to another. When
+    this machine already points at another server, say so and how to switch. True when it
+    already holds a token: an update, which needs no `synapse login`."""
     spec = importlib.util.spec_from_file_location(
         "synapse_home", client / "plugin" / "scripts" / "synapse_home.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     claude = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
-    if mod.plugin_options([claude / "settings.json"]).get("SYNAPSE_URL"):
-        return
-    current = mod.load().get("url")
+    plugin = mod.plugin_options([claude / "settings.json"])
+    saved = mod.load()
+    current, where = saved.get("url"), str(mod.config_file())
+    if not current and plugin.get("SYNAPSE_URL"):
+        current, where = str(plugin["SYNAPSE_URL"]), "the Claude Code plugin"
     if not current:
         mod.update({"url": server})
-        _say("Recorded the server " + server + " in " + str(mod.config_file()) + ".")
+        _say("Recorded the server " + server + " in " + where + ".")
     elif current.rstrip("/") != server:
         _say(
             "Note: "
-            + str(mod.config_file())
+            + where
             + " points at "
             + current
             + "; to use "
@@ -239,6 +242,7 @@ def _record_server(client, server):
             + server
             + " --reenroll"
         )
+    return bool(saved.get("token") or plugin.get("SYNAPSE_INGEST_TOKEN"))
 
 
 def _on_path(bin_dir):
@@ -373,10 +377,10 @@ def main(argv):
         + str(client)
         + "."
     )
-    if server:
-        _record_server(client, server)
+    enrolled = _record_server(client, server) if server else False
     _ensure_path(bin_dir)
-    _say("Now run: synapse login")
+    if not enrolled:
+        _say("Now run: synapse login")
     return 0
 
 

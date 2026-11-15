@@ -6,8 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"",
             "timeout": 15
           }
         ]
@@ -19,38 +18,32 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
             "timeout": 20
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
             "timeout": 20
           }
         ]
@@ -62,8 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end",
             "timeout": 3
           }
         ]
@@ -75,8 +67,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
             "timeout": 5
           }
         ]
@@ -88,8 +79,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
             "timeout": 5
           }
         ]
@@ -99,8 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
             "timeout": 5
           }
         ]
@@ -112,8 +101,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
-            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
+            "command": "[ \"$OS\" = Windows_NT ] && . \"$CLAUDE_PLUGIN_ROOT/bin/synapse-python\" --quiet \"$CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"; exec python3 \"$CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
             "timeout": 5
           }
         ]

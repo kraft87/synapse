@@ -3,8 +3,11 @@
 """MCP auth headers from this machine's saved Synapse credential: the headers helper
 for both harnesses.
 
-Claude Code runs it from plugin.json (`headersHelper`, cwd = the plugin root), Codex
-from config.toml (`http_headers_helper`, with `--url`). Neither hands it the user's
+Claude Code runs it from plugin.json (`headersHelper`, cwd = the plugin root) through
+bin/synapse-python, which picks a Python 3.11 or newer and runs it once (Claude Code runs
+the helper with sh on Linux and macOS and with cmd on Windows, where `python3` is often the
+Microsoft Store stand-in). Codex runs it from config.toml (`http_headers_helper`, with
+`--url`). Neither hands it the user's
 environment: Claude Code strips every variable whose name contains TOKEN, KEY, SECRET or
 AUTH, and Codex clears the environment down to HOME, PATH and a few others. So the
 credential comes from the saved config (~/.synapse/config.json, then the legacy Claude

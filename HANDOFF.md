@@ -6,6 +6,44 @@ release notes, so it is kept short: what changed in a few bullets (the pull requ
 the docs carry the detail), what to do on each machine, what was proven in a line or
 two, and everything that is still open.
 
+## 2026-11-14 — client: Claude Code hooks find Python on Windows (plugin 0.24.20)
+
+**What changed**
+
+- **The hooks no longer need `python3` on Windows.** A python.org install has no
+  `python3`, and the Microsoft Store stand-in answers in its place, so every Claude Code
+  hook failed with "Python was not found": no board, nothing uploaded. On Windows each
+  hook now goes through `plugin/bin/synapse-python`, which uses the first of `python3`,
+  `python` and `py -3` that is Python 3.11 or newer, and runs the hook once. With none, a
+  session shows one line naming the fix. The MCP headers helper, the `bin/` shims and the
+  slash commands use the same lookup.
+- **Linux and macOS run the hooks as before:** `python3`, with one shell test in front.
+- `synapse status` and `synapse login` say on Windows when the hooks will find no Python,
+  or no Git for Windows (Claude Code runs plugin hooks with its Git Bash).
+- **Hook logs on Windows** go to the temp folder. They went to a folder that does not
+  exist there, so nothing was written.
+- Installer: the note about a plugin that points at another server is kept, and an update
+  on an enrolled machine no longer ends with "Now run: synapse login".
+- `docs/install.md` has the Windows steps where a Windows user meets them, with PowerShell
+  commands.
+
+**What to do on each machine**
+
+- `synapse update`, then restart Claude Code or run `/reload-plugins`. Nothing else: on
+  Windows a machine that worked around this with a `python3` of its own keeps working.
+
+**What was proven**
+
+- On a Windows 11 machine with python.org Python and a dead `python3`: a session got the
+  board, its turns were uploaded and recall worked, with no "Python was not found" line.
+  With no Python at all: one line at session start. On Linux: a session with the new
+  hooks got the board, the tools and uploaded its turn; hook start time is unchanged.
+
+**Still open**
+
+- Claude Code on Windows without Git for Windows runs hooks in PowerShell, where they do
+  not work. `synapse status` says so.
+
 ## 2026-11-14 — hermes: `synapse import hermes` imports past Hermes sessions (plugin 0.24.19)
 
 **What changed**

@@ -544,6 +544,8 @@ def test_an_existing_different_url_is_kept_and_the_switch_command_is_printed(tmp
     assert json.loads((home / "config.json").read_text(encoding="utf-8")) == before
     assert "Recorded" not in r.stdout
     assert f"synapse login --url {_SERVER} --reenroll" in r.stdout
+    # The machine holds a token: this is an update, and it needs no `synapse login`.
+    assert "Now run: synapse login" not in r.stdout
 
 
 def test_a_url_an_older_claude_plugin_saved_is_left_for_synapse_login_to_copy(tmp_path):
@@ -567,6 +569,13 @@ def test_a_url_an_older_claude_plugin_saved_is_left_for_synapse_login_to_copy(tm
     assert r.returncode == 0, r.stdout + r.stderr
     assert not (home / "config.json").exists()
     assert "Recorded" not in r.stdout
+    # Not recorded, but not silent either: the machine points at another server, and
+    # the note says so and how to switch, as it does for a URL in config.json.
+    assert (
+        f"Note: the Claude Code plugin points at http://127.0.0.1:8765; to use {_SERVER} "
+        f"instead, run: synapse login --url {_SERVER} --reenroll"
+    ) in r.stdout
+    assert "Now run: synapse login" in r.stdout
 
 
 def test_the_windows_shim_is_ascii_and_reports_pythons_exit_code(tmp_path):
