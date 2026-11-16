@@ -11,6 +11,52 @@ change; the minor (`0.24.x` to `0.25.0`) when the client gains something a user 
 has to do differently, such as a new command, harness, platform or setting, or a changed
 default.
 
+## 2026-11-16 — hermes: a turn that grows is uploaded once (plugin 0.24.23)
+
+**What changed**
+
+- **The fault.** When Hermes added rows to a conversation after a turn was uploaded (a
+  background task's report and the reply to it), the client took the longer turn for a new
+  one and uploaded all of it again. The user's message was stored twice.
+- **The provider keeps a record of the rows it has shipped,** one per server, under
+  `~/.synapse/shipped/hermes/`. A turn that grew sends only its new rows. The reply to a
+  report Hermes wrote is an episode of its own; the report's text is not sent.
+- **Hermes's session store is consulted, never used as the text.** The text and its order
+  still come from the list Hermes hands the provider, which Hermes has already scrubbed
+  of secrets. `state.db` is read by row id for a label the list lost, for who started a
+  gateway turn, and to check a row is stored. When the store cannot be read, the client
+  does what it did before and says so once in the log.
+- `synapse private off --forget` clears the session's record too, and a running Hermes
+  notices: the turns the server dropped as private go up at the next upload, with no
+  restart.
+- `synapse import hermes` shares the record, so an import after live use, or live use
+  after an import, adds nothing. It sends stored text as it is, as before; the server
+  redacts credentials at ingest.
+
+**What to do on each machine**
+
+- `synapse update`, then `hermes gateway stop` so the next `hermes` loads the new
+  provider. Nothing to do for Claude Code or Codex.
+
+**What was proven**
+
+- A real Hermes v0.23.1 run through the gateway with a capture of what the client sent: a
+  background task stored once with its reply apart, a pasted key never on the wire, a
+  model switch, a compaction, private mode with `--forget`, and an import that added
+  nothing.
+- Against a copy of the 0.24.22 cut and uploader on 2,000 random conversations and the 23
+  sequences six independent reviews produced: the same or better on all but one shape.
+
+**Still open**
+
+- After a run fails and the user switches model, the next message typed is not stored, as
+  before. Steered messages and the instruction inside a `/skill` run are not stored, as
+  before. A rewind cannot withdraw rows already sent.
+- One shape found only by random testing stores one message less than 0.24.22 did: a
+  message folded into a marker row after a failed run, when a later list shows the rows
+  apart. A test marked as an expected failure keeps it in view.
+- Not yet run on Windows outside CI.
+
 ## 2026-11-14 — client: Hermes and Codex setup says what is true; presets lower the episode floor (plugin 0.24.22)
 
 **What changed**

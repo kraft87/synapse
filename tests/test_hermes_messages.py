@@ -182,9 +182,10 @@ def test_records_keep_only_what_the_server_reads_and_never_touch_the_input():
 
 def test_text_parts_are_joined_and_memory_context_removed():
     records = hm.to_records(_conversation())
+    # A picture reads as Hermes stores it (agent/session_persistence.py ``_durable_content``).
     assert records[5] == {
         "role": "user",
-        "content": "Now tag it.",
+        "content": "Now tag it. \n[screenshot]",
         "ts": 1_794_000_100.0,
         "id": "u-5",
     }
@@ -295,23 +296,39 @@ def test_a_row_hermes_folded_a_later_message_into_is_shown_to_hold_two(witness):
 
 
 def test_a_user_row_with_no_text_stays_as_a_row_that_opens_no_turn():
-    """A picture alone, or nothing once the memory block is gone. Left out, the reply
-    to it would read as the reply of a turn before it that got none."""
+    """Nothing once the memory block is gone. Left out, the reply to it would read as
+    the reply of a turn before it that got none."""
+    empty = {"role": "user", "content": _MEMORY, "message_uid": "e-1"}
+    assert hm.to_records([empty]) == [
+        {"role": "user", "content": "", "synthetic": True, "id": "e-1"}
+    ]
+    cut_short = {"role": "user", "content": "what is this?", "message_uid": "u-1"}
+    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-1"}
+    (turn,) = cm.turns(hm.to_records([cut_short, empty, reply]))
+    assert [r["id"] for r in turn] == ["u-1", "e-1", "a-1"]
+    assert cm.complete(turn) and cm.joined(turn)
+
+
+def test_a_picture_reads_as_the_store_holds_it_and_opens_a_turn():
+    """Hermes stores a picture as ``[screenshot]`` (agent/session_persistence.py
+    ``_durable_content``): the live list and the store give the same record, a real user
+    row, so its reply is a turn of its own and the turn before is not sent again."""
     picture = {
         "role": "user",
         "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
         "message_uid": "p-1",
         "timestamp": 1_794_000_000.0,
     }
-    assert hm.to_records([picture, {"role": "user", "content": _MEMORY}]) == [
-        {"role": "user", "content": "", "synthetic": True, "ts": 1_794_000_000.0, "id": "p-1"},
-        {"role": "user", "content": "", "synthetic": True},
+    assert hm.to_records([picture]) == [
+        {"role": "user", "content": "[screenshot]", "ts": 1_794_000_000.0, "id": "p-1"}
     ]
-    cut_short = {"role": "user", "content": "what is this?", "message_uid": "u-1"}
-    reply = {"role": "assistant", "content": "A cat.", "message_uid": "a-1"}
-    (turn,) = cm.turns(hm.to_records([cut_short, picture, reply]))
-    assert [r["id"] for r in turn] == ["u-1", "p-1", "a-1"]
-    assert cm.complete(turn) and cm.joined(turn)
+    stored = {**picture, "content": "[screenshot]"}
+    assert hm.to_records([stored]) == hm.to_records([picture])
+    detail = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "x", "detail": "high"}}],
+    }
+    assert hm.to_records([detail])[0]["content"] == "[screenshot detail=high]"
 
 
 def test_tool_arguments_are_capped_and_user_and_assistant_text_are_not():
@@ -522,7 +539,7 @@ def test_the_servers_parser_reads_the_records_as_the_two_finished_turns():
     assert "[result] release/0.24" in first.content
 
     assert second.span_id == "hermes:u-11"
-    assert second.human_turn == "Now tag it."
+    assert second.human_turn == "Now tag it. \n[screenshot]"
     assert second.assistant_turn == "Tagged v0.24.0 and pushed it."
     assert second.content.startswith("[context] The release is on release/0.24.")
     for absent in ("truncated", "Remember to push", "OUT-OF-BAND", "memory-context", "Synapse]"):

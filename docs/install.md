@@ -287,7 +287,10 @@ synapse import hermes          # --hermes-home PATH for another Hermes home
 ```
 
 It imports the local sessions the Hermes provider would have uploaded, and skips the
-rest: see [plugin/README.md](../plugin/README.md#hermes).
+rest: see [plugin/README.md](../plugin/README.md#hermes). It shares the provider's record
+of what was sent (`~/.synapse/shipped/hermes/`): a turn the provider sent is not sent
+again, and the provider does not send again what the import sent. It sends the stored
+text as it is; the server redacts the credentials it recognises at ingest.
 
 Past Codex sessions go through a server-side backfill. On the server box, from the repo
 directory (`--dry-run` first shows the count; `--since-days N` bounds the spend):

@@ -15,6 +15,15 @@ private. A harness names the session at every upload and may name several over i
 (a switch, a late upload for the id it left), so no turn remembered for one id is ever
 sent under another.
 
+With a ``ledger`` (shipped.Ledger), what was shipped is also kept on disk, per session,
+by row id: a turn goes once however often a harness hands it over, across restarts
+and across the uploaders of one session, and only the rows of a turn not shipped yet
+go (messages.pending). A batch is recorded once it is delivered or in the outbox; one
+refused or lost is not. A session the ledger knows is not looked back at: every
+complete turn it has not shipped goes. One it does not know is looked back at as
+below, and the turns before the window are recorded as passed over: not looked at
+again here, still sent by an import.
+
 A session's records can hold turns that are not its own to upload: copied from another
 session by a harness that names no session they came from. A harness that knows of such
 a session says so (``keep_out``, or ``start`` with a look-back of 0): nothing its
@@ -29,6 +38,7 @@ import threading
 from collections.abc import Iterable, Sequence
 
 from . import messages
+from .shipped import Ledger
 from .upload import LOST, PRIVATE, QUEUED, SENT, WAITING, Uploader
 
 #: How many turns a TurnUploader keeps in memory for a session it may not upload yet.
@@ -42,6 +52,12 @@ class _Session:
 
     def __init__(self, lookback: int | None) -> None:
         self.sent: set[str] = set()
+        # Row ids shipped (with a ledger: as recorded on disk, read again at each upload).
+        self.shipped: set[str] = set()
+        # Whether the ledger has held a record of this session: one gone since was
+        # cleared (``synapse private off --forget``) or lost.
+        self.recorded = False
+        self.cleared = 0
         # Turns not handed over yet that the conversation may no longer hold when they
         # can be (a compression in place): by key, oldest first, each with its context.
         self.kept: dict[str, _Pair] = {}
@@ -61,9 +77,9 @@ class TurnUploader:
     """Finished turns, uploaded once each in the ``messages`` format.
 
     ``client`` and ``source`` go in every body: the harness's name, and which of its
-    hooks sends. Turns are remembered by ``messages.turn_key``, per session id and in
-    memory only: the server dedups on span id, so a restart that re-sends a turn costs a
-    request, not a duplicate. With a look-back, a session's first upload considers only
+    hooks sends. Turns are remembered by ``messages.turn_key`` and their rows' ids, per
+    session id, in memory and, with a ``ledger``, on disk; without one, a restart that
+    re-sends a turn costs a request, not a duplicate (the server dedups on span id). With a look-back, a session's first upload considers only
     its last so many complete turns and counts the ones before as sent: a resumed
     conversation's older turns were sent, or not, before this process. ``lookback`` is
     the look-back of a session first met at an upload; ``start`` gives
@@ -82,6 +98,7 @@ class TurnUploader:
         client: str,
         source: str,
         lookback: int | None = None,
+        ledger: Ledger | None = None,
     ) -> None:
         self.uploader = uploader
         self._client = client
@@ -89,6 +106,7 @@ class TurnUploader:
         self._lock = threading.Lock()
         self._lookback = lookback
         self._sessions: dict[str, _Session] = {}
+        self.ledger = ledger
 
     def start(
         self, session_id: str, lookback: int | None = None, *, continues: Iterable[str] = ()
@@ -115,6 +133,41 @@ class TurnUploader:
                 self._sessions[session_id] = _Session(0)
             elif not state.closed:
                 state.close()
+
+    def _record(
+        self,
+        session_id: str,
+        turns: Sequence[messages.Turn],
+        *,
+        passed: bool = False,
+        delivered: bool = False,
+    ) -> None:
+        """Write ``turns`` to the ledger as shipped (``passed``: as passed over by a first
+        look-back). A record that cannot be written is said: those turns may go again
+        after a restart, which the server's span dedup absorbs."""
+        if self.ledger is None or not turns:
+            return
+        # Rows are recorded only of turns whose rows were all stored (messages.keyed): one
+        # that is not goes whole by its key, as the released client sends it.
+        uids = [uid for turn in turns if messages.keyed(turn) for uid in messages.ids(turn)]
+        # A turn that went whole is recorded by its key too, and so is one whose last
+        # part was delivered (a part ends where its turn does): a later turn may then
+        # lead with it as context (messages.pending).
+        keys = [messages.turn_key(turn) for turn in turns if delivered or messages.whole(turn)]
+        try:
+            if passed:
+                self.ledger.add(session_id, passed=uids)
+            else:
+                self.ledger.add(session_id, uids, keys)
+            with self._lock:
+                state = self._sessions.get(session_id)
+                if state is not None:
+                    state.recorded = True
+        except OSError as err:
+            self.uploader.warn(
+                f"synapse: what was shipped for session {session_id} could not be recorded "
+                f"({type(err).__name__}); it may be sent again"
+            )
 
     def upload(
         self,
@@ -164,12 +217,33 @@ class TurnUploader:
         key, opening = messages.turn_key, messages.opening_key
         given_up = 0
         held = None  # the opening of a last turn left for the next upload to settle
+        on_disk = self.ledger.load(session_id) if self.ledger is not None else None
+        windowed: list[messages.Turn] = []  # turns before a first look-back window
         with self._lock:
             if standing == PRIVATE:
                 return False
             state = self._sessions.get(session_id)
             if state is None:
                 state = self._sessions[session_id] = _Session(self._lookback)
+            if on_disk is not None and not on_disk.readable:
+                on_disk = None  # unknown, and unchanged: nothing remembered here changes
+            if on_disk is not None:
+                if state.recorded and (not on_disk.known or on_disk.cleared != state.cleared):
+                    # The record was cleared under this process (off --forget) or lost:
+                    # what this process remembers goes with it, and the session is looked
+                    # back at as after a restart (the released client's look-back): one
+                    # resend, bounded, which the server's span dedup absorbs.
+                    state.sent.clear()
+                    state.shipped.clear()
+                    state.lookback = self._lookback
+                state.recorded, state.cleared = on_disk.known, on_disk.cleared
+                state.shipped |= on_disk.uids | on_disk.passed
+                state.sent |= on_disk.keys
+                empty = not (on_disk.uids or on_disk.keys or on_disk.passed)
+                fresh_clear = bool(on_disk.cleared) and empty  # a clear nothing followed yet
+                if on_disk.known and not fresh_clear and state.lookback is not None:
+                    if state.lookback > 0:
+                        state.lookback = None  # shipped before: every turn not shipped goes
             # A turn sent or kept here is this session's own: it is no copy.
             ours = state.sent | state.kept.keys()
             if state.lookback == 0:
@@ -190,9 +264,13 @@ class TurnUploader:
                 done = [turn for turn in all_turns if messages.complete(turn)]
                 older = done[: max(0, len(done) - state.lookback)]
                 state.sent |= {key(turn) for turn in older}
+                state.shipped |= {
+                    uid for turn in older if messages.keyed(turn) for uid in messages.ids(turn)
+                }
+                windowed = older
                 state.lookback = None
             selected: list[_Pair] = []
-            for before, turn in messages.pending(all_turns, state.sent):
+            for before, turn in messages.pending(all_turns, state.sent, shipped=state.shipped):
                 if opening(turn) in state.copies or opening(turn) == held:
                     continue
                 if before is not None and opening(before) in state.copies:
@@ -215,7 +293,14 @@ class TurnUploader:
                 ]
                 state.kept.clear()
                 # Claimed before the request: a concurrent upload must not send them again.
-                state.sent |= {key(turn) for _, turn in selected}
+                state.sent |= {key(turn) for _, turn in selected if messages.whole(turn)}
+                state.shipped |= {
+                    uid
+                    for _, turn in selected
+                    if messages.keyed(turn)
+                    for uid in messages.ids(turn)
+                }
+        self._record(session_id, windowed, passed=True)
         if waiting:
             if given_up:
                 self.uploader.warn(
@@ -244,11 +329,17 @@ class TurnUploader:
                 failed = outcome in (QUEUED, LOST)
             if outcome == SENT:
                 sent_any = True
+                with self._lock:
+                    state.sent |= {key(turn) for turn in new_turns}  # last parts too
+            if outcome in (SENT, QUEUED):
+                # Delivered, or waiting in the outbox.
+                self._record(session_id, new_turns, delivered=outcome == SENT)
             elif outcome in (LOST, PRIVATE):
                 # Refused: marked private since, or it waits for the server's answer again.
                 again = outcome == LOST or self.uploader.asking(session_id)
                 with self._lock:
                     state.sent -= {key(turn) for turn in new_turns}
+                    state.shipped -= {uid for turn in new_turns for uid in messages.ids(turn)}
                     if again:
                         for turn in new_turns:
                             state.kept.setdefault(key(turn), (contexts.get(key(turn)), turn))

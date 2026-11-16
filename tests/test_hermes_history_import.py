@@ -44,7 +44,7 @@ CREATE TABLE messages (
     content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
     _compressed_summary INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0, api_content TEXT, display_kind TEXT,
-    message_uid TEXT, absorbed_message_uids TEXT);
+    message_uid TEXT, absorbed_message_uids TEXT, display_metadata TEXT);
 CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE session_admissions (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
@@ -513,8 +513,9 @@ def test_ids_match_the_live_provider(store: Store, tmp_path: Path) -> None:
     assert history.records(store.conn, sid) == hm.to_records(live)
     imported = ["hermes:" + key for key in _keys(session)]
     assert imported == list(live_spans)
-    # The delegation's follow-up landed on the turn that dispatched it: one turn.
-    assert len(imported) == 3
+    # The reply to the delegation's report is a turn of its own: the turn that
+    # dispatched it is not sent again.
+    assert len(imported) == 4
     # Each turn keeps its own time: the first record's ts is the stored timestamp.
     assert [turn[0]["ts"] for _, turn in session.pairs] == list(live_spans.values())
     imported_records = [p["records"] for p in history.payloads(session)]
@@ -594,8 +595,11 @@ def test_the_command_imports_and_a_rerun_adds_nothing(store, command, capsys) ->
     assert "2 session(s), 3 finished turn(s)" in out
     assert "Done: 3 new turn(s)" in out
     assert {body["session_id"] for body in server.bodies} == {a, b}
+    # The rerun finds every turn in the ledger the provider shares: nothing is sent.
+    posted = len(server.bodies)
     assert module.main(["--hermes-home", home, "--yes"]) == 0
-    assert "Done: 0 new turn(s)" in capsys.readouterr().out
+    assert "Nothing to import." in capsys.readouterr().out
+    assert len(server.bodies) == posted
 
 
 def test_a_private_marker_keeps_a_session_out(store, command, tmp_path, capsys) -> None:

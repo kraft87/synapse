@@ -7,10 +7,13 @@ Synapse and which ones; ``plugin/scripts/import_hermes.py`` asks and sends.
 
 What it reads
 -------------
-The store is opened read-only (``mode=ro``) and read in one transaction, so a running
-Hermes (WAL mode) is neither blocked nor seen half-way. Nothing under the Hermes home is
-written. A ``schema_version`` other than SCHEMA_VERSIONS, or a table or column this
-module reads that is not there, raises SchemaError before anything is read.
+The store is read through store.py, the provider's own reader: read-only (``mode=ro``)
+and in one transaction, so a running Hermes is neither blocked for long nor seen
+half-way. A ``schema_version`` other than SCHEMA_VERSIONS, or a table or column this
+module reads that is not there, raises SchemaError before anything is read. The only
+thing written under the Hermes home is the ledger the provider keeps of what was
+shipped (``<hermes_home>/synapse/shipped``, shipped.py), by the caller, once a body is
+delivered (``record``).
 
 - ``sessions``: one row per session. ``source`` (the surface, "local" for the gateway's
   local chats, or "subagent", "api_server", "tool", "cron", a platform), ``user_id``,
@@ -60,12 +63,13 @@ uid is read once. A branch or compressed continuation clones its parent's rows i
 new session with their uids: a turn whose opening row is one of the sessions it holds
 turns of (``lineage.chain``) is a copy and is not imported under the new id, nor sent as
 the context of a later turn. Only complete turns are imported, each with the complete
-turn before it as context, in the live path's batches.
+turn before it as context, in the live path's batches. Rows the provider's ledger holds
+as shipped are not imported again: of a turn shipped in part, the rest goes, as the
+live path sends it.
 """
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -74,52 +78,16 @@ from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from ... import messages, project
+from ...shipped import Ledger, Shipped, nothing
 from . import messages as hm
 from . import sessions as hs
+from . import store
 from .lineage import chain, lineage
 from .marks import marked
 
-#: The ``schema_version`` values of Hermes's session store this reader knows.
-SCHEMA_VERSIONS = frozenset({33})
-#: Seconds to wait for a locked store.
-DB_TIMEOUT = 5.0
-#: The columns read, per table.
-COLUMNS: Mapping[str, tuple[str, ...]] = MappingProxyType(
-    {
-        "sessions": (
-            "id",
-            "source",
-            "user_id",
-            "session_key",
-            "chat_id",
-            "chat_type",
-            "model",
-            "model_config",
-            "parent_session_id",
-            "started_at",
-            "cwd",
-            "title",
-        ),
-        "messages": (
-            "id",
-            "session_id",
-            "role",
-            "content",
-            "tool_calls",
-            "tool_name",
-            "timestamp",
-            "_compressed_summary",
-            "active",
-            "compacted",
-            "display_kind",
-            "message_uid",
-            "absorbed_message_uids",
-        ),
-        "state_meta": ("key", "value"),
-        "session_admissions": ("principal_id", "target_session_id"),
-        "schema_version": ("version",),
-    }
-)
+SCHEMA_VERSIONS = store.SCHEMA_VERSIONS
+DB_TIMEOUT = store.DB_TIMEOUT
+COLUMNS = store.COLUMNS
 
 #: The surface a row's ``source`` stands for, as ``initialize``'s ``platform`` keyword.
 _PLATFORM: Mapping[str, str] = MappingProxyType(
@@ -135,18 +103,16 @@ _PLATFORM: Mapping[str, str] = MappingProxyType(
     }
 )
 _SIDE_AGENT = re.compile(r"(bg|btw|preview)_[0-9a-f]+")
-_CONTENT_JSON = "\x00json:"  # hermes_state.py ``_CONTENT_JSON_PREFIX``
-_AUTOMATION = "automation:"
 
 FOREIGN_TURN = "a turn another person or agent wrote"
 SIDE_AGENT = "a side agent the gateway built (/background, /btw)"
 NO_TURNS = "no finished turn of its own"
+ALREADY = "every finished turn already sent"
 
 Pair = tuple[messages.Turn | None, messages.Turn]
 
 
-class SchemaError(Exception):
-    """The store is not one this reader knows: nothing was read."""
+SchemaError = store.SchemaError
 
 
 class Session(NamedTuple):
@@ -167,117 +133,14 @@ class Session(NamedTuple):
     copies: int = 0
 
 
-def connect(home: str | Path) -> sqlite3.Connection:
-    """A read-only connection to ``<home>/state.db``. RAISES FileNotFoundError when there
-    is none, sqlite3.Error when it cannot be opened."""
-    path = Path(home) / "state.db"
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
-    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=DB_TIMEOUT)
-
-
-def check_schema(conn: sqlite3.Connection) -> int:
-    """The store's schema version. RAISES SchemaError when it is not one of
-    SCHEMA_VERSIONS, or a table or column read here is missing."""
-    have: dict[str, set[str]] = {}
-    for table in COLUMNS:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        have[table] = {str(row[1]) for row in rows}
-    missing = [
-        f"{table}.{column}"
-        for table, columns in COLUMNS.items()
-        for column in columns
-        if column not in have[table]
-    ]
-    if not have["schema_version"]:
-        raise SchemaError("state.db has no schema_version table: not a Hermes session store")
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    version = row[0] if row else None
-    if not isinstance(version, int) or version not in SCHEMA_VERSIONS:
-        known = ", ".join(str(v) for v in sorted(SCHEMA_VERSIONS))
-        raise SchemaError(
-            f"state.db is at schema version {version!r}; this client reads version {known}. "
-            "Update the Synapse client (synapse update), or Hermes, and try again."
-        )
-    if missing:
-        raise SchemaError(f"state.db lacks what this client reads: {', '.join(missing)}")
-    return version
-
-
-def _decode(content: Any) -> Any:
-    """A stored ``content`` as Hermes restores it (hermes_state_messages.py
-    ``_decode_content``)."""
-    if isinstance(content, str) and content.startswith(_CONTENT_JSON):
-        try:
-            return json.loads(content[len(_CONTENT_JSON) :])
-        except ValueError:
-            return content
-    return content
-
-
-def _json(value: Any) -> Any:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return json.loads(value)
-    except ValueError:
-        return None
-
-
-def _message(row: Mapping[str, Any]) -> dict[str, Any]:
-    """A stored row as the dict Hermes hands a memory provider, with the keys
-    hermes/messages.py reads (hermes_state_messages.py ``_rows_to_conversation``)."""
-    role = row["role"]
-    content = _decode(row["content"])
-    if role in ("user", "assistant") and isinstance(content, str):
-        content = content.strip()
-    msg: dict[str, Any] = {"role": role, "content": content}
-    for key in ("timestamp", "tool_name", "display_kind", "message_uid"):
-        if row[key]:
-            msg[key] = row[key]
-    calls = _json(row["tool_calls"])
-    if calls:
-        msg["tool_calls"] = calls
-    if row["_compressed_summary"]:
-        msg["_compressed_summary"] = True
-    absorbed = row["absorbed_message_uids"]
-    if absorbed:
-        parsed = _json(absorbed)
-        if parsed is None or parsed:
-            msg["_absorbed_message_uids"] = parsed if parsed is not None else absorbed
-    return msg
+connect = store.connect
+check_schema = store.check_schema
+_message = store.message
 
 
 def _rows(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
-    """A session's messages in order: the live rows and those an in-place compaction
-    archived, each message once (a compaction clones the rows it keeps)."""
-    query = (
-        "SELECT role, content, tool_calls, tool_name, timestamp, _compressed_summary, "
-        "display_kind, message_uid, absorbed_message_uids FROM messages "
-        "WHERE session_id=? AND (active=1 OR compacted=1) ORDER BY id"
-    )
-    names = (
-        "role",
-        "content",
-        "tool_calls",
-        "tool_name",
-        "timestamp",
-        "_compressed_summary",
-        "display_kind",
-        "message_uid",
-        "absorbed_message_uids",
-    )
-    out: list[dict[str, Any]] = []
-    seen: set[Any] = set()
-    for values in conn.execute(query, (session_id,)):
-        row = dict(zip(names, values, strict=True))
-        uid = row["message_uid"]
-        key = ("uid", uid) if uid else ("row", row["role"], row["timestamp"], row["content"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(_message(row))
-    return out
+    """A session's messages in order, each uid once (store.rows)."""
+    return store.rows(conn, session_id)
 
 
 def records(conn: sqlite3.Connection, session_id: str) -> list[messages.Record]:
@@ -288,13 +151,8 @@ def records(conn: sqlite3.Connection, session_id: str) -> list[messages.Record]:
 
 def _admitted_others(conn: sqlite3.Connection, session_id: str, route: Any) -> bool:
     """Whether the gateway admitted a turn into the session from anyone but the owner
-    and the session's own automation."""
-    owner = hs.owner_subject()
-    allowed = {owner} if owner else set()
-    if isinstance(route, str) and route:
-        allowed.add(_AUTOMATION + route)
-    query = "SELECT DISTINCT principal_id FROM session_admissions WHERE target_session_id=?"
-    return any(row[0] not in allowed for row in conn.execute(query, (session_id,)))
+    and the session's own automation (store.admitted_others)."""
+    return store.admitted_others(conn, session_id, hs.owner_subject(), route)
 
 
 def judge(
@@ -362,7 +220,7 @@ def _gateway_cwd(conn: sqlite3.Connection, chat: str) -> str | None:
     cwd = policy.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
         return cwd
-    request = _json(policy.get("request_json"))
+    request = store.loads(policy.get("request_json"))
     cwd = request.get("cwd") if isinstance(request, dict) else None
     return cwd if isinstance(cwd, str) and cwd.strip() else None
 
@@ -376,12 +234,17 @@ def _openings(conn: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
     return found
 
 
-def select(all_turns: Sequence[messages.Turn], copied: set[str]) -> tuple[tuple[Pair, ...], int]:
+def select(
+    all_turns: Sequence[messages.Turn], copied: set[str], shipped: Shipped | None = None
+) -> tuple[tuple[Pair, ...], int]:
     """The complete turns to import, each with its context, and how many complete
-    turns were left out as copies. A copy is not imported, nor sent as context."""
+    turns were left out as copies. A copy is not imported, nor sent as context. Rows in
+    ``shipped`` (the ledger the live provider shares) are not imported again: of a turn
+    shipped in part, the rest goes, as the live path sends it."""
     pairs: list[Pair] = []
     copies = 0
-    for before, turn in messages.pending(all_turns, ()):
+    shipped = shipped or nothing()
+    for before, turn in messages.pending(all_turns, shipped.keys, shipped=shipped.uids):
         if messages.opening_key(turn) in copied:
             copies += 1
             continue
@@ -391,7 +254,7 @@ def select(all_turns: Sequence[messages.Turn], copied: set[str]) -> tuple[tuple[
     return tuple(pairs), copies
 
 
-def read(home: str | Path) -> list[Session]:
+def read(home: str | Path, *, ledger: Ledger | None = None) -> list[Session]:
     """Every session of ``<home>/state.db``, oldest first, judged and with the turns to
     import. Private mode is not looked at here (``private_reason``). RAISES
     FileNotFoundError, SchemaError, sqlite3.Error, and OSError when the marks cannot be
@@ -409,13 +272,19 @@ def read(home: str | Path) -> list[Session]:
         out: list[Session] = []
         for values in conn.execute(query).fetchall():
             row = dict(zip(names, values[:-1], strict=True))
-            out.append(_session(conn, home, row, values[-1]))
+            out.append(_session(conn, home, row, values[-1], ledger))
         return out
     finally:
         conn.close()
 
 
-def _session(conn: sqlite3.Connection, home: Any, row: Mapping[str, Any], last: Any) -> Session:
+def _session(
+    conn: sqlite3.Connection,
+    home: Any,
+    row: Mapping[str, Any],
+    last: Any,
+    ledger: Ledger | None = None,
+) -> Session:
     started = float(row["started_at"] or 0)
     model = row["model"] if isinstance(row["model"], str) and row["model"] else None
     reason, cwd, continues = judge(conn, home, row)
@@ -433,8 +302,10 @@ def _session(conn: sqlite3.Connection, home: Any, row: Mapping[str, Any], last: 
     if reason:
         return base
     all_turns = messages.turns(records(conn, base.id))
-    pairs, copies = select(all_turns, _openings(conn, continues))
-    return base._replace(pairs=pairs, copies=copies, reason="" if pairs else NO_TURNS)
+    shipped = ledger.load(base.id) if ledger is not None else nothing()
+    pairs, copies = select(all_turns, _openings(conn, continues), shipped)
+    reason = "" if pairs else (ALREADY if shipped.uids or shipped.keys else NO_TURNS)
+    return base._replace(pairs=pairs, copies=copies, reason=reason)
 
 
 def private_reason(session: Session, is_private: Callable[[str], bool | None]) -> str:
@@ -450,21 +321,35 @@ def private_reason(session: Session, is_private: Callable[[str], bool | None]) -
     return ""
 
 
-def payloads(session: Session, *, source: str = "hermes-import") -> list[dict[str, Any]]:
+def batches(
+    session: Session, *, source: str = "hermes-import"
+) -> list[tuple[dict[str, Any], list[messages.Turn]]]:
     """The ``/ingest`` bodies for ``session``'s turns, in the live path's batches and
-    shape (turn_upload.TurnUploader)."""
-    out: list[dict[str, Any]] = []
-    for batch, _ in messages.batches(session.pairs):
-        out.append(
-            {
-                "format": "messages",
-                "client": "hermes",
-                "session_id": session.id,
-                "project": session.project,
-                "cwd": session.cwd,
-                "model": session.model,
-                "source": source,
-                "records": batch,
-            }
-        )
+    shape (turn_upload.TurnUploader), each with the turns it ships."""
+    out: list[tuple[dict[str, Any], list[messages.Turn]]] = []
+    for batch, new_turns in messages.batches(session.pairs):
+        payload = {
+            "format": "messages",
+            "client": "hermes",
+            "session_id": session.id,
+            "project": session.project,
+            "cwd": session.cwd,
+            "model": session.model,
+            "source": source,
+            "records": batch,
+        }
+        out.append((payload, new_turns))
     return out
+
+
+def payloads(session: Session, *, source: str = "hermes-import") -> list[dict[str, Any]]:
+    """The ``/ingest`` bodies for ``session``'s turns (``batches``)."""
+    return [payload for payload, _ in batches(session, source=source)]
+
+
+def record(ledger: Ledger, session_id: str, new_turns: Sequence[messages.Turn]) -> None:
+    """Write the turns of a delivered body to the ledger the live provider shares, so it
+    does not send them again. RAISES OSError when it cannot be written."""
+    uids = [uid for turn in new_turns for uid in messages.ids(turn)]
+    keys = [messages.turn_key(turn) for turn in new_turns if not messages.ids(turn)]
+    ledger.add(session_id, uids, keys)

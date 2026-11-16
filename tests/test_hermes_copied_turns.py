@@ -148,8 +148,9 @@ def test_agents_built_one_after_the_other_each_look_back_ten_turns(plugin, serve
     session is new: a managed worker gets ``resumed=False, message_count=0`` at every
     turn (``s19_managed``). A worker's session is INERT today (the next test), so this
     is the rule by itself, in a gateway session that is ACTIVE: every turn goes up as it
-    ends, with the turn before it as context, and no agent sends the whole conversation
-    again. Nothing is recorded of the session."""
+    ends, with the turn before it as context, and no agent sends a turn again: what was
+    shipped is on disk (shipped.Ledger), so the next agent knows. Nothing is recorded of
+    the session as holding copies."""
     home = tmp_path / "hermes-a"
     _store(home)
     for n in range(1, 15):
@@ -157,8 +158,8 @@ def test_agents_built_one_after_the_other_each_look_back_ten_turns(plugin, serve
         before = len(server.posts())
         _say(worker, _conversation(n), gs._LOCAL)
         users = [text for _, texts in _posted(server)[before:] for text in texts]
-        # The turn that ended, the nine before it, and the one before those as context.
-        assert users == _questions(max(1, n - _LOOKBACK), n)
+        # The turn that ended, with the one before it as context.
+        assert users == _questions(max(1, n - 1), n)
     assert server.puts() == [] and not (home / "synapse" / "copied").exists()
 
 

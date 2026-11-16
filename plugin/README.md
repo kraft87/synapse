@@ -325,10 +325,15 @@ session), so the server can record which lines it served to the session. Each to
 a reply, not after one that failed or was cut short: a `POST /ingest` (format
 `messages`, client `hermes`) holding the session id, the project label and working
 directory, the model name, and per message its role, text, tool-call names and
-arguments (first 1000 characters), tool results (first 2000) and timestamp. It holds
-every finished turn not sent yet: a reply you stopped while it came in is stored by
-Hermes as far as it got, and goes up with the next one.
-Hermes scrubs secrets from what it hands a memory provider before the client sees it.
+arguments (first 1000 characters), tool results (first 2000) and timestamp. The text is
+what Hermes hands its memory provider, which Hermes has scrubbed of secrets; each row is
+sent once, and what was sent is kept in `~/.synapse/shipped/hermes/` (one record per
+server). `synapse private off --forget` clears a session's record, and the running
+provider looks back ten turns again at its next upload. From Hermes's
+session store, `$HERMES_HOME/state.db`, read-only, the provider reads only how Hermes
+labelled each row and who started each turn. A reply you stopped while it came in is
+stored by Hermes as far as it got, and goes up with the next one. A background task's
+report is not sent, only the reply to it.
 Not sent: the system prompt, Hermes's compaction summaries (nor a message of yours that
 Hermes folded one into), the memory context it injects into prompts, reasoning, and its
 own bookkeeping fields. The first upload an agent makes for a session looks back ten
@@ -365,11 +370,11 @@ the turns that end in it from now on.
 Private mode covers a whole session. `synapse private off <id>` removes the marker and
 keeps the server's row, which goes on dropping that session's turns: to go back on the
 record, start a new session (`/new`). `synapse private off --forget <id>` deletes the
-row too and puts that session back on the record whole: its next turn uploads the
-finished turns not sent yet, the ones spoken while it was private among them (the last
-ten at most, unless the agent uploaded turns of the session before it went private; a
-turn the server's row dropped after a plain `off` counts as sent for the agent that
-sent it).
+row too and puts that session back on the record whole: it also clears this machine's
+record of what was sent for that session, so the running agent, at its next turn, sends
+every finished turn of the session again, the ones spoken while it was private among
+them, also those the server's row dropped after a plain `off` (the server keeps one copy
+of each turn it already holds).
 For a session that was private because of the one it continues, those are also the
 turns it took over from that session, which stays private under its own id only: to
 go on without them, start a new session instead. A session is made private because of
