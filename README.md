@@ -27,11 +27,13 @@ knowledge-graph facts with the original episode.
 
 ## Benchmark
 
-**84.8%** on [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (500 questions,
-official gpt-4o reader + judge), using the deployed pipeline end to end.
-Strongest categories: temporal reasoning 82.7%, knowledge-update 84.6%,
-single-session recall 95–97%. For reference, Zep/Graphiti reports 71.2%, Mastra 84.2%
-on the same reader class.
+**83.7%** on [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (500 questions,
+official gpt-4o reader + judge), using the deployed pipeline end to end. That is the mean
+of three runs (82.8%, 84.0%, 84.2%), measured 2026-11-15 with every conversation
+re-extracted by the current extractor.
+Strongest categories: single-session recall 96–99%, knowledge-update 87.2%, temporal
+reasoning 80.0%. Weakest: multi-session 77%, preference 62%. For reference, Zep/Graphiti
+reports 71.2%, Mastra 84.2% on the same reader class.
 
 ## How it works
 
