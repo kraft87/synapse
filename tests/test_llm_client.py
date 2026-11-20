@@ -497,3 +497,52 @@ def test_agent_call_refuses_an_error_result():
     ):
         with pytest.raises(LLMUnavailableError, match="Not logged in"):
             asyncio.run(agent_call("hi"))
+
+
+def test_agent_call_does_not_return_an_error_envelopes_empty_structured_output():
+    """When the CLI gives up on a schema it sends ``is_error=True``, ``result=None`` and
+    ``structured_output={}``. ``{}`` validates for the defaults-only output models
+    (``ExtractionOutput``), so returning it stored a failed call as an empty extraction.
+    The envelope has to fail the call; a success envelope still returns its payload."""
+    import pytest
+
+    import ingestion.llm_client as mod
+
+    class _FakeResult:
+        def __init__(self, *, failed: bool) -> None:
+            self.result = None
+            self.structured_output = {} if failed else {"facts": []}
+            self.is_error = failed
+            self.subtype = "error_max_structured_output_retries" if failed else "success"
+
+    def _client(failed: bool) -> type:
+        class _FakeClient:
+            def __init__(self, options: Any = None) -> None:
+                pass
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+            async def query(self, prompt: str) -> None:
+                return None
+
+            async def receive_response(self):  # type: ignore[no-untyped-def]
+                yield _FakeResult(failed=failed)
+
+        return _FakeClient
+
+    schema = {"type": "json_schema", "schema": {"type": "object"}}
+    with (
+        patch.object(mod, "ClaudeAgentOptions", lambda **kw: object()),
+        patch.object(mod, "ResultMessage", _FakeResult),
+    ):
+        with patch.object(mod, "ClaudeSDKClient", _client(False)):
+            assert asyncio.run(agent_call("hi", output_format=schema)) == '{"facts": []}'
+        with (
+            patch.object(mod, "ClaudeSDKClient", _client(True)),
+            pytest.raises(RuntimeError, match="error_max_structured_output_retries"),
+        ):
+            asyncio.run(agent_call("hi", output_format=schema))

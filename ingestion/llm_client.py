@@ -343,12 +343,25 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def _find_cli_path() -> str:
-    """Locate the latest installed Claude Code CLI version."""
+    """Locate the latest installed Claude Code CLI version.
+
+    Always an installed CLI, never the one the SDK bundles: with no
+    ``cli_path`` the SDK runs ``claude_agent_sdk/_bundled/claude`` first, and
+    the pinned SDK (0.1.72) ships 2.1.126, which is months behind the
+    installed CLI.
+
+    Newest by version number, not by name: as strings "2.1.99" sorts after
+    "2.1.326". Entries whose names are not versions are skipped.
+    """
     versions_dir = Path.home() / ".local/share/claude/versions"
-    if versions_dir.exists():
-        versions = sorted(versions_dir.iterdir(), key=lambda p: p.name, reverse=True)
+    if versions_dir.is_dir():
+        versions = [
+            (tuple(int(part) for part in path.name.split(".")), path)
+            for path in versions_dir.iterdir()
+            if re.fullmatch(r"\d+(?:\.\d+)*", path.name)
+        ]
         if versions:
-            return str(versions[0])
+            return str(max(versions)[1])
     return "claude"  # fallback to PATH
 
 
@@ -416,14 +429,26 @@ async def agent_call(
                     result_text: str | None = None
                     structured: dict[str, Any] | None = None
                     is_error = False
+                    subtype = ""
                     async for msg in client.receive_response():
                         if isinstance(msg, ResultMessage):
                             result_text = msg.result
                             structured = getattr(msg, "structured_output", None)
                             is_error = bool(getattr(msg, "is_error", False))
-                if structured is not None:
+                            subtype = str(getattr(msg, "subtype", "") or "")
+                # An error envelope outranks its payload. When the CLI gives up
+                # on the schema (error_max_structured_output_retries) or runs out
+                # of turns it still sends ``structured_output={}``, and ``{}``
+                # validates for the defaults-only output models — a failed call
+                # stored as a successful empty extraction.
+                failed = is_error or subtype.startswith("error")
+                if structured is not None and not failed:
                     return json.dumps(structured)
                 if result_text is None:
+                    if failed:
+                        raise RuntimeError(
+                            f"agent_call: CLI error result ({subtype or 'error'}) with no text"
+                        )
                     raise RuntimeError("agent_call: no ResultMessage")
                 if _is_usage_limit(result_text):
                     raise UsageLimitError(result_text.strip()[:300])
