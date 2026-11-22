@@ -1,8 +1,9 @@
-"""RecallWebMixin: the web bucket (research pages captured into ``web_chunks``).
+"""RecallWebMixin: the web bucket (research briefs chunked into ``web_chunks``).
 
 BM25 and vector legs over web chunks, fused, reranked, floored and deduped by page.
-A restricted caller reads only artifacts labelled with its audience tier (schema 063,
-``web_artifacts.audience``); full trust reads them all.
+Only chunks of a served artifact kind are read (:data:`SERVED_KINDS`). A restricted
+caller reads only artifacts labelled with its audience tier (schema 063,
+``web_artifacts.audience``); full trust reads every label.
 """
 
 from __future__ import annotations
@@ -17,6 +18,13 @@ from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import warn as _warn
 
 logger = logging.getLogger(__name__)
+
+#: The ``web_artifacts.kind`` values the web bucket serves. A research brief is a
+#: synthesis written for reuse. A raw scraped page or search result list (``web_scrape``,
+#: ``search_result_set``) stays stored and is not served: in rated recalls, scraped page
+#: chunks were 10 helpful against 159 noise. The predicate is in both SQL legs, ahead of
+#: their LIMIT, so unserved kinds cannot crowd briefs out of the candidate pool.
+SERVED_KINDS: tuple[str, ...] = ("research_brief",)
 
 
 class RecallWebMixin:
@@ -52,8 +60,9 @@ class RecallWebMixin:
         if not any(c.isalnum() for c in query):
             return []
         audience_sql = "AND a.audience = %s" if audience is not None else ""
+        kinds = list(SERVED_KINDS)
         params: tuple[Any, ...] = (
-            (query, audience, limit) if audience is not None else (query, limit)
+            (query, kinds, audience, limit) if audience is not None else (query, kinds, limit)
         )
         try:
             with self._pg() as pg:
@@ -66,6 +75,7 @@ class RecallWebMixin:
                     FROM web_chunks c
                     JOIN web_artifacts a ON a.id = c.web_artifact_id
                     WHERE c.id @@@ paradedb.match('content', %s)
+                    AND a.kind = ANY(%s)
                     {audience_sql}
                     ORDER BY bm25_score DESC LIMIT %s
                     """,
@@ -87,8 +97,11 @@ class RecallWebMixin:
         audience predicate filters an exact scan rather than thinning an ANN result."""
         emb_literal = _vec_literal(query_emb)
         audience_sql = "AND a.audience = %s" if audience is not None else ""
+        kinds = list(SERVED_KINDS)
         params: tuple[Any, ...] = (
-            (emb_literal, audience, limit) if audience is not None else (emb_literal, limit)
+            (emb_literal, kinds, audience, limit)
+            if audience is not None
+            else (emb_literal, kinds, limit)
         )
         try:
             with self._pg() as pg:
@@ -101,6 +114,7 @@ class RecallWebMixin:
                     FROM web_chunks c
                     JOIN web_artifacts a ON a.id = c.web_artifact_id
                     WHERE c.is_embedded = TRUE
+                    AND a.kind = ANY(%s)
                     {audience_sql}
                     ORDER BY vec_distance ASC LIMIT %s
                     """,

@@ -249,6 +249,36 @@ def test_full_trust_web_is_unfiltered(web_rows, clean, db_url, monkeypatch):
     assert sorted(w["id"] for w in out.get("web", [])) == sorted(web_rows.values())
 
 
+def test_web_serves_briefs_and_not_scraped_pages(web_rows, clean, db_url, monkeypatch):
+    """A scraped page stays stored and is not served, by either leg and to any caller:
+    only the served kinds (research briefs) reach the web bucket."""
+    aid = clean.execute(
+        "INSERT INTO web_artifacts (kind, tool_name, tool_use_id, url, title, "
+        "content_markdown, fetched_at, audience) "
+        "VALUES ('web_scrape', 'WebFetch', 'toolu_scrape', 'https://example.com/widget', "
+        "'scrape', 'scraped widget notes', now(), 'work-safe') RETURNING id"
+    ).fetchone()[0]
+    scrape = clean.execute(
+        "INSERT INTO web_chunks (web_artifact_id, idx, content, char_start, char_end, "
+        "embedding, is_embedded, content_ts) VALUES (%s, 0, 'scraped widget notes', 0, 20, "
+        "array_fill(0.5::real, ARRAY[2048])::vector, true, now()) RETURNING id",
+        (aid,),
+    ).fetchone()[0]
+    r = _web_engine(db_url, monkeypatch)
+    for leg in (
+        r._search_bm25_web("widget", 50),
+        r._search_vector_web([0.5] * 2048, 50),
+        r._search_bm25_web("widget", 50, audience="work-safe"),
+        r._search_vector_web([0.5] * 2048, 50, audience="work-safe"),
+    ):
+        ids = {row["id"] for row in leg}
+        assert web_rows["safe"] in ids
+        assert f"w:{scrape}" not in ids
+    full = register_full(clean)
+    out = r.recall("widget", surface=full)
+    assert sorted(w["id"] for w in out.get("web", [])) == sorted(web_rows.values())
+
+
 def test_unknown_caller_gets_work_safe_web_only(web_rows, clean, db_url, monkeypatch):
     """An unidentified caller is restricted (fail-closed), so it is held to the same
     tier: work-safe or nothing."""

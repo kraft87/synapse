@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -67,7 +67,12 @@ def _pool(n: int = 4) -> list[dict]:
     ]
 
 
-_CUT = datetime(2026, 11, 12, 14, 0, tzinfo=UTC)
+#: The caller's last compaction: yesterday. A fixed date made the caller's turn from before
+#: it age with the calendar, and after about a week the recency weight dropped it out of
+#: its lane, so the test failed without a code change.
+_CUT = (datetime.now(UTC) - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+_CUT_Z = _CUT.strftime("%Y-%m-%dT%H:%M:%SZ")
+_CUT_OFFSET = _CUT.astimezone(timezone(timedelta(hours=-5))).isoformat()
 
 
 def _own_pool() -> list[dict]:
@@ -234,7 +239,7 @@ def test_recall_kind_with_a_cut_serves_the_callers_turns_from_before_it(
         source="mcp-tool",
         surface=full_surface,
         self_session="MY-SESSION",
-        self_since="2026-11-12T09:00:00-05:00",
+        self_since=_CUT_OFFSET,
     )
     assert sorted(it["id"] for it in out["episodes"]) == ["e:0", "e:2", "e:3"]
     # The overlay asks for the other turns, then for the caller's own (a lookup of its own).
@@ -243,7 +248,7 @@ def test_recall_kind_with_a_cut_serves_the_callers_turns_from_before_it(
     row = _newest(conn, engine, "recall", "served_ids", mark)
     assert row is not None
     (served,) = row
-    assert served["self_since"] == "2026-11-12T14:00:00+00:00"
+    assert served["self_since"] == _CUT.isoformat()
     assert served["n_self_served"] == 1
     assert served["n_self_excluded"] == 1
 
@@ -381,13 +386,13 @@ def test_episodes_kind_with_a_cut_serves_the_callers_turns_from_before_it(
     )
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
-    out = server.recall_full_turns(q, self_session="MY-SESSION", self_since="2026-11-12T14:00:00Z")
+    out = server.recall_full_turns(q, self_session="MY-SESSION", self_since=_CUT_Z)
     assert sorted(it["id"] for it in out["episodes"]) == ["e:0", "e:2", "e:3"]
 
     row = _newest(conn, engine, "episodes", "served_ids", mark)
     assert row is not None
     (served,) = row
-    assert served["self_since"] == "2026-11-12T14:00:00+00:00"
+    assert served["self_since"] == _CUT.isoformat()
     assert served["n_self_served"] == 1
     assert served["n_self_excluded"] == 1
 
